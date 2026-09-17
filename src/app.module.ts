@@ -6,6 +6,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { envValidationSchema } from './config/env.validation';
 import { PrismaModule } from './prisma/prisma.module';
+import { GroupsModule } from './groups/groups.module';
 import { HealthController } from './health/health.controller';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -22,6 +23,7 @@ import { buildPinoConfig } from './logger/pino-logger.config';
       useFactory: buildPinoConfig,
     }),
     PrismaModule,
+    GroupsModule,
   ],
   controllers: [AppController, HealthController],
   providers: [

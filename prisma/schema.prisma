@@ -74,7 +74,11 @@ model Group {
   kind                 GroupKind
   externalId           String
   title                String
-  accessTokenEncrypted String
+  // Nullable: only VK community groups carry their own token. MAX bots
+  // authenticate with one bot-wide token (configured once, not per-chat),
+  // so a MAX Group row has neither an encrypted token nor a mask.
+  accessTokenEncrypted String?
+  tokenMask            String?
   tags                 String[]    @default([])
   status               GroupStatus
   createdAt            DateTime    @default(now())
