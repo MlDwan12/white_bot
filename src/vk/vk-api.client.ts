@@ -12,6 +12,13 @@ export interface VkGroupInfo {
   title: string;
 }
 
+export interface VkAttachmentInput {
+  kind: 'photo' | 'doc';
+  filename: string;
+  mimeType: string;
+  buffer: Buffer;
+}
+
 async function parseVkResponse<T>(res: globalThis.Response): Promise<T> {
   if (!res.ok) {
     // VK's own API errors come back as HTTP 200 with an `error` field in the
@@ -51,10 +58,10 @@ async function parseVkResponse<T>(res: globalThis.Response): Promise<T> {
 }
 
 /**
- * Thin client around VK's HTTP API. Deliberately narrow — only the two calls
- * Groups needs right now (validate a token + confirm connectivity). VK
- * content methods (wall.post/edit/delete for real campaigns) belong to the
- * VK-integration step, not here.
+ * Thin client around VK's HTTP API: resolving/validating a community token
+ * (used by Groups), and the wall-post content methods (text, photo/document
+ * attachments) used by the VK-integration step. No queueing/retry logic
+ * here — that's the delivery pipeline's job, built on top of this.
  */
 @Injectable()
 export class VkApiClient {
@@ -94,10 +101,176 @@ export class VkApiClient {
 
   /** Posts the connection-check message to the community's own wall. */
   async postTestMessage(token: string, externalId: string): Promise<void> {
-    await this.call('wall.post', token, {
-      owner_id: String(-Math.abs(Number(externalId))),
+    await this.wallPost(token, externalId, '✅ Бот подключён');
+  }
+
+  async wallPost(
+    token: string,
+    externalId: string,
+    message: string,
+    attachmentRefs: string[] = [],
+  ): Promise<{ postId: number }> {
+    const response = await this.call<{ post_id: number }>('wall.post', token, {
+      owner_id: this.wallOwnerId(externalId),
       from_group: '1',
-      message: '✅ Бот подключён',
+      message,
+      ...(attachmentRefs.length > 0
+        ? { attachments: attachmentRefs.join(',') }
+        : {}),
     });
+    return { postId: response.post_id };
+  }
+
+  /**
+   * Confirmed empirically (2026-09-17) that VK currently rejects this for
+   * *any* token/app type we could get: error 27 with a community token
+   * ("unavailable with group auth"), error 15 with a personal token from a
+   * self-service app ("denied for non-standalone applications"). VK's own
+   * docs say wall.edit/wall.delete rights require a manual grant from
+   * devsupport@corp.vk.com — not something a token/app-type change fixes.
+   * Left implemented (request shape is correct, proven via curl) since it
+   * should start working the moment that grant exists, with no code change.
+   */
+  async wallEdit(
+    token: string,
+    externalId: string,
+    postId: number,
+    message: string,
+    attachmentRefs: string[] = [],
+  ): Promise<void> {
+    await this.call('wall.edit', token, {
+      owner_id: this.wallOwnerId(externalId),
+      post_id: String(postId),
+      message,
+      ...(attachmentRefs.length > 0
+        ? { attachments: attachmentRefs.join(',') }
+        : {}),
+    });
+  }
+
+  /** Same VK-side restriction as wallEdit above — see its comment. */
+  async wallDelete(
+    token: string,
+    externalId: string,
+    postId: number,
+  ): Promise<void> {
+    await this.call('wall.delete', token, {
+      owner_id: this.wallOwnerId(externalId),
+      post_id: String(postId),
+    });
+  }
+
+  /** Uploads a photo or document and returns its wall-attachment reference (e.g. "photo-123_456"). */
+  async uploadAttachment(
+    token: string,
+    externalId: string,
+    input: VkAttachmentInput,
+  ): Promise<string> {
+    return input.kind === 'photo'
+      ? this.uploadPhoto(token, externalId, input)
+      : this.uploadDoc(token, externalId, input);
+  }
+
+  private async uploadPhoto(
+    token: string,
+    externalId: string,
+    input: VkAttachmentInput,
+  ): Promise<string> {
+    const { upload_url } = await this.call<{ upload_url: string }>(
+      'photos.getWallUploadServer',
+      token,
+      { group_id: externalId },
+    );
+    const uploaded = await this.postFile<{
+      server: number;
+      photo: string;
+      hash: string;
+    }>(upload_url, 'photo', input);
+    const saved = await this.call<{ id: number; owner_id: number }[]>(
+      'photos.saveWallPhoto',
+      token,
+      {
+        group_id: externalId,
+        server: String(uploaded.server),
+        photo: uploaded.photo,
+        hash: uploaded.hash,
+      },
+    );
+    const photo = saved[0];
+    if (!photo) {
+      throw new VkApiError(0, 'VK не сохранил загруженное фото');
+    }
+    return `photo${photo.owner_id}_${photo.id}`;
+  }
+
+  private async uploadDoc(
+    token: string,
+    externalId: string,
+    input: VkAttachmentInput,
+  ): Promise<string> {
+    const { upload_url } = await this.call<{ upload_url: string }>(
+      'docs.getWallUploadServer',
+      token,
+      { group_id: externalId },
+    );
+    const uploaded = await this.postFile<{ file: string }>(
+      upload_url,
+      'file',
+      input,
+    );
+    const saved = await this.call<{
+      doc?: { id: number; owner_id: number };
+    }>('docs.save', token, { file: uploaded.file, title: input.filename });
+    if (!saved.doc) {
+      throw new VkApiError(0, 'VK не сохранил загруженный документ');
+    }
+    return `doc${saved.doc.owner_id}_${saved.doc.id}`;
+  }
+
+  /** VK's upload servers aren't `api.vk.com/method/*` calls — they return raw JSON, not the `{response: ...}` envelope. */
+  private async postFile<T>(
+    uploadUrl: string,
+    fieldName: string,
+    input: VkAttachmentInput,
+  ): Promise<T> {
+    const form = new FormData();
+    form.append(
+      fieldName,
+      // Buffer is a Uint8Array and Blob accepts it fine at runtime; the cast
+      // only works around TS's BlobPart type being narrower (ArrayBuffer,
+      // not ArrayBufferLike) than what Node's Buffer type declares.
+      new Blob([input.buffer as unknown as ArrayBuffer], {
+        type: input.mimeType,
+      }),
+      input.filename,
+    );
+    const res = await fetch(uploadUrl, {
+      method: 'POST',
+      body: form,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      throw new VkApiError(0, `Загрузка файла в VK вернула HTTP ${res.status}`);
+    }
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      throw new VkApiError(
+        0,
+        'VK вернул нераспознаваемый ответ при загрузке файла',
+      );
+    }
+    if (typeof body !== 'object' || body === null) {
+      throw new VkApiError(
+        0,
+        'Неожиданный формат ответа при загрузке файла в VK',
+      );
+    }
+    return body as T;
+  }
+
+  private wallOwnerId(externalId: string): string {
+    return String(-Math.abs(Number(externalId)));
   }
 }

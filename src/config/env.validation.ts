@@ -24,4 +24,14 @@ export const envValidationSchema = Joi.object({
       }
       return value;
     }, 'base64-encoded 32-byte AES-256 key'),
+  // Optional: only needed for the VK personal-uploader OAuth flow (photo/doc
+  // wall attachments), not for the app to boot — a community-only setup
+  // shouldn't be forced to configure a VK app it doesn't use yet. No
+  // redirect_uri setting here: VK's Mini App console (the only app type
+  // currently offered) exposes no way to register a custom one, and a
+  // custom redirect_uri is rejected outright ("check application redirect
+  // uri in the settings page") — only the universal oauth.vk.com/blank.html
+  // works, so it's hardcoded (see VkUploaderTokenService), not configurable.
+  VK_APP_ID: Joi.string().optional(),
+  VK_APP_CLIENT_SECRET: Joi.string().optional(),
 });
