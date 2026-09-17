@@ -6,3 +6,226 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+enum Platform {
+  vk
+  max
+}
+
+enum GroupKind {
+  community
+  chat
+  channel
+}
+
+enum GroupStatus {
+  pending_confirmation
+  active
+  token_invalid
+  bot_removed
+  removed
+}
+
+enum PostStatus {
+  draft
+  scheduled
+  sending
+  sent
+  partially_failed
+  stopped
+}
+
+enum PostDeliveryStatus {
+  pending
+  sending
+  sent
+  failed
+  skipped_by_stop
+  unknown
+}
+
+enum ContestStatus {
+  draft
+  open
+  drawn
+}
+
+enum AdminRole {
+  developer
+  admin
+}
+
+enum Permission {
+  groups_manage
+  groups_tags_edit
+  groups_tokens_manage
+  groups_pendingMax_review
+  groups_view
+  posts_manage
+  contests_manage
+  admins_manage
+  system_health
+  audit_viewAll
+}
+
+model Group {
+  id                   String      @id @default(uuid())
+  platform             Platform
+  kind                 GroupKind
+  externalId           String
+  title                String
+  accessTokenEncrypted String
+  tags                 String[]    @default([])
+  status               GroupStatus
+  createdAt            DateTime    @default(now())
+
+  postDeliveries  PostDelivery[]
+  templateTargets PostTemplateTarget[]
+
+  @@unique([platform, externalId])
+  @@index([tags], type: Gin)
+}
+
+model Post {
+  id                     String     @id @default(uuid())
+  text                   String
+  vkTextOverride         String?
+  maxTextOverride        String?
+  attachments            Json?
+  createdAt              DateTime   @default(now())
+  scheduledAt            DateTime?
+  recurrenceRule         String?
+  templatePaused         Boolean    @default(false)
+  autoDeleteAt           DateTime?
+  autoDeleteAfterMinutes Int?
+  status                 PostStatus @default(draft)
+  stopRequested          Boolean    @default(false)
+  clonedFromPostId       String?
+  recurringTemplateId    String?
+  updatedAt              DateTime   @updatedAt
+
+  clonedFromPost    Post?                @relation("PostClone", fields: [clonedFromPostId], references: [id])
+  clones            Post[]               @relation("PostClone")
+  recurringTemplate Post?                @relation("RecurringOccurrence", fields: [recurringTemplateId], references: [id])
+  occurrences       Post[]               @relation("RecurringOccurrence")
+  deliveries        PostDelivery[]
+  contest           Contest?
+  templateTargets   PostTemplateTarget[]
+
+  @@index([clonedFromPostId])
+  @@index([recurringTemplateId])
+  @@index([status, scheduledAt])
+}
+
+/// Текущий (редактируемый) список целевых групп повторяющегося шаблона —
+/// сам шаблон не проходит через доставку, поэтому его цели не выражаются PostDelivery.
+model PostTemplateTarget {
+  id      String @id @default(uuid())
+  postId  String
+  groupId String
+
+  post  Post  @relation(fields: [postId], references: [id])
+  group Group @relation(fields: [groupId], references: [id])
+
+  @@unique([postId, groupId])
+  @@index([groupId])
+}
+
+model PostDelivery {
+  id                String             @id @default(uuid())
+  postId            String
+  groupId           String
+  status            PostDeliveryStatus @default(pending)
+  externalMessageId String?
+  error             String?
+  sentAt            DateTime?
+  attemptsMade      Int                @default(0)
+
+  post  Post  @relation(fields: [postId], references: [id])
+  group Group @relation(fields: [groupId], references: [id])
+
+  @@unique([postId, groupId])
+  @@index([groupId])
+}
+
+model Contest {
+  id        String        @id @default(uuid())
+  postId    String?       @unique
+  title     String
+  status    ContestStatus @default(draft)
+  createdAt DateTime      @default(now())
+
+  post         Post?                @relation(fields: [postId], references: [id])
+  participants ContestParticipant[]
+  prizes       ContestPrize[]
+  drawLogs     ContestDrawLog[]
+}
+
+model ContestParticipant {
+  id          String  @id @default(uuid())
+  contestId   String
+  displayName String
+  vkId        String?
+  maxId       String?
+
+  contest Contest        @relation(fields: [contestId], references: [id])
+  prizes  ContestPrize[]
+
+  @@index([contestId])
+}
+
+model ContestPrize {
+  id                  String  @id @default(uuid())
+  contestId           String
+  place               Int
+  label               String
+  winnerParticipantId String?
+  isForced            Boolean @default(false)
+
+  contest           Contest             @relation(fields: [contestId], references: [id])
+  winnerParticipant ContestParticipant? @relation(fields: [winnerParticipantId], references: [id])
+
+  @@unique([contestId, place])
+  @@unique([winnerParticipantId])
+}
+
+model ContestDrawLog {
+  id             String   @id @default(uuid())
+  contestId      String
+  drawnAt        DateTime @default(now())
+  resultSnapshot Json
+  note           String?
+  actorId        String
+
+  contest Contest   @relation(fields: [contestId], references: [id])
+  actor   AdminUser @relation(fields: [actorId], references: [id])
+
+  @@index([contestId])
+  @@index([actorId])
+}
+
+model AdminUser {
+  id               String       @id @default(uuid())
+  email            String       @unique
+  passwordHash     String
+  role             AdminRole
+  maxUserId        String?      @unique
+  extraPermissions Permission[] @default([])
+  createdAt        DateTime     @default(now())
+
+  sessions AdminSession[]
+  drawLogs ContestDrawLog[]
+}
+
+model AdminSession {
+  id               String   @id @default(uuid())
+  adminUserId      String
+  refreshTokenHash String   @unique
+  expiresAt        DateTime
+  revoked          Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id])
+
+  @@index([adminUserId])
+}
