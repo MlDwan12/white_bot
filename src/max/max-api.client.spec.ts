@@ -123,32 +123,33 @@ describe('MaxApiClient', () => {
 });
 
 describe('toMaxApiError', () => {
-  it('marks rate limiting and server faults retryable, but a rejection not', () => {
-    const rateLimited = toMaxApiError({ status: 429, response: {} });
-    const serverFault = toMaxApiError({ status: 503, response: {} });
-    const rejected = toMaxApiError({ status: 400, response: {} });
+  it('preserves the status and code the delivery policy classifies on', () => {
+    const rateLimited = toMaxApiError({
+      status: 429,
+      response: { code: 'too.many.requests' },
+    });
 
-    expect(rateLimited.retryable).toBe(true);
-    expect(serverFault.retryable).toBe(true);
-    // Retrying a 400 just burns rate-limit budget: MAX understood and refused.
-    expect(rejected.retryable).toBe(false);
+    expect(rateLimited.status).toBe(429);
+    expect(rateLimited.code).toBe('too.many.requests');
   });
 
-  it('treats a transport failure as retryable, since it never reached MAX', () => {
+  it('marks a transport failure with status 0, since it never reached MAX', () => {
     const err = toMaxApiError(new TypeError('fetch failed'));
 
     expect(err.status).toBe(0);
     expect(err.code).toBe('network.error');
-    expect(err.retryable).toBe(true);
   });
 
-  it('flags an invalid token so the group can be marked rather than retried', () => {
+  it('flags an invalid token so a global token problem is recognisable', () => {
     const err = toMaxApiError({
       status: 401,
       response: { code: 'verify.token' },
     });
 
     expect(err.tokenInvalid).toBe(true);
-    expect(err.retryable).toBe(false);
+  });
+
+  it('falls back to a placeholder code when MAX sends none', () => {
+    expect(toMaxApiError({ status: 500, response: {} }).code).toBe('unknown');
   });
 });

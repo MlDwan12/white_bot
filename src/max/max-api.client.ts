@@ -230,8 +230,9 @@ export function toMaxApiError(err: unknown): MaxApiError {
     }
   }
   // A transport-level failure (DNS, TLS, our own abort timeout) never reached
-  // MAX, so it has no status of its own — status 0 marks it as such while
-  // still counting as retryable (see MaxApiError.retryable).
+  // MAX in a form it could answer, so it has no status of its own. Status 0
+  // marks exactly that, and the delivery pipeline reads it as ambiguous — the
+  // request may still have been processed before the answer was lost.
   const message = err instanceof Error ? err.message : 'Ошибка MAX API';
   return new MaxApiError(0, 'network.error', message);
 }

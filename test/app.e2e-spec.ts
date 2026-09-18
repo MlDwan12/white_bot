@@ -19,6 +19,13 @@ describe('AppController (e2e)', () => {
     await app.init();
   });
 
+  afterEach(async () => {
+    // Required now that the app owns a BullMQ worker and Redis connections:
+    // leaving them open keeps the Node process alive and the test run never
+    // finishes. It also exercises the shutdown path on every run.
+    await app.close();
+  });
+
   it('/ (GET)', () => {
     return request(app.getHttpServer())
       .get('/')

@@ -9,6 +9,8 @@ import { PrismaModule } from './prisma/prisma.module';
 import { GroupsModule } from './groups/groups.module';
 import { VkModule } from './vk/vk.module';
 import { MaxModule } from './max/max.module';
+import { QueueModule } from './queue/queue.module';
+import { PostsModule } from './posts/posts.module';
 import { HealthController } from './health/health.controller';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -27,7 +29,9 @@ import { buildPinoConfig } from './logger/pino-logger.config';
     PrismaModule,
     VkModule,
     GroupsModule,
+    QueueModule,
     MaxModule,
+    PostsModule,
   ],
   controllers: [AppController, HealthController],
   providers: [

@@ -4,8 +4,14 @@
  *
  * `code` is MAX's own string code (e.g. `verify.token`, `chat.not.found`)
  * rather than a number — unlike VK, MAX identifies errors by string. `status`
- * is the HTTP status, kept separately because retry decisions key off it
- * (429/5xx are retryable, 4xx are not).
+ * is the HTTP status, kept separately because the delivery pipeline decides
+ * what to do from it.
+ *
+ * Deliberately carries no `retryable` flag of its own: whether a failure may
+ * be retried is delivery policy, and it lives in one place
+ * (`classifyDeliveryError`). Two notions of "retryable" in the codebase would
+ * eventually disagree, and the safe answer here is subtler than a boolean —
+ * see the comment there about duplicate posts.
  */
 export class MaxApiError extends Error {
   constructor(
@@ -15,16 +21,6 @@ export class MaxApiError extends Error {
   ) {
     super(message);
     this.name = 'MaxApiError';
-  }
-
-  /**
-   * A failure worth retrying: rate limiting, a server-side fault, or a
-   * transport error that never reached MAX (status 0 — DNS, TLS, timeout).
-   * A 4xx means MAX understood us and said no, so retrying it just burns
-   * rate-limit budget.
-   */
-  get retryable(): boolean {
-    return this.status === 0 || this.status === 429 || this.status >= 500;
   }
 
   /** The bot token is missing/revoked — the group can't be delivered to at all. */

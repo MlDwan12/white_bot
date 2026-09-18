@@ -144,12 +144,20 @@ model PostDelivery {
   error             String?
   sentAt            DateTime?
   attemptsMade      Int                @default(0)
+  // Needed to spot a delivery abandoned mid-flight: `sending` is committed
+  // before the network call, so a worker that dies leaves the row stuck
+  // there. Without a timestamp there's no way to tell "started a second ago"
+  // from "orphaned an hour ago", and such a row must go to `unknown` rather
+  // than be retried (retrying risks a duplicate post).
+  updatedAt         DateTime           @updatedAt
 
   post  Post  @relation(fields: [postId], references: [id])
   group Group @relation(fields: [groupId], references: [id])
 
   @@unique([postId, groupId])
   @@index([groupId])
+  // The reconciler sweeps for deliveries abandoned in `sending`.
+  @@index([status, updatedAt])
 }
 
 model Contest {

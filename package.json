@@ -22,15 +22,18 @@
   },
   "dependencies": {
     "@maxhub/max-bot-api": "0.3.1",
+    "@nestjs/bullmq": "12.0.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^12.0.0",
     "@nestjs/core": "^11.0.1",
     "@nestjs/platform-express": "^11.0.1",
     "@prisma/adapter-pg": "^7.10.0",
     "@prisma/client": "^7.10.0",
+    "bullmq": "6.3.6",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "dotenv": "^17.4.2",
+    "ioredis": "5.11.1",
     "joi": "^18.2.9",
     "nestjs-pino": "^5.2.0",
     "pg": "^8.23.0",
@@ -79,7 +82,7 @@
       "^.+\\.(t|j)s$": "ts-jest"
     },
     "transformIgnorePatterns": [
-      "/node_modules/(?!(@nestjs/config|dotenv-expand|es-toolkit|@standard-schema)/)"
+      "/node_modules/(?!(@nestjs/config|@nestjs/bullmq|@nestjs/bull-shared|dotenv-expand|es-toolkit|@standard-schema)/)"
     ],
     "moduleNameMapper": {
       "^(\\.{1,2}/.*)\\.js$": "$1"
