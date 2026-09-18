@@ -6,6 +6,7 @@ import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { PrismaService } from '../prisma/prisma.service';
 import { Post, PostDeliveryStatus } from '../generated/prisma/client';
+import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 import {
   DispatchPostJob,
   JOB_DISPATCH_POST,
@@ -23,6 +24,13 @@ const IN_FLIGHT: PostDeliveryStatus[] = ['pending', 'sending'];
 const DISPATCH_ATTEMPTS = 3;
 const DISPATCH_BACKOFF_MS = 2_000;
 
+/**
+ * VK's wall.post accepts at most 10 attachments. Checked at creation so the
+ * campaign fails while it's still a draft, rather than after the MAX targets
+ * already received it and every VK target rejects it.
+ */
+const MAX_ATTACHMENTS_PER_POST = 10;
+
 /** How long a failed dispatch stays in Redis for diagnosis (seconds). */
 const DISPATCH_FAILURE_RETENTION_S = 24 * 60 * 60;
 
@@ -34,6 +42,8 @@ export interface CreatePostInput {
   vkTextOverride?: string;
   maxTextOverride?: string;
   groupIds: string[];
+  /** Files to attach, in the order they should appear. */
+  attachmentIds?: string[];
   scheduledAt?: Date;
 }
 
@@ -42,6 +52,7 @@ export class PostsService {
   constructor(
     private readonly prisma: PrismaService,
     @InjectQueue(POST_DELIVERY_QUEUE) private readonly queue: Queue,
+    private readonly vkUploaderToken: VkUploaderTokenService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(PostsService.name);
@@ -79,6 +90,28 @@ export class PostsService {
       );
     }
 
+    const attachmentIds = input.attachmentIds ?? [];
+    if (attachmentIds.length > MAX_ATTACHMENTS_PER_POST) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        `VK принимает не больше ${MAX_ATTACHMENTS_PER_POST} вложений в посте`,
+      );
+    }
+    if (attachmentIds.length !== new Set(attachmentIds).size) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Один и тот же файл указан во вложениях дважды',
+      );
+    }
+    if (attachmentIds.length > 0) {
+      const found = await this.prisma.mediaAsset.count({
+        where: { id: { in: attachmentIds } },
+      });
+      if (found !== attachmentIds.length) {
+        throw new AppException(ErrorCode.NOT_FOUND, 'Часть файлов не найдена');
+      }
+    }
+
     return this.prisma.post.create({
       data: {
         text: input.text,
@@ -88,6 +121,14 @@ export class PostsService {
         status: 'draft',
         deliveries: {
           create: groupIds.map((groupId) => ({ groupId })),
+        },
+        attachments: {
+          // Position is stored explicitly: the order attachments appear in is
+          // part of the post, not an accident of row ordering.
+          create: attachmentIds.map((mediaAssetId, position) => ({
+            mediaAssetId,
+            position,
+          })),
         },
       },
     });
@@ -108,6 +149,8 @@ export class PostsService {
         `Пост нельзя запланировать из статуса «${post.status}»`,
       );
     }
+
+    await this.assertVkAttachmentsUploadable(id);
 
     const updated = await this.prisma.post.update({
       where: { id },
@@ -217,6 +260,14 @@ export class PostsService {
       );
     }
 
+    // Same gate as scheduling, and checked *before* anything is written:
+    // without it a resume answers 200, flips the post to `sending`, and the
+    // dispatch job then quietly returns — leaving the reconciler to re-offer
+    // the campaign every minute while the admin sees no sign of the problem.
+    // The statuses examined are the ones about to be resumed, since they are
+    // not `pending` yet.
+    await this.assertVkAttachmentsUploadable(id, RESUMABLE);
+
     await this.prisma.$transaction([
       this.prisma.postDelivery.updateMany({
         where: { postId: id, status: { in: RESUMABLE } },
@@ -230,6 +281,75 @@ export class PostsService {
 
     await this.enqueueDispatch({ ...post, scheduledAt: null });
     return this.findOrThrow(id);
+  }
+
+  /**
+   * True when publishing this campaign needs the personal VK uploader token:
+   * it has attachments and at least one VK target still to deliver to. MAX
+   * uploads use the bot token and are unaffected.
+   */
+  async requiresVkUploaderToken(
+    postId: string,
+    statuses: PostDeliveryStatus[] = ['pending'],
+  ): Promise<boolean> {
+    const attachments = await this.prisma.postAttachment.findMany({
+      where: { postId },
+      select: { mediaAssetId: true },
+    });
+    if (attachments.length === 0) {
+      return false;
+    }
+    const vkTargets = await this.prisma.postDelivery.findMany({
+      where: {
+        postId,
+        status: { in: statuses },
+        group: { platform: 'vk' },
+      },
+      select: { groupId: true },
+    });
+    if (vkTargets.length === 0) {
+      return false;
+    }
+
+    // Files already uploaded into those communities need no token at all —
+    // and that is precisely the "отправить оставшимся" case, where a campaign
+    // is resumed a day later with everything already uploaded and the
+    // 24-hour token long gone. Counting cached references keeps that working
+    // instead of refusing a campaign that has nothing left to upload.
+    const cached = await this.prisma.mediaPlatformUpload.count({
+      where: {
+        platform: 'vk',
+        mediaAssetId: { in: attachments.map((a) => a.mediaAssetId) },
+        scope: { in: vkTargets.map((t) => t.groupId) },
+      },
+    });
+    return cached < attachments.length * vkTargets.length;
+  }
+
+  /**
+   * Refuses to start a campaign whose attachments can't be uploaded.
+   *
+   * VK issues no refresh_token, so an expired uploader token is renewed only
+   * by the admin re-authorizing. Discovering that halfway through means some
+   * communities already have the post and the rest don't — a state nobody
+   * asked for. Better to say so before anything is published.
+   */
+  private async assertVkAttachmentsUploadable(
+    postId: string,
+    statuses?: PostDeliveryStatus[],
+  ): Promise<void> {
+    if (!(await this.requiresVkUploaderToken(postId, statuses))) {
+      return;
+    }
+    if (await this.vkUploaderToken.isUsable()) {
+      return;
+    }
+    throw new AppException(
+      ErrorCode.VK_UPLOADER_TOKEN_EXPIRED,
+      'Личный VK-токен для загрузки вложений истёк — обновите его, иначе пост с вложениями не опубликуется',
+      undefined,
+      { reauthorizeUrl: '/vk/oauth/authorize' },
+    );
   }
 
   /**

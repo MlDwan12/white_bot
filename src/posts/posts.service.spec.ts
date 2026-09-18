@@ -4,6 +4,7 @@ import { AppException } from '../common/app-exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { Post, PostDeliveryStatus } from '../generated/prisma/client';
 import { PostsService } from './posts.service';
+import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 
 function post(overrides: Partial<Post> = {}): Post {
   return {
@@ -11,7 +12,6 @@ function post(overrides: Partial<Post> = {}): Post {
     text: 'привет',
     vkTextOverride: null,
     maxTextOverride: null,
-    attachments: null,
     createdAt: new Date(),
     scheduledAt: null,
     recurrenceRule: null,
@@ -59,6 +59,9 @@ function buildService() {
       groupBy: jest.fn().mockResolvedValue([]),
     },
     group: { findMany: jest.fn() },
+    mediaAsset: { count: jest.fn().mockResolvedValue(0) },
+    postAttachment: { findMany: jest.fn().mockResolvedValue([]) },
+    mediaPlatformUpload: { count: jest.fn().mockResolvedValue(0) },
     $transaction: jest.fn().mockResolvedValue([]),
   };
   const queue = {
@@ -67,12 +70,15 @@ function buildService() {
   };
   const logger = { setContext: jest.fn(), warn: jest.fn(), error: jest.fn() };
 
+  const vkUploaderToken = { isUsable: jest.fn().mockResolvedValue(true) };
+
   const service = new PostsService(
     prisma as unknown as PrismaService,
     queue as unknown as Queue,
+    vkUploaderToken as unknown as VkUploaderTokenService,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma, queue, logger };
+  return { service, prisma, queue, vkUploaderToken, logger };
 }
 
 describe('PostsService', () => {
@@ -124,6 +130,87 @@ describe('PostsService', () => {
     });
   });
 
+  describe('attachments on create', () => {
+    it('stores attachment order explicitly', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g1', status: 'active', title: 'A' },
+      ]);
+      prisma.mediaAsset.count.mockResolvedValue(2);
+      prisma.post.create.mockResolvedValue(post());
+
+      await service.createPost({
+        text: 'x',
+        groupIds: ['g1'],
+        attachmentIds: ['m2', 'm1'],
+      });
+
+      const args = callArg<{
+        data: {
+          attachments: { create: { mediaAssetId: string; position: number }[] };
+        };
+      }>(prisma.post.create, 0, 0);
+      // The order the admin chose is the order published, so it is stored
+      // rather than inferred from row order.
+      expect(args.data.attachments.create).toEqual([
+        { mediaAssetId: 'm2', position: 0 },
+        { mediaAssetId: 'm1', position: 1 },
+      ]);
+    });
+
+    it('rejects more attachments than VK will accept', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g1', status: 'active', title: 'A' },
+      ]);
+
+      // VK's wall.post takes at most 10. Caught at creation, otherwise the
+      // MAX targets receive the post and every VK target then rejects it.
+      await expect(
+        service.createPost({
+          text: 'x',
+          groupIds: ['g1'],
+          attachmentIds: Array.from({ length: 11 }, (_, i) => `m${i}`),
+        }),
+      ).rejects.toBeInstanceOf(AppException);
+      expect(prisma.post.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects an attachment id that does not exist', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g1', status: 'active', title: 'A' },
+      ]);
+      prisma.mediaAsset.count.mockResolvedValue(1);
+
+      await expect(
+        service.createPost({
+          text: 'x',
+          groupIds: ['g1'],
+          attachmentIds: ['m1', 'missing'],
+        }),
+      ).rejects.toBeInstanceOf(AppException);
+      expect(prisma.post.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects the same file listed twice', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g1', status: 'active', title: 'A' },
+      ]);
+
+      // The (postId, mediaAssetId) unique constraint would reject this at the
+      // database anyway; failing here gives a readable reason instead of a 500.
+      await expect(
+        service.createPost({
+          text: 'x',
+          groupIds: ['g1'],
+          attachmentIds: ['m1', 'm1'],
+        }),
+      ).rejects.toBeInstanceOf(AppException);
+    });
+  });
+
   describe('enqueueDispatch', () => {
     it('delays the job until scheduledAt', async () => {
       const { service, queue } = buildService();
@@ -162,6 +249,73 @@ describe('PostsService', () => {
       await service.enqueueDispatch(post());
 
       expect(remove).toHaveBeenCalled();
+      expect(queue.add).toHaveBeenCalled();
+    });
+  });
+
+  describe('VK uploader token pre-flight', () => {
+    it('refuses to start a campaign whose attachments cannot be uploaded', async () => {
+      const { service, prisma, vkUploaderToken, queue } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.postAttachment.findMany.mockResolvedValue([
+        { mediaAssetId: 'm1' },
+      ]);
+      prisma.postDelivery.findMany.mockResolvedValue([{ groupId: 'g1' }]);
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      // VK issues no refresh_token, so an expired token is renewed only by the
+      // admin. Finding that out mid-campaign leaves some groups with the post
+      // and others without — better to refuse before anything is published.
+      await expect(service.schedulePost('post-1')).rejects.toBeInstanceOf(
+        AppException,
+      );
+      expect(queue.add).not.toHaveBeenCalled();
+    });
+
+    it('carries the reauthorization link in the error', async () => {
+      const { service, prisma, vkUploaderToken } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.postAttachment.findMany.mockResolvedValue([
+        { mediaAssetId: 'm1' },
+      ]);
+      prisma.postDelivery.findMany.mockResolvedValue([{ groupId: 'g1' }]);
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      const error = await service.schedulePost('post-1').then(
+        () => {
+          throw new Error('Ожидалась ошибка');
+        },
+        (err: unknown) => err as AppException,
+      );
+
+      expect(error.details).toMatchObject({
+        reauthorizeUrl: '/vk/oauth/authorize',
+      });
+    });
+
+    it('does not block a text-only campaign', async () => {
+      const { service, prisma, vkUploaderToken, queue } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.postAttachment.findMany.mockResolvedValue([]);
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      // No attachments means no upload, so the personal token is irrelevant.
+      await service.schedulePost('post-1');
+      expect(queue.add).toHaveBeenCalled();
+    });
+
+    it('does not block a campaign whose only targets are MAX', async () => {
+      const { service, prisma, vkUploaderToken, queue } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.postAttachment.findMany.mockResolvedValue([
+        { mediaAssetId: 'm1' },
+        { mediaAssetId: 'm2' },
+      ]);
+      prisma.postDelivery.findMany.mockResolvedValue([]); // no VK targets
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      // MAX uploads go through the bot token, which never expires this way.
+      await service.schedulePost('post-1');
       expect(queue.add).toHaveBeenCalled();
     });
   });
@@ -251,6 +405,43 @@ describe('PostsService', () => {
             .stopRequested === false,
       );
       expect(clearedStop).toBe(true);
+    });
+
+    it('refuses to resume when attachments still need an expired token', async () => {
+      const { service, prisma, vkUploaderToken } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'stopped' }));
+      prisma.postDelivery.findMany
+        .mockResolvedValueOnce([{ id: 'd1' }]) // resumable deliveries
+        .mockResolvedValueOnce([{ groupId: 'g1' }]); // VK targets to re-deliver
+      prisma.postAttachment.findMany.mockResolvedValue([
+        { mediaAssetId: 'm1' },
+      ]);
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      // Without this the resume answers 200, the post flips to `sending`, and
+      // dispatch quietly does nothing — with no signal to the admin.
+      await expect(service.resumePost('post-1')).rejects.toBeInstanceOf(
+        AppException,
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('resumes when every attachment is already uploaded to those groups', async () => {
+      const { service, prisma, vkUploaderToken } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'stopped' }));
+      prisma.postDelivery.findMany
+        .mockResolvedValueOnce([{ id: 'd1' }])
+        .mockResolvedValueOnce([{ groupId: 'g1' }]);
+      prisma.postAttachment.findMany.mockResolvedValue([
+        { mediaAssetId: 'm1' },
+      ]);
+      // 1 asset × 1 group, already cached — nothing left to upload.
+      prisma.mediaPlatformUpload.count.mockResolvedValue(1);
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      // This is the everyday case: a campaign resumed a day later, when the
+      // 24-hour token is long gone but no upload is needed.
+      await expect(service.resumePost('post-1')).resolves.toBeDefined();
     });
 
     it('says so when there is nothing to resend', async () => {

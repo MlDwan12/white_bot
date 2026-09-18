@@ -7,6 +7,15 @@ const VK_API_VERSION = '5.199';
 const VK_API_BASE = 'https://api.vk.com/method';
 const REQUEST_TIMEOUT_MS = 10_000;
 
+/**
+ * Pushing file bytes is not one round trip: a 20 MB document on a modest
+ * uplink needs far longer than an API call, and the 10s budget above would
+ * abort it midway. An aborted upload surfaces as an ambiguous failure, which
+ * sends the whole delivery to `unknown` for manual checking — an expensive
+ * outcome for a slow connection. Mirrors the 60s the MAX client already uses.
+ */
+const UPLOAD_TIMEOUT_MS = 60_000;
+
 export interface VkGroupInfo {
   externalId: string;
   title: string;
@@ -247,7 +256,7 @@ export class VkApiClient {
     const res = await fetch(uploadUrl, {
       method: 'POST',
       body: form,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
     });
     if (!res.ok) {
       throw new VkApiError(0, `Загрузка файла в VK вернула HTTP ${res.status}`);

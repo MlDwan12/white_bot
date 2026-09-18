@@ -3,6 +3,7 @@ import { TokenEncryptionService } from '../common/crypto/token-encryption.servic
 import { VkApiClient } from '../vk/vk-api.client';
 import { MaxApiClient } from '../max/max-api.client';
 import { PostSender } from './post-sender';
+import { AttachmentUploader } from './attachment-uploader';
 
 function post(overrides: Partial<Post> = {}): Post {
   return {
@@ -29,13 +30,18 @@ function setup() {
     sendMessageToChat: jest.fn().mockResolvedValue({ messageId: 'mid-9' }),
   };
   const tokenEncryption = { decrypt: jest.fn().mockReturnValue('plain-token') };
+  const attachments = {
+    vkRefs: jest.fn().mockResolvedValue([]),
+    maxAttachments: jest.fn().mockResolvedValue([]),
+  };
 
   const sender = new PostSender(
     vk as unknown as VkApiClient,
     max as unknown as MaxApiClient,
     tokenEncryption as unknown as TokenEncryptionService,
+    attachments as unknown as AttachmentUploader,
   );
-  return { sender, vk, max, tokenEncryption };
+  return { sender, vk, max, tokenEncryption, attachments };
 }
 
 describe('PostSender', () => {
@@ -71,6 +77,7 @@ describe('PostSender', () => {
       'plain-token',
       '123',
       'общий текст',
+      [],
     );
     expect(result).toEqual({ externalMessageId: '777' });
   });
@@ -93,7 +100,9 @@ describe('PostSender', () => {
     );
 
     // MAX identifies chats numerically, while we store external ids as text.
-    expect(max.sendMessageToChat).toHaveBeenCalledWith(500, 'общий текст');
+    expect(max.sendMessageToChat).toHaveBeenCalledWith(500, 'общий текст', {
+      attachments: [],
+    });
     expect(result).toEqual({ externalMessageId: 'mid-9' });
   });
 });

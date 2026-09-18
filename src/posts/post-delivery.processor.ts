@@ -13,6 +13,7 @@ import {
 } from '../queue/queue.constants';
 import { PostsService } from './posts.service';
 import { PostSender } from './post-sender';
+import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 import { classifyDeliveryError } from './delivery-outcome';
 
 /**
@@ -41,6 +42,7 @@ export class PostDeliveryProcessor extends WorkerHost {
     private readonly posts: PostsService,
     private readonly sender: PostSender,
     private readonly rateLimiter: GroupRateLimiter,
+    private readonly vkUploaderToken: VkUploaderTokenService,
     @InjectQueue(POST_DELIVERY_QUEUE) private readonly queue: Queue,
     private readonly logger: PinoLogger,
   ) {
@@ -74,6 +76,22 @@ export class PostDeliveryProcessor extends WorkerHost {
       this.logger.warn(
         { postId, status: post.status },
         'Пост не в состоянии рассылки — пропуск',
+      );
+      return;
+    }
+
+    // Checked again here, not only when the campaign was scheduled: a post
+    // planned for tomorrow outlives the 24-hour uploader token, so the answer
+    // at scheduling time says nothing about now. Status is left untouched so
+    // the reconciler keeps re-offering the campaign — the moment the admin
+    // re-authorizes, it goes out by itself.
+    if (
+      (await this.posts.requiresVkUploaderToken(postId)) &&
+      !(await this.vkUploaderToken.isUsable())
+    ) {
+      this.logger.warn(
+        { postId },
+        'Личный VK-токен истёк — рассылка с вложениями отложена до переавторизации',
       );
       return;
     }
@@ -139,7 +157,17 @@ export class PostDeliveryProcessor extends WorkerHost {
     const { deliveryId } = job.data;
     const delivery = await this.prisma.postDelivery.findUnique({
       where: { id: deliveryId },
-      include: { post: true, group: true },
+      include: {
+        post: {
+          include: {
+            attachments: {
+              orderBy: { position: 'asc' },
+              include: { mediaAsset: true },
+            },
+          },
+        },
+        group: true,
+      },
     });
     if (!delivery) {
       this.logger.warn({ deliveryId }, 'Доставка исчезла — пропуск');
@@ -198,6 +226,7 @@ export class PostDeliveryProcessor extends WorkerHost {
       ({ externalMessageId } = await this.sender.send(
         delivery.post,
         delivery.group,
+        delivery.post.attachments.map((attachment) => attachment.mediaAsset),
       ));
     } catch (err: unknown) {
       await this.handleDeliveryError(job, deliveryId, delivery.groupId, err);

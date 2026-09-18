@@ -33,6 +33,17 @@ export class CreatePostDto {
   @IsUUID('4', { each: true })
   groupIds: string[];
 
+  /**
+   * Ids of previously uploaded files (POST /media), in display order.
+   * Attachments are shared across platforms — only text has per-platform
+   * overrides, as PLAN.md fixes for the MVP.
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  attachmentIds?: string[];
+
   /** Omit to publish as soon as the campaign is started. */
   @IsOptional()
   @Type(() => Date)

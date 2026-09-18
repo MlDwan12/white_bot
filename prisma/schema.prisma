@@ -44,6 +44,11 @@ enum PostDeliveryStatus {
   unknown
 }
 
+enum MediaKind {
+  image
+  document
+}
+
 enum ContestStatus {
   draft
   open
@@ -95,7 +100,6 @@ model Post {
   text                   String
   vkTextOverride         String?
   maxTextOverride        String?
-  attachments            Json?
   createdAt              DateTime   @default(now())
   scheduledAt            DateTime?
   recurrenceRule         String?
@@ -113,6 +117,7 @@ model Post {
   recurringTemplate Post?                @relation("RecurringOccurrence", fields: [recurringTemplateId], references: [id])
   occurrences       Post[]               @relation("RecurringOccurrence")
   deliveries        PostDelivery[]
+  attachments       PostAttachment[]
   contest           Contest?
   templateTargets   PostTemplateTarget[]
 
@@ -158,6 +163,77 @@ model PostDelivery {
   @@index([groupId])
   // The reconciler sweeps for deliveries abandoned in `sending`.
   @@index([status, updatedAt])
+}
+
+/// Загруженный файл. Хранится на диске (путь относительно MEDIA_STORAGE_PATH),
+/// в БД — только метаданные: класть байты в Postgres означало бы раздувать
+/// дампы, а видео во «Фазе 2» сделало бы это невыносимым.
+model MediaAsset {
+  id       String    @id @default(uuid())
+  /// Имя, под которым файл загрузили — его видит получатель документа.
+  filename String
+  kind     MediaKind
+  /// Для изображений определён по содержимому файла, а не по заголовку формы:
+  /// Content-Type от клиента подделывается тривиально, а от этого решения
+  /// зависит, будем ли мы пережимать файл и каким методом его публиковать.
+  mimeType String
+  sizeBytes Int
+  /// sha256 оригинала: позволяет убедиться, что файл на диске не подменён,
+  /// и распознать повторную загрузку того же файла.
+  checksum String
+  storagePath String @unique
+  /// Оптимизированный вариант — только для изображений и только если он
+  /// реально меньше оригинала. Оригинал остаётся нетронутым всегда.
+  optimizedPath String? @unique
+  optimizedSizeBytes Int?
+  createdAt DateTime @default(now())
+
+  postAttachments PostAttachment[]
+  platformUploads MediaPlatformUpload[]
+
+  @@index([checksum])
+}
+
+/// Связь поста с файлами и их порядок. Отдельная таблица, а не JSON-массив в
+/// Post: внешний ключ не даёт удалить файл, на который ссылается пост, а
+/// позиция задаётся явно, а не смыслом порядка элементов в JSON.
+model PostAttachment {
+  id           String @id @default(uuid())
+  postId       String
+  mediaAssetId String
+  position     Int
+
+  post       Post       @relation(fields: [postId], references: [id])
+  mediaAsset MediaAsset @relation(fields: [mediaAssetId], references: [id])
+
+  @@unique([postId, position])
+  @@unique([postId, mediaAssetId])
+  @@index([mediaAssetId])
+}
+
+/// Кэш ссылок на уже загруженный платформе файл.
+///
+/// VK требует загружать файл отдельно в каждое сообщество (ссылка вида
+/// photo-123_456 принадлежит конкретному владельцу), поэтому для VK ключом
+/// служит id группы. У MAX токен вложения выдаётся боту и годится для всех
+/// его чатов, поэтому там ключ один на платформу.
+///
+/// Без кэша повторная попытка после rate-limit или «отправить оставшимся»
+/// заливала бы тот же файл заново.
+model MediaPlatformUpload {
+  id           String   @id @default(uuid())
+  mediaAssetId String
+  platform     Platform
+  /// Group.id для VK; фиксированная строка для MAX. Не nullable намеренно:
+  /// в Postgres NULL не равен NULL, и уникальный индекс с NULL не помешал бы
+  /// дубликатам для MAX.
+  scope        String
+  externalRef  String
+  createdAt    DateTime @default(now())
+
+  mediaAsset MediaAsset @relation(fields: [mediaAssetId], references: [id])
+
+  @@unique([mediaAssetId, platform, scope])
 }
 
 model Contest {

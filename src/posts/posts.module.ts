@@ -3,10 +3,12 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { CryptoModule } from '../common/crypto/crypto.module';
 import { VkModule } from '../vk/vk.module';
 import { MaxModule } from '../max/max.module';
+import { MediaModule } from '../media/media.module';
 import { QueueModule } from '../queue/queue.module';
 import { PostsController } from './posts.controller';
 import { PostsService } from './posts.service';
 import { PostSender } from './post-sender';
+import { AttachmentUploader } from './attachment-uploader';
 import { PostDeliveryProcessor } from './post-delivery.processor';
 import { PostReconcilerService } from './post-reconciler.service';
 
@@ -16,6 +18,7 @@ import { PostReconcilerService } from './post-reconciler.service';
     CryptoModule,
     VkModule,
     MaxModule,
+    MediaModule,
     // QueueModule is global and already registers the delivery queue; a
     // second registerQueue here would build a second Queue instance (and a
     // second set of Redis connections) behind the same token.
@@ -25,6 +28,7 @@ import { PostReconcilerService } from './post-reconciler.service';
   providers: [
     PostsService,
     PostSender,
+    AttachmentUploader,
     PostDeliveryProcessor,
     PostReconcilerService,
   ],

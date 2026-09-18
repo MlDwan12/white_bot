@@ -9,6 +9,7 @@ import { MaxApiError } from '../max/max-api.error';
 import { PostDeliveryProcessor } from './post-delivery.processor';
 import { PostSender } from './post-sender';
 import { PostsService } from './posts.service';
+import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 
 function deliveryRow(overrides: Record<string, unknown> = {}) {
   return {
@@ -16,7 +17,12 @@ function deliveryRow(overrides: Record<string, unknown> = {}) {
     postId: 'post-1',
     groupId: 'g1',
     status: 'pending',
-    post: { id: 'post-1', stopRequested: false, text: 'привет' },
+    post: {
+      id: 'post-1',
+      stopRequested: false,
+      text: 'привет',
+      attachments: [],
+    },
     group: { id: 'g1', platform: 'vk', externalId: '123' },
     ...overrides,
   };
@@ -53,7 +59,11 @@ function setup() {
     },
     group: { update: jest.fn().mockResolvedValue({}) },
   };
-  const posts = { finalizeIfComplete: jest.fn().mockResolvedValue({}) };
+  const posts = {
+    finalizeIfComplete: jest.fn().mockResolvedValue({}),
+    requiresVkUploaderToken: jest.fn().mockResolvedValue(false),
+  };
+  const vkUploaderToken = { isUsable: jest.fn().mockResolvedValue(true) };
   const sender = {
     send: jest.fn().mockResolvedValue({ externalMessageId: '42' }),
   };
@@ -76,10 +86,20 @@ function setup() {
     posts as unknown as PostsService,
     sender as unknown as PostSender,
     rateLimiter as unknown as GroupRateLimiter,
+    vkUploaderToken as unknown as VkUploaderTokenService,
     queue as unknown as Queue,
     logger as unknown as PinoLogger,
   );
-  return { processor, prisma, posts, sender, rateLimiter, queue, logger };
+  return {
+    processor,
+    prisma,
+    posts,
+    sender,
+    rateLimiter,
+    vkUploaderToken,
+    queue,
+    logger,
+  };
 }
 
 /** Reads one argument of a recorded call as `T` — `mock.calls` is `any[][]`. */
@@ -145,6 +165,44 @@ describe('PostDeliveryProcessor', () => {
     });
   });
 
+  describe('uploader token at dispatch time', () => {
+    it('holds back a campaign with attachments when the token has expired', async () => {
+      const { processor, prisma, posts, vkUploaderToken, queue } = setup();
+      prisma.post.findUnique.mockResolvedValue({
+        id: 'post-1',
+        status: 'scheduled',
+        stopRequested: false,
+      });
+      posts.requiresVkUploaderToken.mockResolvedValue(true);
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      await processor.process(dispatchJob('post-1'));
+
+      // A post scheduled for tomorrow outlives the 24-hour token, so the check
+      // at scheduling time says nothing about now.
+      expect(queue.add).not.toHaveBeenCalled();
+      // Status untouched, so the reconciler keeps offering the campaign and it
+      // goes out by itself once the admin re-authorizes.
+      expect(prisma.post.update).not.toHaveBeenCalled();
+    });
+
+    it('proceeds when the campaign needs no VK upload', async () => {
+      const { processor, prisma, posts, vkUploaderToken, queue } = setup();
+      prisma.post.findUnique.mockResolvedValue({
+        id: 'post-1',
+        status: 'scheduled',
+        stopRequested: false,
+      });
+      prisma.postDelivery.findMany.mockResolvedValue([{ id: 'd1' }]);
+      posts.requiresVkUploaderToken.mockResolvedValue(false);
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      await processor.process(dispatchJob('post-1'));
+
+      expect(queue.add).toHaveBeenCalled();
+    });
+  });
+
   describe('deliver', () => {
     it('records the platform message id needed for later edit/delete', async () => {
       const { processor, prisma, sender } = setup();
@@ -156,6 +214,29 @@ describe('PostDeliveryProcessor', () => {
         status: 'sent',
         externalMessageId: '42',
       });
+    });
+
+    it('hands the sender its attachments in the stored order', async () => {
+      const { processor, prisma, sender } = setup();
+      prisma.postDelivery.findUnique.mockResolvedValue(
+        deliveryRow({
+          post: {
+            id: 'post-1',
+            stopRequested: false,
+            attachments: [
+              { position: 0, mediaAsset: { id: 'm1' } },
+              { position: 1, mediaAsset: { id: 'm2' } },
+            ],
+          },
+        }),
+      );
+
+      await processor.process(deliverJob());
+
+      const assets = (sender.send.mock.calls[0] as unknown[])[2] as {
+        id: string;
+      }[];
+      expect(assets.map((a) => a.id)).toEqual(['m1', 'm2']);
     });
 
     it('commits `sending` before calling the platform', async () => {
@@ -188,7 +269,9 @@ describe('PostDeliveryProcessor', () => {
     it('marks the delivery skipped when a stop landed after queueing', async () => {
       const { processor, prisma, sender } = setup();
       prisma.postDelivery.findUnique.mockResolvedValue(
-        deliveryRow({ post: { id: 'post-1', stopRequested: true } }),
+        deliveryRow({
+          post: { id: 'post-1', stopRequested: true, attachments: [] },
+        }),
       );
 
       await processor.process(deliverJob());

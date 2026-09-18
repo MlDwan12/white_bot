@@ -11,6 +11,7 @@ import { VkModule } from './vk/vk.module';
 import { MaxModule } from './max/max.module';
 import { QueueModule } from './queue/queue.module';
 import { PostsModule } from './posts/posts.module';
+import { MediaModule } from './media/media.module';
 import { HealthController } from './health/health.controller';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -31,6 +32,7 @@ import { buildPinoConfig } from './logger/pino-logger.config';
     GroupsModule,
     QueueModule,
     MaxModule,
+    MediaModule,
     PostsModule,
   ],
   controllers: [AppController, HealthController],

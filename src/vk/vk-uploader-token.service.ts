@@ -149,6 +149,25 @@ export class VkUploaderTokenService {
     return { expiresAt };
   }
 
+  /**
+   * Non-throwing check, for deciding *before* a campaign starts whether its
+   * attachments can be uploaded at all.
+   *
+   * VK issues no refresh_token for this flow (confirmed empirically in Step 4),
+   * so an expired token can only be renewed by the admin clicking through
+   * authorization again. Finding that out mid-campaign is far worse than
+   * refusing to start: by then some groups have the post and others don't.
+   */
+  async isUsable(): Promise<boolean> {
+    const row = await this.prisma.vkUploaderToken.findUnique({
+      where: { id: SINGLETON_ID },
+    });
+    return (
+      row !== null &&
+      row.expiresAt.getTime() - EXPIRY_SAFETY_MARGIN_MS > Date.now()
+    );
+  }
+
   /** Throws AppException(VK_UPLOADER_TOKEN_EXPIRED, details.reauthorizeUrl) if missing/expired. */
   async getValidAccessToken(): Promise<string> {
     const row = await this.prisma.vkUploaderToken.findUnique({

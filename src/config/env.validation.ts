@@ -45,4 +45,8 @@ export const envValidationSchema = Joi.object({
   // rather than per-Group: in MAX the bot is one identity and the chats are
   // its targets.
   MAX_BOT_TOKEN: Joi.string().allow('').optional(),
+  // Where uploaded attachment files live. A default keeps local runs and CI
+  // working without extra configuration; in Docker this path is a volume, so
+  // files survive container rebuilds (see PLAN.md, шаг 11).
+  MEDIA_STORAGE_PATH: Joi.string().default('./storage/media'),
 });
