@@ -8,6 +8,7 @@ import { envValidationSchema } from './config/env.validation';
 import { PrismaModule } from './prisma/prisma.module';
 import { GroupsModule } from './groups/groups.module';
 import { VkModule } from './vk/vk.module';
+import { MaxModule } from './max/max.module';
 import { HealthController } from './health/health.controller';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -26,6 +27,7 @@ import { buildPinoConfig } from './logger/pino-logger.config';
     PrismaModule,
     VkModule,
     GroupsModule,
+    MaxModule,
   ],
   controllers: [AppController, HealthController],
   providers: [

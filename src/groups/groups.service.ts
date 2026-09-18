@@ -258,6 +258,45 @@ export class GroupsService {
       : 'active';
   }
 
+  /**
+   * MAX's `bot_removed` event: the bot can no longer post there, so the group
+   * stops being a valid delivery target. Deliberately not a soft-delete —
+   * `bot_removed` is recoverable (re-adding the bot reactivates the row via
+   * createOrReactivateMaxDraft), while `removed` means an admin disconnected
+   * it on purpose and must confirm again.
+   *
+   * An unknown chat_id is not an error: the bot can be removed from a chat
+   * whose draft was already rejected (rejectMaxGroup hard-deletes the row),
+   * and a removal event for a group we never tracked is simply nothing to do.
+   *
+   * A still-`pending_confirmation` draft is deliberately left untouched.
+   * `maxDraftStatus` reads `bot_removed` as proof the group was confirmed
+   * once, so overwriting a draft here would let this sequence through: bot
+   * added → draft created → bot removed before anyone reviews it → bot
+   * re-added → group silently becomes `active`. That would make a chat a live
+   * broadcast target that no admin ever approved.
+   */
+  async markMaxGroupBotRemoved(externalId: string): Promise<boolean> {
+    const { count } = await this.prisma.group.updateMany({
+      where: {
+        platform: 'max',
+        externalId,
+        status: { notIn: ['removed', 'pending_confirmation'] },
+      },
+      data: { status: 'bot_removed' },
+    });
+    return count > 0;
+  }
+
+  /** MAX drafts awaiting an admin's confirm/reject decision. */
+  async listPendingMaxGroups(): Promise<PublicGroup[]> {
+    const groups = await this.prisma.group.findMany({
+      where: { platform: 'max', status: 'pending_confirmation' },
+      orderBy: { createdAt: 'asc' },
+    });
+    return groups.map((group) => this.toPublicGroup(group));
+  }
+
   async confirmMaxGroup(id: string, tags?: string[]): Promise<PublicGroup> {
     const existing = await this.findByIdOrThrow(id);
     this.assertPendingMax(existing);

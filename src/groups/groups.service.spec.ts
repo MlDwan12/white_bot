@@ -31,6 +31,7 @@ function buildService() {
       create: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
+      updateMany: jest.fn(),
     },
   };
   const vkApiClient = {
@@ -447,6 +448,96 @@ describe('GroupsService', () => {
       await service.rejectMaxGroup('g1');
 
       expect(prisma.group.delete).toHaveBeenCalledWith({ where: { id: 'g1' } });
+    });
+  });
+
+  describe('markMaxGroupBotRemoved', () => {
+    it('marks a known MAX group as bot_removed', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+
+      await expect(service.markMaxGroupBotRemoved('500')).resolves.toBe(true);
+      expect(prisma.group.updateMany).toHaveBeenCalledWith({
+        where: {
+          platform: 'max',
+          externalId: '500',
+          status: { notIn: ['removed', 'pending_confirmation'] },
+        },
+        data: { status: 'bot_removed' },
+      });
+    });
+
+    it('leaves an explicitly disconnected group and an unreviewed draft alone', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.markMaxGroupBotRemoved('500')).resolves.toBe(false);
+      const where = lastCallArg<{ where: { status: unknown } }>(
+        prisma.group.updateMany,
+      ).where;
+      // `removed` means an admin disconnected it on purpose. And overwriting
+      // a `pending_confirmation` draft would be worse than cosmetic:
+      // maxDraftStatus reads `bot_removed` as "was confirmed once", so a
+      // draft removed before review and then re-added would come back
+      // `active` — a live broadcast target nobody ever approved.
+      expect(where.status).toEqual({
+        notIn: ['removed', 'pending_confirmation'],
+      });
+    });
+
+    it('does not let an unreviewed draft reach active by way of bot_removed', async () => {
+      const { service, prisma } = buildService();
+      // The draft was never reviewed, so the removal must not touch it...
+      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+      await service.markMaxGroupBotRemoved('500');
+
+      // ...and re-adding the bot must therefore still ask for confirmation.
+      prisma.group.findUnique.mockResolvedValue({
+        id: 'g1',
+        status: 'pending_confirmation',
+      });
+      prisma.group.update.mockImplementation(
+        (args: { data: { status: string } }) => ({
+          id: 'g1',
+          platform: 'max',
+          kind: 'chat',
+          externalId: '500',
+          title: 'Чат',
+          tokenMask: null,
+          tags: [],
+          status: args.data.status,
+          createdAt: new Date(),
+        }),
+      );
+
+      const group = await service.createOrReactivateMaxDraft({
+        externalId: '500',
+        kind: 'chat',
+        title: 'Чат',
+      });
+      expect(group.status).toBe('pending_confirmation');
+    });
+
+    it('reports an unknown chat as nothing-to-do rather than failing', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+
+      // A rejected draft is hard-deleted, so its removal event has no row.
+      await expect(service.markMaxGroupBotRemoved('999')).resolves.toBe(false);
+    });
+  });
+
+  describe('listPendingMaxGroups', () => {
+    it('returns only MAX drafts awaiting review, oldest first', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.findMany.mockResolvedValue([]);
+
+      await service.listPendingMaxGroups();
+
+      expect(prisma.group.findMany).toHaveBeenCalledWith({
+        where: { platform: 'max', status: 'pending_confirmation' },
+        orderBy: { createdAt: 'asc' },
+      });
     });
   });
 });

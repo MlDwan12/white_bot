@@ -32,6 +32,17 @@ export const envValidationSchema = Joi.object({
   // custom redirect_uri is rejected outright ("check application redirect
   // uri in the settings page") — only the universal oauth.vk.com/blank.html
   // works, so it's hardcoded (see VkUploaderTokenService), not configurable.
-  VK_APP_ID: Joi.string().optional(),
-  VK_APP_CLIENT_SECRET: Joi.string().optional(),
+  // `.allow('')` matters: dotenv turns a bare `VK_APP_ID=` line (exactly what
+  // .env.example ships) into an empty string, which Joi's string type rejects
+  // by default — copying .env.example to .env would then refuse to boot
+  // instead of simply running without the optional integration.
+  VK_APP_ID: Joi.string().allow('').optional(),
+  VK_APP_CLIENT_SECRET: Joi.string().allow('').optional(),
+  // Optional for the same reason as VK_APP_ID: the app must boot without it
+  // (local runs, CI, e2e) — a missing token disables MAX long polling with a
+  // startup warning instead of crashing the whole process. Unlike VK, this
+  // is a single bot token for every MAX chat/channel, so it lives in env
+  // rather than per-Group: in MAX the bot is one identity and the chats are
+  // its targets.
+  MAX_BOT_TOKEN: Joi.string().allow('').optional(),
 });

@@ -1,0 +1,251 @@
+import { Inject, Injectable } from '@nestjs/common';
+import { Bot } from '@maxhub/max-bot-api';
+import { PinoLogger } from 'nestjs-pino';
+import { GroupsService, PublicGroup } from '../groups/groups.service';
+import { MaxAdminResolver } from './max-admin.resolver';
+import { MaxApiClient } from './max-api.client';
+import { MAX_BOT } from './max-bot.provider';
+
+/** Callback payloads for the pending-group review buttons. */
+const GROUP_REVIEW_PAYLOAD = /^group:(confirm|reject):([0-9a-fA-F-]{36})$/;
+
+export function groupReviewPayload(
+  action: 'confirm' | 'reject',
+  groupId: string,
+): string {
+  return `group:${action}:${groupId}`;
+}
+
+/**
+ * Registers the bot's update handlers, in the Composer style the MAX docs
+ * document (`bot.on` / `bot.action` / `bot.command`) rather than a hand-rolled
+ * switch over `update_type` — the SDK narrows `ctx` to the matching update
+ * type, so the payload fields are typed per handler.
+ *
+ * Handlers stay thin on purpose: every decision that outlives the update lives
+ * in GroupsService, so the web panel and the bot can't drift apart.
+ */
+@Injectable()
+export class MaxBotHandlers {
+  constructor(
+    @Inject(MAX_BOT) private readonly bot: Bot | null,
+    private readonly groups: GroupsService,
+    private readonly admins: MaxAdminResolver,
+    private readonly api: MaxApiClient,
+    private readonly logger: PinoLogger,
+  ) {
+    this.logger.setContext(MaxBotHandlers.name);
+  }
+
+  register(): void {
+    const bot = this.bot;
+    if (!bot) {
+      return;
+    }
+
+    // A thrown handler would otherwise bubble into the polling loop and kill
+    // it, taking every future update with it.
+    bot.catch((err, ctx) => {
+      this.logger.error(
+        { err, updateType: ctx.updateType },
+        'Ошибка в обработчике MAX-апдейта',
+      );
+    });
+
+    bot.command('start', async (ctx) => {
+      // `message_created` carries no top-level `user` (unlike the chat-
+      // membership events) — the sender lives on the message itself, and MAX
+      // leaves it unset for channel posts published on the channel's behalf.
+      const senderId = ctx.message.sender?.user_id;
+      const chatId = ctx.chatId;
+      if (senderId === undefined || chatId === null) {
+        return;
+      }
+      await this.handleStart(senderId, chatId);
+    });
+
+    bot.on('bot_added', async (ctx) => {
+      await this.handleBotAdded(ctx.chatId, ctx.update.is_channel);
+    });
+
+    bot.on('bot_removed', async (ctx) => {
+      await this.handleBotRemoved(ctx.chatId);
+    });
+
+    bot.action(GROUP_REVIEW_PAYLOAD, async (ctx) => {
+      const match = ctx.match;
+      if (!match) {
+        return;
+      }
+      await this.handleGroupReview(
+        ctx.user.user_id,
+        ctx.callback.callback_id,
+        match[1] as 'confirm' | 'reject',
+        match[2],
+      );
+    });
+  }
+
+  /**
+   * Answers with the sender's own MAX user id. Until the web panel can create
+   * admins (Step 9), this is how the first AdminUser row gets its `maxUserId`
+   * — there's no other way to discover it. Replying to a stranger leaks
+   * nothing: they already know the bot exists (they just messaged it) and the
+   * id returned is their own.
+   */
+  private async handleStart(userId: number, chatId: number): Promise<void> {
+    const admin = await this.admins.findByMaxUserId(userId);
+    const text = admin
+      ? `Бот на связи. Вы опознаны как ${admin.email} (роль: ${admin.role}).`
+      : `Бот на связи, но ваш MAX-аккаунт не привязан ни к одному администратору.\n\nВаш MAX user id: ${userId}\nЧтобы получить доступ, впишите его в поле maxUserId нужного администратора.`;
+    await this.api.sendMessageToChat(chatId, text);
+  }
+
+  /**
+   * The bot was added to a chat or channel. MAX's `bot_added` payload carries
+   * no title, so the name has to be fetched separately before the draft can
+   * be created.
+   */
+  private async handleBotAdded(
+    chatId: number,
+    isChannel: boolean,
+  ): Promise<void> {
+    const info = await this.api.getChat(chatId);
+    // `is_channel` and the chat's own type can disagree (the event flag is
+    // derived, the chat record is authoritative), and a `dialog` is a 1:1
+    // conversation that must never become a delivery target.
+    if (info.kind === 'dialog') {
+      this.logger.info(
+        { chatId },
+        'Бот добавлен в личный диалог — группа не создаётся',
+      );
+      return;
+    }
+    // The chat record wins outright: `is_channel` is a derived flag on the
+    // event, while `getChat` returns the chat's own type. Letting the flag
+    // override it would file a group chat as a channel (or the reverse), and
+    // `kind` decides how the group is addressed everywhere downstream.
+    const kind = info.kind;
+    if (isChannel !== (kind === 'channel')) {
+      this.logger.warn(
+        { chatId, isChannel, kind },
+        'Флаг is_channel расходится с типом чата — использован тип из getChat',
+      );
+    }
+
+    const group = await this.groups.createOrReactivateMaxDraft({
+      externalId: info.externalId,
+      kind,
+      title: info.title,
+    });
+
+    if (group.status !== 'pending_confirmation') {
+      this.logger.info(
+        { chatId, groupId: group.id },
+        'Бот возвращён в ранее подтверждённую MAX-группу — переподтверждение не требуется',
+      );
+      return;
+    }
+    await this.notifyAdminsOfPendingGroup(group);
+  }
+
+  private async handleBotRemoved(chatId: number): Promise<void> {
+    const marked = await this.groups.markMaxGroupBotRemoved(String(chatId));
+    this.logger.info(
+      { chatId, marked },
+      marked
+        ? 'MAX-группа помечена как bot_removed'
+        : 'Событие bot_removed для неизвестной группы — пропущено',
+    );
+  }
+
+  private async handleGroupReview(
+    userId: number,
+    callbackId: string,
+    action: 'confirm' | 'reject',
+    groupId: string,
+  ): Promise<void> {
+    const admin = await this.admins.findByMaxUserId(userId);
+    if (!admin) {
+      // Silence rather than "доступ запрещён": an unknown sender shouldn't
+      // learn that this button maps to anything real.
+      this.logger.warn(
+        { userId, groupId },
+        'Нажатие кнопки подтверждения группы от неизвестного пользователя — проигнорировано',
+      );
+      await this.api.answerCallback(callbackId);
+      return;
+    }
+
+    try {
+      if (action === 'confirm') {
+        const group = await this.groups.confirmMaxGroup(groupId);
+        await this.api.answerCallback(
+          callbackId,
+          `Группа «${group.title}» подключена`,
+        );
+      } else {
+        await this.groups.rejectMaxGroup(groupId);
+        await this.api.answerCallback(callbackId, 'Группа отклонена');
+      }
+    } catch (err: unknown) {
+      // Most likely the other admin already decided, or the draft is gone —
+      // the click still has to be acknowledged or the client spins forever.
+      this.logger.warn(
+        { err, groupId, action, adminId: admin.id },
+        'Не удалось применить решение по MAX-группе',
+      );
+      await this.api.answerCallback(
+        callbackId,
+        'Не удалось применить решение — возможно, группа уже обработана',
+      );
+    }
+  }
+
+  /**
+   * Best-effort, like the VK connection test post: MAX refuses to deliver a
+   * bot's first message to a user who never opened a dialog with it, so a
+   * failure here is expected rather than exceptional. The draft is already
+   * saved and stays confirmable through the REST endpoints either way.
+   */
+  private async notifyAdminsOfPendingGroup(group: PublicGroup): Promise<void> {
+    const admins = await this.admins.listNotifiableAdmins();
+    if (admins.length === 0) {
+      this.logger.warn(
+        { groupId: group.id },
+        'Нет администраторов с привязанным maxUserId — некому подтвердить группу',
+      );
+      return;
+    }
+
+    const kindLabel = group.kind === 'channel' ? 'канал' : 'чат';
+    const text = `Бот добавлен в ${kindLabel} «${group.title}».\nПодтвердить его как цель для рассылок?`;
+    const buttons = [
+      [
+        {
+          type: 'callback' as const,
+          text: 'Подтвердить',
+          payload: groupReviewPayload('confirm', group.id),
+        },
+        {
+          type: 'callback' as const,
+          text: 'Отклонить',
+          payload: groupReviewPayload('reject', group.id),
+        },
+      ],
+    ];
+
+    for (const admin of admins) {
+      try {
+        await this.api.sendMessageToUser(Number(admin.maxUserId), text, {
+          buttons,
+        });
+      } catch (err: unknown) {
+        this.logger.warn(
+          { err, adminId: admin.id, groupId: group.id },
+          'Не удалось уведомить администратора о новой MAX-группе',
+        );
+      }
+    }
+  }
+}

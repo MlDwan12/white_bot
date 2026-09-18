@@ -27,6 +27,20 @@ export class GroupsController {
     return this.groupsService.listGroups();
   }
 
+  /**
+   * MAX drafts awaiting review. Declared before `:id` for readability (that
+   * route only matches a single segment, so there's no actual conflict).
+   *
+   * This is the fallback the chat buttons need: MAX refuses a bot's first
+   * message to a user who never opened a dialog with it, so the notification
+   * carrying those buttons can legitimately fail to arrive. Without a way to
+   * list pending drafts, such a group would be invisible and unconfirmable.
+   */
+  @Get('max/pending')
+  listPendingMaxGroups() {
+    return this.groupsService.listPendingMaxGroups();
+  }
+
   @Get(':id')
   getGroup(@Param('id') id: string) {
     return this.groupsService.getGroup(id);

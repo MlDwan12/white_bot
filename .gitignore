@@ -60,3 +60,8 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 # Local planning/progress notes, not for the shared repo
 /PLAN.md
 /PROGRESS.md
+
+# Stray compiler output next to the hand-written scripts (scripts/*.cjs are source)
+/scripts/*.js
+/scripts/*.js.map
+/scripts/*.d.ts

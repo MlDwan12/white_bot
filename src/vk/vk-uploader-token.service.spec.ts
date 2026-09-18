@@ -49,9 +49,15 @@ describe('VkUploaderTokenService', () => {
       const { service, prisma } = buildService();
       prisma.vkUploaderToken.findUnique.mockResolvedValue(null);
 
-      const error: AppException = await service
-        .getValidAccessToken()
-        .catch((err: unknown) => err as AppException);
+      // `then` with both handlers, not `.catch`: a bare catch widens the type
+      // to `string | AppException` (the success value included), which fails
+      // the type check.
+      const error: AppException = await service.getValidAccessToken().then(
+        () => {
+          throw new Error('Ожидалась ошибка, но токен был возвращён');
+        },
+        (err: unknown) => err as AppException,
+      );
 
       expect(error).toBeInstanceOf(AppException);
       expect(error.code).toBe(ErrorCode.VK_UPLOADER_TOKEN_EXPIRED);
