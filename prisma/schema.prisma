@@ -182,20 +182,35 @@ model PostTemplateTarget {
 }
 
 model PostDelivery {
-  id                String             @id @default(uuid())
-  postId            String
-  groupId           String
-  status            PostDeliveryStatus @default(pending)
-  externalMessageId String?
-  error             String?
-  sentAt            DateTime?
-  attemptsMade      Int                @default(0)
+  id                 String             @id @default(uuid())
+  postId             String
+  groupId            String
+  status             PostDeliveryStatus @default(pending)
+  externalMessageId  String?
+  error              String?
+  sentAt             DateTime?
+  /// Когда опубликованное сообщение было удалено из группы. Отдельное поле,
+  /// а не новый статус: доставка **была** отправлена — это факт истории, а
+  /// удаление случилось позже. Статус `deleted` смешивал бы два разных факта
+  /// в одном поле и его пришлось бы исключать из «отправить оставшимся».
+  deletedAt          DateTime?
+  /// Когда это сообщение пора удалить автоматически. Считается в момент
+  /// отправки из настроек поста: доставки в разные группы расходятся на
+  /// минуты, и «висит час» должно означать час в каждой группе, а не час
+  /// от начала кампании. Хранится здесь, а не вычисляется на лету, чтобы
+  /// сверщик искал по индексу, а не перебирал все отправленные доставки.
+  autoDeleteDueAt    DateTime?
+  /// Сколько раз автоудаление уже не удалось. Нужно, чтобы вечно
+  /// неудаляемая строка (например, VK без одобренных прав) не занимала
+  /// место в окне выборки и не вытесняла тех, кого удалить можно.
+  autoDeleteAttempts Int                @default(0)
+  attemptsMade       Int                @default(0)
   // Needed to spot a delivery abandoned mid-flight: `sending` is committed
   // before the network call, so a worker that dies leaves the row stuck
   // there. Without a timestamp there's no way to tell "started a second ago"
   // from "orphaned an hour ago", and such a row must go to `unknown` rather
   // than be retried (retrying risks a duplicate post).
-  updatedAt         DateTime           @updatedAt
+  updatedAt          DateTime           @updatedAt
 
   post  Post  @relation(fields: [postId], references: [id])
   group Group @relation(fields: [groupId], references: [id])
@@ -204,6 +219,8 @@ model PostDelivery {
   @@index([groupId])
   // The reconciler sweeps for deliveries abandoned in `sending`.
   @@index([status, updatedAt])
+  /// Выборка доставок, которым пора автоудаляться.
+  @@index([autoDeleteDueAt])
 }
 
 /// Загруженный файл. Хранится на диске (путь относительно MEDIA_STORAGE_PATH),

@@ -10,6 +10,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { REDIS_CLIENT } from '../queue/queue.constants';
 import { PostsService } from './posts.service';
 import { PostTemplatesService } from './post-templates.service';
+import { PostModerationService } from './post-moderation.service';
 
 const SWEEP_INTERVAL_MS = 60_000;
 
@@ -63,6 +64,7 @@ export class PostReconcilerService
     private readonly prisma: PrismaService,
     private readonly posts: PostsService,
     private readonly templates: PostTemplatesService,
+    private readonly moderation: PostModerationService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly logger: PinoLogger,
   ) {
@@ -130,6 +132,9 @@ export class PostReconcilerService
       await this.requeueDueScheduledPosts(now);
       await this.resolveStuckCampaigns();
       await this.resolveStuckDeliveries(now);
+      // Автоудаление живёт здесь же, а не в своём таймере: один
+      // планировщик, один лок, одно место отказа.
+      await this.moderation.sweepAutoDeletions(now);
       // Isolated as well: its own `findMany` sits outside the per-template
       // try/catch inside it, and a failure there must not look like a failed
       // sweep.

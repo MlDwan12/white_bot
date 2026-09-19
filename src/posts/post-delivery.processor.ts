@@ -16,6 +16,7 @@ import { ContestButton, PostSender } from './post-sender';
 import { joinButtonText } from '../contests/contest-button';
 import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 import { classifyDeliveryError } from './delivery-outcome';
+import { autoDeleteDueAt } from './post-moderation.service';
 
 /**
  * How many times a rate-limited delivery is re-attempted. Only rate limits get
@@ -268,13 +269,19 @@ export class PostDeliveryProcessor extends WorkerHost {
     // out of this job: a thrown error would be a failed attempt, and BullMQ
     // would retry it into a second publication.
     try {
+      const sentAt = new Date();
       await this.prisma.postDelivery.update({
         where: { id: deliveryId },
         data: {
           status: 'sent',
           externalMessageId,
-          sentAt: new Date(),
+          sentAt,
           error: null,
+          // Срок автоудаления считается здесь, а не в сверщике: доставки в
+          // разные группы расходятся на минуты из-за лимитов, и «висит час»
+          // должно означать час в каждой группе, а не час от начала
+          // кампании.
+          autoDeleteDueAt: autoDeleteDueAt(delivery.post, sentAt),
         },
       });
     } catch (err: unknown) {

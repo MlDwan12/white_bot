@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { PostReconcilerService } from './post-reconciler.service';
 import { PostsService } from './posts.service';
 import { PostTemplatesService } from './post-templates.service';
+import { PostModerationService } from './post-moderation.service';
 
 /** Reads one argument of a recorded call as `T` — `mock.calls` is `any[][]`,
  * which trips the type-aware lint rules when indexed directly. */
@@ -36,14 +37,17 @@ function setup(lockAcquired = true) {
     error: jest.fn(),
   };
 
+  const moderation = { sweepAutoDeletions: jest.fn().mockResolvedValue(0) };
+
   const service = new PostReconcilerService(
     prisma as unknown as PrismaService,
     posts as unknown as PostsService,
     templates as unknown as PostTemplatesService,
+    moderation as unknown as PostModerationService,
     redis as unknown as Redis,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma, posts, templates, redis, logger };
+  return { service, prisma, posts, templates, redis, logger, moderation };
 }
 
 describe('PostReconcilerService', () => {

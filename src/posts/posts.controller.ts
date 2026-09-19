@@ -4,6 +4,8 @@ import { CsrfGuard } from '../auth/csrf.guard';
 import { RequirePermissions } from '../auth/require-permissions.decorator';
 import { PostsService } from './posts.service';
 import { CreatePostDto } from './dto/create-post.dto';
+import { DeletePublishedDto, EditPublishedDto } from './dto/moderate-post.dto';
+import { PostModerationService } from './post-moderation.service';
 
 // Deliberately minimal: enough to drive the delivery pipeline end to end and
 // to verify it against real VK groups. The full post CRUD belongs to the web
@@ -15,7 +17,10 @@ import { CreatePostDto } from './dto/create-post.dto';
 @UseGuards(AdminAuthGuard, CsrfGuard)
 @RequirePermissions('posts_manage')
 export class PostsController {
-  constructor(private readonly postsService: PostsService) {}
+  constructor(
+    private readonly postsService: PostsService,
+    private readonly moderation: PostModerationService,
+  ) {}
 
   @Post()
   createPost(@Body() dto: CreatePostDto) {
@@ -37,6 +42,24 @@ export class PostsController {
   @Post(':id/resume')
   resumePost(@Param('id') id: string) {
     return this.postsService.resumePost(id);
+  }
+
+  /**
+   * Удаление уже опубликованного — отдельное действие, а не следствие стопа:
+   * остановить рассылку и снести то, что люди уже увидели, — разные решения.
+   */
+  @Post(':id/delete-published')
+  deletePublished(@Param('id') id: string, @Body() dto: DeletePublishedDto) {
+    return this.moderation.deletePublished(id, dto.groupIds);
+  }
+
+  /**
+   * Правка опубликованного. Подтверждения на проталкивание нет намеренно —
+   * это и есть смысл действия: текст меняется везде, где пост уже вышел.
+   */
+  @Post(':id/edit-published')
+  editPublished(@Param('id') id: string, @Body() dto: EditPublishedDto) {
+    return this.moderation.editPublished(id, dto);
   }
 
   @Get(':id')

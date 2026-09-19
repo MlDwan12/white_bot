@@ -13,6 +13,7 @@ import { PostSender } from './post-sender';
 import { AttachmentUploader } from './attachment-uploader';
 import { PostDeliveryProcessor } from './post-delivery.processor';
 import { PostReconcilerService } from './post-reconciler.service';
+import { PostModerationService } from './post-moderation.service';
 import { AuthModule } from '../auth/auth.module';
 
 @Module({
@@ -36,6 +37,7 @@ import { AuthModule } from '../auth/auth.module';
     AttachmentUploader,
     PostDeliveryProcessor,
     PostReconcilerService,
+    PostModerationService,
   ],
   exports: [PostsService, PostTemplatesService],
 })
