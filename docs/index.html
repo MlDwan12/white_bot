@@ -116,8 +116,67 @@
     <script>
       (function () {
         var app = window.WebApp;
-        var unsafe = (app && app.initDataUnsafe) || {};
         var raw = (app && app.initData) || '';
+        var unsafe = (app && app.initDataUnsafe) || {};
+        var preview = false;
+
+        // Вне MAX библиотека Bridge не отдаёт данных запуска, и страница
+        // выглядит пустой — посмотреть, что увидит человек, невозможно.
+        // Поэтому если объекта WebApp нет, разбираем фрагмент адреса сами:
+        // MAX кладёт данные ровно туда (`#WebAppData=...`), так что тот же
+        // разбор годится и для предпросмотра, и для отладки реального
+        // запуска. Подпись здесь не проверяется — это делает сервер.
+        if (!raw && window.location.hash) {
+          var hash = window.location.hash.slice(1);
+          var fragment = new URLSearchParams(hash);
+          var fromUrl = fragment.get('WebAppData');
+          // `#preview` — образец данных, чтобы посмотреть страницу глазами
+          // пользователя, не имея доступа к MAX.
+          if (!fromUrl && (hash === 'preview' || fragment.has('preview'))) {
+            fromUrl = samplePayload();
+          }
+          if (fromUrl) {
+            raw = fromUrl;
+            preview = !app;
+            unsafe = parseLaunchParams(fromUrl);
+          }
+        }
+
+        function samplePayload() {
+          var sample = {
+            auth_date: String(Math.floor(Date.now() / 1000)),
+            chat: JSON.stringify({ id: -79114405995998, type: 'CHANNEL' }),
+            query_id: '00000000-0000-4000-8000-000000000000',
+            start_param: 'proba_1',
+            user: JSON.stringify({
+              id: 263973086,
+              first_name: 'Иван',
+              last_name: 'Петренко',
+              username: null,
+              language_code: 'ru',
+            }),
+            hash: 'образец, настоящая подпись сюда не попадает',
+          };
+          return Object.keys(sample)
+            .map(function (k) { return k + '=' + encodeURIComponent(sample[k]); })
+            .join('&');
+        }
+
+        function parseLaunchParams(value) {
+          var out = {};
+          value.split('&').forEach(function (pair) {
+            var at = pair.indexOf('=');
+            if (at === -1) return;
+            var key = pair.slice(0, at);
+            var text = decodeURIComponent(pair.slice(at + 1));
+            if (key === 'user' || key === 'chat') {
+              try { out[key] = JSON.parse(text); } catch (e) { out[key] = text; }
+            } else {
+              out[key] = text;
+            }
+          });
+          return out;
+        }
 
         function put(id, rows) {
           var dl = document.getElementById(id);
@@ -139,10 +198,20 @@
 
         put('env', [
           ['Bridge загружен', app ? 'да' : 'НЕТ'],
+          ['Режим', preview ? 'предпросмотр из адреса' : 'запуск из MAX'],
           ['platform', app && app.platform],
           ['version', app && app.version],
           ['deviceName', app && app.deviceName],
         ]);
+
+        if (preview) {
+          var note = document.createElement('p');
+          note.className = 'sub';
+          note.textContent =
+            'Предпросмотр: данные взяты из адреса, а не от клиента MAX. ' +
+            'Подпись не проверена — так выглядит страница, а не настоящий запуск.';
+          document.querySelector('h1').after(note);
+        }
 
         var user = unsafe.user || {};
         var chat = unsafe.chat || {};
@@ -172,7 +241,7 @@
           initData.textContent = raw;
         } else {
           initData.textContent =
-            'пусто — либо страница открыта вне MAX, либо библиотека не загрузилась';
+            'пусто — страница открыта вне MAX и без данных в адресе';
           initData.className = 'bad';
         }
 
