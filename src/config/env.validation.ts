@@ -45,6 +45,33 @@ export const envValidationSchema = Joi.object({
   // rather than per-Group: in MAX the bot is one identity and the chats are
   // its targets.
   MAX_BOT_TOKEN: Joi.string().allow('').optional(),
+  // MAX serves the same bot API from two hosts. The SDK defaults to
+  // `platform-api2.max.ru`, whose certificate is issued by the Russian
+  // Trusted CA — absent from the default trust store, so every call dies as
+  // an opaque `fetch failed`. `botapi.max.ru` serves the same API behind a
+  // publicly trusted certificate and is what we use. It stays configurable
+  // because a host that does trust that CA (a Russian VPS in production) may
+  // prefer the other one, and that is an environment fact, not a design
+  // decision.
+  MAX_API_BASE_URL: Joi.string()
+    // dotenv turns a bare `MAX_API_BASE_URL=` line into '', and a Joi default
+    // does not apply to ''. Without `.empty('')` blanking the line — the
+    // natural way to say "use the default" — would crash the boot instead.
+    .empty('')
+    .uri({ scheme: ['https'] })
+    // The SDK builds request URLs as `new URL(method, baseUrl)`, which
+    // resolves against the base's *parent* path: a base of
+    // `https://proxy/max` silently becomes `https://proxy/messages`. Rather
+    // than let a path-prefixed proxy fail as unexplained 404s at runtime, we
+    // reject it at boot.
+    .custom((value: string, helpers) => {
+      const { pathname } = new URL(value);
+      return pathname === '/' ? value : helpers.error('any.invalid');
+    }, 'root path only')
+    .message(
+      'MAX_API_BASE_URL must be a host root without a path (e.g. https://botapi.max.ru)',
+    )
+    .default('https://botapi.max.ru'),
   // Where uploaded attachment files live. A default keeps local runs and CI
   // working without extra configuration; in Docker this path is a volume, so
   // files survive container rebuilds (see PLAN.md, шаг 11).

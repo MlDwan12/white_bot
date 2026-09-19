@@ -45,4 +45,41 @@ describe('envValidationSchema', () => {
 
     expect(error).toBeDefined();
   });
+
+  describe('MAX_API_BASE_URL', () => {
+    const validate = (value?: string) =>
+      envValidationSchema.validate({
+        ...REQUIRED,
+        ...(value === undefined ? {} : { MAX_API_BASE_URL: value }),
+      }) as { error?: Error; value: { MAX_API_BASE_URL: string } };
+
+    it('falls back to the publicly trusted host when unset', () => {
+      // The SDK's own default host serves a certificate from a CA that isn't
+      // in the default trust store, so every MAX call would die as an opaque
+      // `fetch failed`. Our default must win whenever the var isn't set.
+      expect(validate().value.MAX_API_BASE_URL).toBe('https://botapi.max.ru');
+    });
+
+    it('treats a blank line as unset rather than as a fatal error', () => {
+      // dotenv turns `MAX_API_BASE_URL=` into '', and a Joi default does not
+      // apply to ''. Blanking the line is the natural way to say "use the
+      // default", so it must not crash the boot.
+      const { error, value } = validate('');
+
+      expect(error).toBeUndefined();
+      expect(value.MAX_API_BASE_URL).toBe('https://botapi.max.ru');
+    });
+
+    it('rejects a base URL carrying a path', () => {
+      // `new URL('messages', 'https://proxy/max')` resolves to
+      // `https://proxy/messages` — the prefix vanishes and every call 404s
+      // with no hint why. Better to refuse to boot.
+      expect(validate('https://proxy.example/max').error).toBeDefined();
+      expect(validate('https://proxy.example/').error).toBeUndefined();
+    });
+
+    it('rejects a non-https host', () => {
+      expect(validate('http://botapi.max.ru').error).toBeDefined();
+    });
+  });
 });

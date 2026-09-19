@@ -1,6 +1,14 @@
-import { createTimeoutFetch, timeoutForUrl } from './max-bot.provider';
+import { Bot } from '@maxhub/max-bot-api';
+import { ConfigService } from '@nestjs/config';
+import {
+  createTimeoutFetch,
+  maxBotProvider,
+  timeoutForUrl,
+} from './max-bot.provider';
 
-const BASE = 'https://platform-api2.max.ru';
+jest.mock('@maxhub/max-bot-api', () => ({ Bot: jest.fn() }));
+
+const BASE = 'https://botapi.max.ru';
 
 function captureFetch() {
   const calls: RequestInit[] = [];
@@ -50,5 +58,38 @@ describe('createTimeoutFetch', () => {
     expect(timeoutForUrl(`${BASE}/updates/subscriptions`)).toBe(
       timeoutForUrl(`${BASE}/messages`),
     );
+  });
+});
+
+describe('maxBotProvider', () => {
+  const build = (env: Record<string, string | undefined>) => {
+    const config = {
+      get: (key: string) => env[key],
+    } as unknown as ConfigService;
+    return (
+      maxBotProvider as { useFactory: (c: ConfigService) => Bot | null }
+    ).useFactory(config);
+  };
+
+  beforeEach(() => {
+    (Bot as unknown as jest.Mock).mockClear();
+  });
+
+  it('returns null without a token, so the app still boots without MAX', () => {
+    expect(build({})).toBeNull();
+    expect(Bot).not.toHaveBeenCalled();
+  });
+
+  it('points the SDK at the configured host', () => {
+    // The SDK's built-in default host answers with a certificate the default
+    // trust store rejects, so leaving baseUrl unset breaks every MAX call.
+    build({ MAX_BOT_TOKEN: 'token', MAX_API_BASE_URL: BASE });
+
+    const [, options] = (Bot as unknown as jest.Mock).mock.calls[0] as [
+      string,
+      { clientOptions: { baseUrl?: string; fetch?: typeof fetch } },
+    ];
+    expect(options.clientOptions.baseUrl).toBe(BASE);
+    expect(options.clientOptions.fetch).toEqual(expect.any(Function));
   });
 });

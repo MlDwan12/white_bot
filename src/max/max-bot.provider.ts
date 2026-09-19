@@ -65,7 +65,10 @@ export const maxBotProvider: Provider = {
       return null;
     }
     return new Bot(token, {
-      clientOptions: { fetch: createTimeoutFetch() },
+      clientOptions: {
+        fetch: createTimeoutFetch(),
+        baseUrl: config.get<string>('MAX_API_BASE_URL'),
+      },
     });
   },
 };
