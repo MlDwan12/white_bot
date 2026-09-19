@@ -3,13 +3,15 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { MaxModule } from '../max/max.module';
 import { ContestParticipationModule } from './contest-participation.module';
 import { ContestsController } from './contests.controller';
+import { MiniAppController } from './miniapp.controller';
+import { MiniAppService } from './miniapp.service';
 import { ContestsService } from './contests.service';
 import { ContestNotifier } from './contest-notifier';
 
 @Module({
   imports: [PrismaModule, MaxModule, ContestParticipationModule],
-  controllers: [ContestsController],
-  providers: [ContestsService, ContestNotifier],
+  controllers: [ContestsController, MiniAppController],
+  providers: [ContestsService, ContestNotifier, MiniAppService],
   exports: [ContestsService],
 })
 export class ContestsModule {}

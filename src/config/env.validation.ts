@@ -53,6 +53,10 @@ export const envValidationSchema = Joi.object({
   // because a host that does trust that CA (a Russian VPS in production) may
   // prefer the other one, and that is an environment fact, not a design
   // decision.
+  // Источники, которым разрешено обращаться к API из браузера, через
+  // запятую. Пусто — CORS выключен совсем: так и надо, пока мини-приложение
+  // не развёрнуто, и заодно это не даёт случайно открыть API всем.
+  MINIAPP_ORIGINS: Joi.string().allow('').default(''),
   MAX_API_BASE_URL: Joi.string()
     // dotenv turns a bare `MAX_API_BASE_URL=` line into '', and a Joi default
     // does not apply to ''. Without `.empty('')` blanking the line — the
