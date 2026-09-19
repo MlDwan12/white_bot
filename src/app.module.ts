@@ -12,6 +12,7 @@ import { MaxModule } from './max/max.module';
 import { QueueModule } from './queue/queue.module';
 import { PostsModule } from './posts/posts.module';
 import { MediaModule } from './media/media.module';
+import { ContestsModule } from './contests/contests.module';
 import { HealthController } from './health/health.controller';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -34,6 +35,7 @@ import { buildPinoConfig } from './logger/pino-logger.config';
     MaxModule,
     MediaModule,
     PostsModule,
+    ContestsModule,
   ],
   controllers: [AppController, HealthController],
   providers: [

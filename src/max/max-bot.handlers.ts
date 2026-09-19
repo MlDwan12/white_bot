@@ -1,9 +1,19 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Bot } from '@maxhub/max-bot-api';
+import type { Attachment } from '@maxhub/max-bot-api/types';
 import { PinoLogger } from 'nestjs-pino';
 import { GroupsService, PublicGroup } from '../groups/groups.service';
 import { MaxAdminResolver } from './max-admin.resolver';
 import { MaxApiClient } from './max-api.client';
+import {
+  ContestParticipationService,
+  type JoinOutcome,
+} from '../contests/contest-participation.service';
+import { CONTEST_JOIN_PAYLOAD } from '../contests/contest-button';
+import {
+  toRequestAttachments,
+  unsupportedAttachmentTypes,
+} from './max-attachments';
 import { MAX_BOT } from './max-bot.provider';
 
 /** Callback payloads for the pending-group review buttons. */
@@ -31,6 +41,7 @@ export class MaxBotHandlers {
     @Inject(MAX_BOT) private readonly bot: Bot | null,
     private readonly groups: GroupsService,
     private readonly admins: MaxAdminResolver,
+    private readonly contests: ContestParticipationService,
     private readonly api: MaxApiClient,
     private readonly logger: PinoLogger,
   ) {
@@ -70,6 +81,22 @@ export class MaxBotHandlers {
 
     bot.on('bot_removed', async (ctx) => {
       await this.handleBotRemoved(ctx.chatId);
+    });
+
+    bot.action(CONTEST_JOIN_PAYLOAD, async (ctx) => {
+      const contestId = ctx.match?.[1];
+      if (!contestId) {
+        return;
+      }
+      await this.handleContestJoin(
+        contestId,
+        ctx.user,
+        ctx.callback.callback_id,
+        ctx.chatId,
+        // Апдейт приносит исходное сообщение целиком, так что медиа не
+        // приходится запрашивать отдельно — только передать обратно.
+        ctx.update.message?.body?.attachments,
+      );
     });
 
     bot.action(GROUP_REVIEW_PAYLOAD, async (ctx) => {
@@ -157,6 +184,129 @@ export class MaxBotHandlers {
         ? 'MAX-группа помечена как bot_removed'
         : 'Событие bot_removed для неизвестной группы — пропущено',
     );
+  }
+
+  /**
+   * Нажатие кнопки под анонс-постом.
+   *
+   * В MAX ответ на колбэк не всплывашка, а замена сообщения целиком, поэтому
+   * анонс возвращается на место тем же текстом и той же кнопкой — меняется
+   * только счётчик участников. Личный ответ («вы уже участвуете») уходит в
+   * лс и только если бот вообще может писать этому человеку.
+   */
+  private async handleContestJoin(
+    contestId: string,
+    user: {
+      user_id: number;
+      name?: string | null;
+      first_name?: string | null;
+      last_name?: string | null;
+      username?: string | null;
+      is_bot?: boolean;
+    },
+    callbackId: string,
+    chatId: number | null | undefined,
+    attachments?: Attachment[] | null,
+  ): Promise<void> {
+    let outcome: JoinOutcome;
+    try {
+      outcome = await this.contests.join({
+        contestId,
+        platform: 'max',
+        user: {
+          externalUserId: String(user.user_id),
+          // Имя нужно только для читаемого списка победителей; дедуп идёт по
+          // id, так что отсутствие имени ничего не ломает.
+          displayName:
+            user.name ??
+            user.first_name ??
+            user.username ??
+            `id${user.user_id}`,
+          firstName: user.first_name,
+          lastName: user.last_name,
+          username: user.username,
+          isBot: user.is_bot,
+          raw: user,
+        },
+        groupExternalId: String(chatId ?? ''),
+      });
+    } catch (err: unknown) {
+      // Участие не записалось. Клик всё равно надо подтвердить, иначе клиент
+      // будет ждать вечно; пустой ответ безопаснее замены — сообщение
+      // останется как есть.
+      this.logger.error(
+        { err, contestId, userId: user.user_id },
+        'Не удалось записать участие в конкурсе',
+      );
+      await this.safeAnswer(callbackId);
+      return;
+    }
+
+    const dropped = unsupportedAttachmentTypes(attachments);
+    if (dropped.length > 0) {
+      this.logger.warn(
+        { contestId, dropped },
+        'Вложения анонса, которые нечем пересобрать, потеряются при перерисовке',
+      );
+    }
+
+    // Отсюда и ниже участие уже зафиксировано: любой сбой — это неудачное
+    // уведомление, а не неудачная запись, и путать их в логах нельзя.
+    await this.safeAnswer(
+      callbackId,
+      outcome.refresh
+        ? {
+            text: outcome.refresh.text,
+            buttons: [
+              [
+                {
+                  type: 'callback' as const,
+                  text: outcome.refresh.buttonText,
+                  payload: outcome.refresh.payload,
+                },
+              ],
+            ],
+            // Без этого первое же нажатие стёрло бы картинку анонса у всех.
+            attachments: toRequestAttachments(attachments),
+          }
+        : undefined,
+    );
+
+    await this.sendPrivately(user.user_id, outcome.message);
+  }
+
+  /**
+   * Подтверждение клика. Протухший `callback_id` или сетевой сбой здесь не
+   * должны мешать остальному: участник уже записан.
+   */
+  private async safeAnswer(
+    callbackId: string,
+    replacement?: Parameters<MaxApiClient['answerCallback']>[1],
+  ): Promise<void> {
+    try {
+      await this.api.answerCallback(callbackId, replacement);
+    } catch (err: unknown) {
+      this.logger.warn(
+        { err },
+        'Не удалось подтвердить нажатие кнопки — участие при этом уже записано',
+      );
+    }
+  }
+
+  /**
+   * Личное сообщение участнику — best-effort. MAX не доставит первое
+   * сообщение тому, кто сам не открывал диалог с ботом, так что провал здесь
+   * ожидаем: счётчик на кнопке остаётся единственным общим подтверждением.
+   */
+  private async sendPrivately(userId: number, text: string): Promise<void> {
+    try {
+      await this.api.sendMessageToUser(userId, text);
+    } catch (err: unknown) {
+      this.logger.info(
+        { err, userId },
+        'Личное подтверждение участия не доставлено — у бота нет диалога с пользователем',
+      );
+    }
   }
 
   private async handleGroupReview(

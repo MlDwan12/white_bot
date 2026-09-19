@@ -4,6 +4,17 @@ import { AttachmentUploader } from './attachment-uploader';
 import { TokenEncryptionService } from '../common/crypto/token-encryption.service';
 import { VkApiClient } from '../vk/vk-api.client';
 import { MaxApiClient } from '../max/max-api.client';
+import { contestJoinPayload } from '../contests/contest-button';
+
+/**
+ * Конкурс, чья кнопка участия вшивается в сообщение. Передаётся сюда, а не
+ * читается из базы: PostSender намеренно не знает про Prisma, вся загрузка
+ * данных остаётся в процессоре доставки.
+ */
+export interface ContestButton {
+  contestId: string;
+  label: string;
+}
 
 export interface SendResult {
   /** VK post id or MAX message id — required later for edit/delete. */
@@ -31,10 +42,13 @@ export class PostSender {
     post: Post,
     group: Group,
     assets: MediaAsset[] = [],
+    contestButton?: ContestButton | null,
   ): Promise<SendResult> {
     return group.platform === 'vk'
-      ? this.sendToVk(post, group, assets)
-      : this.sendToMax(post, group, assets);
+      ? // У VK постов на стене кнопок не бывает в принципе — клавиатуры там
+        // живут только в сообщениях, поэтому конкурс сюда не доезжает.
+        this.sendToVk(post, group, assets)
+      : this.sendToMax(post, group, assets, contestButton);
   }
 
   /**
@@ -75,12 +89,24 @@ export class PostSender {
     post: Post,
     group: Group,
     assets: MediaAsset[],
+    contestButton?: ContestButton | null,
   ): Promise<SendResult> {
     const attachments = await this.attachments.maxAttachments(assets);
+    const buttons = contestButton
+      ? [
+          [
+            {
+              type: 'callback' as const,
+              text: contestButton.label,
+              payload: contestJoinPayload(contestButton.contestId),
+            },
+          ],
+        ]
+      : undefined;
     const { messageId } = await this.max.sendMessageToChat(
       Number(group.externalId),
       PostSender.resolveText(post, 'max'),
-      { attachments },
+      { attachments, buttons },
     );
     return { externalMessageId: messageId };
   }

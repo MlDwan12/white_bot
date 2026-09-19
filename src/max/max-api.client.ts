@@ -1,6 +1,10 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Bot } from '@maxhub/max-bot-api';
 import type { AttachmentRequest, Button } from '@maxhub/max-bot-api/types';
+import {
+  toRequestAttachments,
+  unsupportedAttachmentTypes,
+} from './max-attachments';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { MaxApiError } from './max-api.error';
@@ -38,6 +42,22 @@ export interface MaxSendOptions {
   attachments?: AttachmentRequest[];
   /** Rendered as an inline keyboard attachment — MAX has no separate keyboard field. */
   buttons?: Button[][];
+}
+
+/**
+ * Чем заменить сообщение в ответ на нажатие кнопки. В MAX нет всплывающих
+ * уведомлений: единственный ответ на колбэк — замена самого сообщения, на
+ * котором сидит кнопка. Поэтому в публичном посте отвечать «по-человечески»
+ * нечем, и замена должна воспроизводить пост почти без изменений.
+ */
+export interface MaxCallbackReplacement {
+  text: string;
+  buttons?: Button[][];
+  /**
+   * Медиа исходного сообщения. Замена перезаписывает сообщение целиком, так
+   * что не передать их — значит стереть картинку у всех, кто видит пост.
+   */
+  attachments?: AttachmentRequest[];
 }
 
 /**
@@ -91,6 +111,25 @@ export class MaxApiClient {
     await this.call(() =>
       api.editMessage(messageId, { text, ...this.buildSendExtra(options) }),
     );
+  }
+
+  /**
+   * Тело уже опубликованного сообщения. Нужно перед правкой: MAX заменяет
+   * сообщение целиком, поэтому вложения приходится снимать со старой версии
+   * и передавать заново.
+   */
+  async getMessageBody(messageId: string): Promise<{
+    text: string;
+    attachments: AttachmentRequest[];
+    unsupported: string[];
+  }> {
+    const api = this.requireBot().api;
+    const message = await this.call(() => api.getMessage(messageId));
+    return {
+      text: message.body.text ?? '',
+      attachments: toRequestAttachments(message.body.attachments),
+      unsupported: unsupportedAttachmentTypes(message.body.attachments),
+    };
   }
 
   async deleteMessage(messageId: string): Promise<void> {
@@ -149,20 +188,33 @@ export class MaxApiClient {
    *
    * MAX offers no toast/alert here (unlike Telegram): the only feedback
    * channel is `message`, which *replaces* the message the button sits on.
-   * That suits a decision prompt well — passing `replacementText` swaps the
-   * question for its outcome and takes the now-stale buttons away, so the
-   * same choice can't be submitted twice.
+   *
+   * That suits a decision prompt in a DM — the question is swapped for its
+   * outcome and the stale buttons go away, so the same choice can't be
+   * submitted twice. In a public post it is destructive instead: one person's
+   * click would rewrite the announcement for everyone. Callers there must
+   * pass the post back unchanged (text *and* buttons), or nothing at all.
    */
   async answerCallback(
     callbackId: string,
-    replacementText?: string,
+    replacement?: string | MaxCallbackReplacement,
   ): Promise<void> {
     const api = this.requireBot().api;
+    if (!replacement) {
+      await this.call(() => api.answerOnCallback(callbackId, {}));
+      return;
+    }
+    const { text, buttons, attachments } =
+      typeof replacement === 'string'
+        ? { text: replacement, buttons: undefined, attachments: undefined }
+        : replacement;
     await this.call(() =>
-      api.answerOnCallback(
-        callbackId,
-        replacementText ? { message: { text: replacementText } } : {},
-      ),
+      api.answerOnCallback(callbackId, {
+        // Клавиатура и медиа передаются вместе с текстом не для красоты:
+        // ответ перезаписывает сообщение целиком, и без них кнопка и
+        // картинка исчезнут.
+        message: { text, ...this.buildSendExtra({ buttons, attachments }) },
+      }),
     );
   }
 

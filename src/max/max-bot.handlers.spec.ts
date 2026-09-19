@@ -2,6 +2,7 @@ import { Bot } from '@maxhub/max-bot-api';
 import { PinoLogger } from 'nestjs-pino';
 import { GroupsService, PublicGroup } from '../groups/groups.service';
 import { MaxAdminResolver } from './max-admin.resolver';
+import { ContestParticipationService } from '../contests/contest-participation.service';
 import { MaxApiClient } from './max-api.client';
 import { MaxBotHandlers, groupReviewPayload } from './max-bot.handlers';
 
@@ -98,15 +99,23 @@ function setup() {
     error: jest.fn(),
   };
 
+  const contests = {
+    join: jest.fn().mockResolvedValue({
+      status: 'joined',
+      message: 'Вы участвуете в конкурсе!',
+    }),
+  };
+
   const handlers = new MaxBotHandlers(
     harness.bot,
     groups as unknown as GroupsService,
     admins as unknown as MaxAdminResolver,
+    contests as unknown as ContestParticipationService,
     api as unknown as MaxApiClient,
     logger as unknown as PinoLogger,
   );
   handlers.register();
-  return { harness, groups, admins, api, logger, handlers };
+  return { harness, groups, admins, contests, api, logger, handlers };
 }
 
 describe('MaxBotHandlers', () => {
@@ -116,6 +125,7 @@ describe('MaxBotHandlers', () => {
       null,
       {} as GroupsService,
       {} as MaxAdminResolver,
+      {} as ContestParticipationService,
       {} as MaxApiClient,
       logger,
     );

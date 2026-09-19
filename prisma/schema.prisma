@@ -55,6 +55,32 @@ enum ContestStatus {
   drawn
 }
 
+enum ContestParticipantSource {
+  /// Человек сам нажал кнопку под постом.
+  button
+  /// Админ добавил руками — запасной путь на случай сбоя кнопки.
+  manual
+}
+
+enum ContestNotifyStatus {
+  pending
+  sent
+  failed
+  /// Уведомить автоматически нечем (нет id платформы) или отправка провалилась
+  /// окончательно. Явное состояние вместо тихого отказа: победитель не должен
+  /// потеряться из-за недоставленного сообщения.
+  manual_required
+  notified_manually
+}
+
+enum ContestDrawLogKind {
+  /// Сам розыгрыш: все места разом, один сид.
+  draw
+  /// Ручная правка отдельного места после розыгрыша — отдельной записью
+  /// со старым и новым значением, а не молчаливой перезаписью.
+  override
+}
+
 enum AdminRole {
   developer
   admin
@@ -88,8 +114,9 @@ model Group {
   status               GroupStatus
   createdAt            DateTime    @default(now())
 
-  postDeliveries  PostDelivery[]
-  templateTargets PostTemplateTarget[]
+  postDeliveries      PostDelivery[]
+  templateTargets     PostTemplateTarget[]
+  contestParticipants ContestParticipant[]
 
   @@unique([platform, externalId])
   @@index([tags], type: Gin)
@@ -183,24 +210,24 @@ model PostDelivery {
 /// в БД — только метаданные: класть байты в Postgres означало бы раздувать
 /// дампы, а видео во «Фазе 2» сделало бы это невыносимым.
 model MediaAsset {
-  id       String    @id @default(uuid())
+  id                 String    @id @default(uuid())
   /// Имя, под которым файл загрузили — его видит получатель документа.
-  filename String
-  kind     MediaKind
+  filename           String
+  kind               MediaKind
   /// Для изображений определён по содержимому файла, а не по заголовку формы:
   /// Content-Type от клиента подделывается тривиально, а от этого решения
   /// зависит, будем ли мы пережимать файл и каким методом его публиковать.
-  mimeType String
-  sizeBytes Int
+  mimeType           String
+  sizeBytes          Int
   /// sha256 оригинала: позволяет убедиться, что файл на диске не подменён,
   /// и распознать повторную загрузку того же файла.
-  checksum String
-  storagePath String @unique
+  checksum           String
+  storagePath        String    @unique
   /// Оптимизированный вариант — только для изображений и только если он
   /// реально меньше оригинала. Оригинал остаётся нетронутым всегда.
-  optimizedPath String? @unique
+  optimizedPath      String?   @unique
   optimizedSizeBytes Int?
-  createdAt DateTime @default(now())
+  createdAt          DateTime  @default(now())
 
   postAttachments PostAttachment[]
   platformUploads MediaPlatformUpload[]
@@ -251,11 +278,26 @@ model MediaPlatformUpload {
 }
 
 model Contest {
-  id        String        @id @default(uuid())
-  postId    String?       @unique
-  title     String
-  status    ContestStatus @default(draft)
-  createdAt DateTime      @default(now())
+  id                   String        @id @default(uuid())
+  /// Анонс-пост с кнопкой участия. Пост может уходить в несколько групп —
+  /// пул участников при этом общий, а группа входа фиксируется у участника.
+  /// Nullable: конкурс без анонса живёт на ручном списке участников.
+  postId               String?       @unique
+  title                String
+  status               ContestStatus @default(draft)
+  createdAt            DateTime      @default(now())
+  /// Подписи кнопки до и после розыгрыша. Кнопка одна и та же: по завершении
+  /// её подпись подменяется через editMessage (проверено живьём на MAX).
+  joinButtonLabel      String        @default("Участвовать")
+  resultsButtonLabel   String        @default("Узнать результаты")
+  /// Слать ли победителю личное сообщение — по требованию отключаемо.
+  notifyWinners        Boolean       @default(true)
+  /// Дописывать ли список победителей в текст анонса при розыгрыше.
+  /// Временная мера: в MAX нечем показать что-то одному человеку, а лс от
+  /// бота доходит не всем — тот, кто сам не писал боту, его не получит.
+  /// Пост — единственный канал, который видят все подписчики. Уйдёт, когда
+  /// появится мини-апп со своим экраном результатов.
+  publishResultsInPost Boolean       @default(true)
 
   post         Post?                @relation(fields: [postId], references: [id])
   participants ContestParticipant[]
@@ -263,26 +305,75 @@ model Contest {
   drawLogs     ContestDrawLog[]
 }
 
+/// Профиль человека с платформы: заводится при первом же участии и живёт
+/// дальше самостоятельно. Участник конкурса — это факт «он записался вот
+/// сюда», а профиль — «вот что мы про него знаем»; смешивать их в одной
+/// строке значило бы дублировать имя и username в каждом конкурсе и терять
+/// историю, как только конкурс удалят.
+model PlatformUser {
+  id             String   @id @default(uuid())
+  platform       Platform
+  externalUserId String
+  displayName    String
+  firstName      String?
+  lastName       String?
+  username       String?
+  isBot          Boolean  @default(false)
+  /// Сырой профиль, как его отдала платформа. Поля у платформ разные и со
+  /// временем прибавляются — типизированные колонки покрывают то, что нужно
+  /// в выдаче, а снимок сохраняет остальное, не требуя миграции на каждый
+  /// новый атрибут.
+  profile        Json?
+  firstSeenAt    DateTime @default(now())
+  lastSeenAt     DateTime @default(now())
+
+  contestEntries ContestParticipant[]
+
+  @@unique([platform, externalUserId])
+}
+
 model ContestParticipant {
-  id          String  @id @default(uuid())
-  contestId   String
-  displayName String
-  vkId        String?
-  maxId       String?
+  id             String                   @id @default(uuid())
+  contestId      String
+  displayName    String
+  platform       Platform
+  /// Id пользователя на платформе. Nullable: ручная строка без ссылки даёт
+  /// участника без id — его нельзя уведомить автоматически.
+  externalUserId String?
+  /// Из какой группы человек вошёл. Пул общий на весь конкурс, поэтому это
+  /// справочное поле, а не часть ключа дедупликации. Nullable у ручных.
+  groupId        String?
+  joinedAt       DateTime                 @default(now())
+  source         ContestParticipantSource @default(button)
+  /// Профиль человека, если он известен. Null у ручной строки без ссылки:
+  /// про такого участника нет ничего, кроме имени, написанного админом.
+  platformUserId String?
+  /// Нормализованный ключ дедупликации: `<платформа>:<id>`, а без id —
+  /// `name:<имя в нижнем регистре>`. Группа в ключ не входит: нажатие в двух
+  /// группах одного конкурса — один участник, иначе у него удвоился бы шанс.
+  dedupKey       String
 
-  contest Contest        @relation(fields: [contestId], references: [id])
-  prizes  ContestPrize[]
+  contest      Contest        @relation(fields: [contestId], references: [id])
+  group        Group?         @relation(fields: [groupId], references: [id])
+  platformUser PlatformUser?  @relation(fields: [platformUserId], references: [id])
+  prizes       ContestPrize[]
 
+  @@unique([contestId, dedupKey])
   @@index([contestId])
+  @@index([groupId])
+  @@index([platformUserId])
 }
 
 model ContestPrize {
-  id                  String  @id @default(uuid())
+  id                  String              @id @default(uuid())
   contestId           String
   place               Int
   label               String
   winnerParticipantId String?
-  isForced            Boolean @default(false)
+  isForced            Boolean             @default(false)
+  notifyStatus        ContestNotifyStatus @default(pending)
+  notifyError         String?
+  notifyAttemptedAt   DateTime?
 
   contest           Contest             @relation(fields: [contestId], references: [id])
   winnerParticipant ContestParticipant? @relation(fields: [winnerParticipantId], references: [id])
@@ -292,15 +383,21 @@ model ContestPrize {
 }
 
 model ContestDrawLog {
-  id             String   @id @default(uuid())
+  id             String             @id @default(uuid())
   contestId      String
-  drawnAt        DateTime @default(now())
+  drawnAt        DateTime           @default(now())
   resultSnapshot Json
   note           String?
-  actorId        String
+  /// Кто провёл розыгрыш. Nullable до Шага 9: guard'ов ещё нет, запрос
+  /// неаутентифицирован, и писать сюда выдуманного админа хуже, чем null.
+  actorId        String?
+  kind           ContestDrawLogKind @default(draw)
+  /// Сид розыгрыша (hex). Тасовка из него детерминирована, поэтому розыгрыш
+  /// можно пересчитать и доказать, что он не подкручен. Null у записей-правок.
+  seed           String?
 
-  contest Contest   @relation(fields: [contestId], references: [id])
-  actor   AdminUser @relation(fields: [actorId], references: [id])
+  contest Contest    @relation(fields: [contestId], references: [id])
+  actor   AdminUser? @relation(fields: [actorId], references: [id])
 
   @@index([contestId])
   @@index([actorId])

@@ -12,7 +12,8 @@ import {
   deliverJobId,
 } from '../queue/queue.constants';
 import { PostsService } from './posts.service';
-import { PostSender } from './post-sender';
+import { ContestButton, PostSender } from './post-sender';
+import { joinButtonText } from '../contests/contest-button';
 import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 import { classifyDeliveryError } from './delivery-outcome';
 
@@ -153,6 +154,22 @@ export class PostDeliveryProcessor extends WorkerHost {
     });
   }
 
+  /** Кнопка участия со счётчиком на момент отправки — или ничего. */
+  private async contestButtonFor(
+    contest: { id: string; joinButtonLabel: string } | null,
+  ): Promise<ContestButton | null> {
+    if (!contest) {
+      return null;
+    }
+    const count = await this.prisma.contestParticipant.count({
+      where: { contestId: contest.id },
+    });
+    return {
+      contestId: contest.id,
+      label: joinButtonText(contest.joinButtonLabel, count),
+    };
+  }
+
   private async deliver(job: Job<DeliverJob>): Promise<void> {
     const { deliveryId } = job.data;
     const delivery = await this.prisma.postDelivery.findUnique({
@@ -164,6 +181,7 @@ export class PostDeliveryProcessor extends WorkerHost {
               orderBy: { position: 'asc' },
               include: { mediaAsset: true },
             },
+            contest: true,
           },
         },
         group: true,
@@ -227,6 +245,18 @@ export class PostDeliveryProcessor extends WorkerHost {
         delivery.post,
         delivery.group,
         delivery.post.attachments.map((attachment) => attachment.mediaAsset),
+        // Кнопка вшивается в момент отправки: пост-анонс может уходить в
+        // несколько групп, и в каждой доставке нужна своя копия кнопки,
+        // ведущая на один и тот же конкурс с общим пулом участников.
+        //
+        // Счётчик берётся текущий, а не нулевой: доставка в последнюю группу
+        // может случиться, когда в первой уже кто-то участвует, и кнопка
+        // «Участвовать» рядом с «Участвовать (5)» выглядела бы сбоем.
+        //
+        // У повторяющегося шаблона конкурс сюда не доедет: вхождения — это
+        // отдельные Post-строки, у которых `contest` пуст. Связка «конкурс +
+        // расписание» в MVP не предусмотрена.
+        await this.contestButtonFor(delivery.post.contest),
       ));
     } catch (err: unknown) {
       await this.handleDeliveryError(job, deliveryId, delivery.groupId, err);
