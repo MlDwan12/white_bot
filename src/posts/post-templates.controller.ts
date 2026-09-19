@@ -1,4 +1,15 @@
-import { Body, Controller, Get, Param, Patch, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Patch,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
+import { AdminAuthGuard } from '../auth/admin-auth.guard';
+import { CsrfGuard } from '../auth/csrf.guard';
+import { RequirePermissions } from '../auth/require-permissions.decorator';
 import { PostTemplatesService } from './post-templates.service';
 import {
   CreateTemplateDto,
@@ -7,9 +18,10 @@ import {
 } from './dto/create-template.dto';
 
 // Minimal, like the other controllers in this project: enough to drive and
-// verify recurring posts. Full CRUD belongs to the panel (Step 8) and
-// permission guards to Step 9.
+// verify recurring posts. Full CRUD belongs to the panel (Step 8).
 @Controller('post-templates')
+@UseGuards(AdminAuthGuard, CsrfGuard)
+@RequirePermissions('posts_manage')
 export class PostTemplatesController {
   constructor(private readonly templates: PostTemplatesService) {}
 

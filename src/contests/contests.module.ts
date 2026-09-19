@@ -7,9 +7,10 @@ import { MiniAppController } from './miniapp.controller';
 import { MiniAppService } from './miniapp.service';
 import { ContestsService } from './contests.service';
 import { ContestNotifier } from './contest-notifier';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [PrismaModule, MaxModule, ContestParticipationModule],
+  imports: [AuthModule, PrismaModule, MaxModule, ContestParticipationModule],
   controllers: [ContestsController, MiniAppController],
   providers: [ContestsService, ContestNotifier, MiniAppService],
   exports: [ContestsService],

@@ -8,9 +8,10 @@ import {
   ManualVkTokenProvider,
   VK_TOKEN_PROVIDER,
 } from './token-provider/vk-token.provider';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [PrismaModule, CryptoModule, VkModule],
+  imports: [AuthModule, PrismaModule, CryptoModule, VkModule],
   controllers: [GroupsController],
   providers: [
     GroupsService,

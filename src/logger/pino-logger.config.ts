@@ -30,6 +30,15 @@ export function buildPinoConfig(config: ConfigService): Params {
           method: req.method,
           url: sanitizeUrl(req.url ?? ''),
         }),
+        // Ответ по умолчанию логируется вместе со всеми заголовками, а в
+        // заголовке `set-cookie` уходит выданный токен входа — целиком, в
+        // открытом виде, на каждый успешный вход и каждое обновление
+        // сессии. Любой, кто видит логи, получал бы рабочий пропуск в
+        // панель. Оставляем только статус: остальное для трассировки не
+        // нужно.
+        res: (res: { statusCode?: number }) => ({
+          statusCode: res.statusCode,
+        }),
       },
       redact: {
         paths: [

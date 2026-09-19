@@ -1,12 +1,19 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
+import { AdminAuthGuard } from '../auth/admin-auth.guard';
+import { CsrfGuard } from '../auth/csrf.guard';
+import { RequirePermissions } from '../auth/require-permissions.decorator';
 import { PostsService } from './posts.service';
 import { CreatePostDto } from './dto/create-post.dto';
 
 // Deliberately minimal: enough to drive the delivery pipeline end to end and
 // to verify it against real VK groups. The full post CRUD belongs to the web
-// panel (Step 8), and permission guards to Step 9 — like GroupsController,
-// this isn't exposed publicly before then.
+// panel (Step 8).
+//
+// Право одно на весь контроллер: посты — единая область, и дробить её на
+// «создать» и «остановить» значило бы выдавать половину рычага от кампании.
 @Controller('posts')
+@UseGuards(AdminAuthGuard, CsrfGuard)
+@RequirePermissions('posts_manage')
 export class PostsController {
   constructor(private readonly postsService: PostsService) {}
 

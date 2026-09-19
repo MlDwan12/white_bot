@@ -57,6 +57,18 @@ export const envValidationSchema = Joi.object({
   // запятую. Пусто — CORS выключен совсем: так и надо, пока мини-приложение
   // не развёрнуто, и заодно это не даёт случайно открыть API всем.
   MINIAPP_ORIGINS: Joi.string().allow('').default(''),
+  // Секрет подписи access-токенов. Обязателен и без значения по умолчанию:
+  // предсказуемый секрет означает, что пропуск в панель может выписать себе
+  // кто угодно. 32 байта — минимум, чтобы подпись не подбиралась.
+  JWT_SECRET: Joi.string().min(32).required(),
+  // В разработке панель открывается по http, и кука с `secure` не встанет.
+  COOKIE_SECURE: Joi.string().valid('true', 'false').default('true'),
+  // Сколько обратных прокси стоит перед приложением. Нужно ограничителю
+  // попыток: за прокси `req.ip` у всех запросов один и тот же — адрес
+  // прокси, и лимит входа из персонального превращается в общий на всё
+  // развёртывание. Включать **только** когда прокси действительно есть:
+  // иначе клиент подделает `X-Forwarded-For` и обойдёт ограничитель.
+  TRUST_PROXY_HOPS: Joi.number().integer().min(0).default(0),
   MAX_API_BASE_URL: Joi.string()
     // dotenv turns a bare `MAX_API_BASE_URL=` line into '', and a Joi default
     // does not apply to ''. Without `.empty('')` blanking the line — the

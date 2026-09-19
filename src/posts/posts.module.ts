@@ -13,9 +13,11 @@ import { PostSender } from './post-sender';
 import { AttachmentUploader } from './attachment-uploader';
 import { PostDeliveryProcessor } from './post-delivery.processor';
 import { PostReconcilerService } from './post-reconciler.service';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     PrismaModule,
     CryptoModule,
     VkModule,

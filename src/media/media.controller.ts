@@ -2,16 +2,23 @@ import {
   Controller,
   Post,
   UploadedFile,
+  UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
+import { AdminAuthGuard } from '../auth/admin-auth.guard';
+import { CsrfGuard } from '../auth/csrf.guard';
+import { RequirePermissions } from '../auth/require-permissions.decorator';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { MAX_FILE_BYTES, MediaService } from './media.service';
 
-// No permission guards yet — Step 9, like the other controllers.
+// Загрузка файлов — часть работы с постами, отдельного права под неё нет:
+// иметь `posts_manage` и не мочь приложить картинку бессмысленно.
 @Controller('media')
+@UseGuards(AdminAuthGuard, CsrfGuard)
+@RequirePermissions('posts_manage')
 export class MediaController {
   constructor(private readonly mediaService: MediaService) {}
 

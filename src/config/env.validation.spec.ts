@@ -7,6 +7,9 @@ const REQUIRED = {
   DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
   REDIS_URL: 'redis://localhost:6379',
   TOKEN_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
+  // Как и ключ шифрования, в .env.example не кладётся: значение-заглушка,
+  // пригодное к запуску, рано или поздно уедет в прод как настоящее.
+  JWT_SECRET: 'x'.repeat(48),
 };
 
 describe('envValidationSchema', () => {
@@ -21,9 +24,26 @@ describe('envValidationSchema', () => {
     const { error } = envValidationSchema.validate({
       ...example,
       TOKEN_ENCRYPTION_KEY: REQUIRED.TOKEN_ENCRYPTION_KEY,
+      JWT_SECRET: REQUIRED.JWT_SECRET,
     });
 
     expect(error).toBeUndefined();
+  });
+
+  it('refuses to boot without a signing secret', () => {
+    // Сервер с предсказуемым секретом подписи хуже, чем сервер, который не
+    // стартовал: пропуск в панель тогда может выписать себе кто угодно.
+    const withoutSecret: Record<string, string> = { ...REQUIRED };
+    delete withoutSecret.JWT_SECRET;
+
+    expect(envValidationSchema.validate(withoutSecret).error).toBeDefined();
+  });
+
+  it('refuses a signing secret short enough to brute-force', () => {
+    expect(
+      envValidationSchema.validate({ ...REQUIRED, JWT_SECRET: 'короткий' })
+        .error,
+    ).toBeDefined();
   });
 
   it('treats an empty MAX_BOT_TOKEN as "MAX disabled", not as a fatal error', () => {

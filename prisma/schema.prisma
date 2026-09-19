@@ -417,12 +417,16 @@ model AdminUser {
 }
 
 model AdminSession {
-  id               String   @id @default(uuid())
+  id               String    @id @default(uuid())
   adminUserId      String
-  refreshTokenHash String   @unique
+  refreshTokenHash String    @unique
   expiresAt        DateTime
-  revoked          Boolean  @default(false)
-  createdAt        DateTime @default(now())
+  revoked          Boolean   @default(false)
+  /// Когда токен погашен. Нужно, чтобы отличить гонку вкладок от кражи:
+  /// повторное обновление через секунду после законного — это повтор
+  /// запроса, а через час — чужие руки.
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
 
   adminUser AdminUser @relation(fields: [adminUserId], references: [id])
 
