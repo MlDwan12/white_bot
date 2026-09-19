@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Конкурс</title>
+    <!--
+      Макет экранов конкурса. Данные пока подставные: цель — договориться о
+      том, что видит человек, до того как это будет подключено к серверу.
+
+      Состояния переключаются через #state=... — так их можно посмотреть в
+      обычном браузере, не имея ни доступа к платформе MAX, ни живого
+      конкурса. Переключатель внизу показывается только в режиме макета и
+      исчезнет, когда страница начнёт получать настоящие данные.
+    -->
+    <script src="https://st.max.ru/js/max-web-app.js"></script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #16181d;
+        --muted: #6b7280;
+        --line: #e6e8ec;
+        --card: #f7f8fa;
+        --accent: #2f6feb;
+        --accent-fg: #ffffff;
+        --win: #0f7a3d;
+        --win-bg: #e8f6ed;
+        --bad: #b42318;
+        --bad-bg: #fdeceb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0f1114;
+          --fg: #e9ebee;
+          --muted: #98a0ab;
+          --line: #23272e;
+          --card: #171a1f;
+          --accent: #4c8bff;
+          --accent-fg: #0f1114;
+          --win: #4ade80;
+          --win-bg: #10291b;
+          --bad: #f87171;
+          --bad-bg: #2a1414;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        display: flex;
+        flex-direction: column;
+      }
+      main {
+        flex: 1;
+        width: 100%;
+        max-width: 560px;
+        margin: 0 auto;
+        padding: 24px 16px 32px;
+      }
+
+      .eyebrow {
+        font-size: 12px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-weight: 600;
+        margin: 0 0 6px;
+      }
+      h1 { font-size: 22px; line-height: 1.25; margin: 0 0 12px; }
+      .terms {
+        margin: 0 0 20px;
+        color: var(--fg);
+        white-space: pre-wrap;
+      }
+
+      .stat {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 14px 16px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--card);
+        margin-bottom: 16px;
+      }
+      .stat b { font-size: 24px; font-variant-numeric: tabular-nums; }
+      .stat span { color: var(--muted); font-size: 14px; }
+
+      .prizes { list-style: none; margin: 0 0 20px; padding: 0; }
+      .prizes li {
+        display: grid;
+        grid-template-columns: 28px 1fr;
+        gap: 12px;
+        padding: 12px 0;
+        border-bottom: 1px solid var(--line);
+        align-items: start;
+      }
+      .prizes li:last-child { border-bottom: 0; }
+      .place {
+        font-weight: 700;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .label { font-weight: 600; }
+      .winner { color: var(--muted); font-size: 14px; }
+      .prizes li.mine {
+        background: var(--win-bg);
+        border-radius: 12px;
+        padding: 12px;
+        border-bottom: 0;
+        margin-bottom: 1px;
+      }
+      .prizes li.mine .winner { color: var(--win); font-weight: 600; }
+
+      button.cta {
+        width: 100%;
+        padding: 15px;
+        border: 0;
+        border-radius: 14px;
+        background: var(--accent);
+        color: var(--accent-fg);
+        font-size: 16px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.cta[disabled] { opacity: 0.5; cursor: default; }
+      .joined {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 15px;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        background: var(--card);
+        color: var(--win);
+        font-weight: 600;
+      }
+      .hint {
+        margin: 10px 2px 0;
+        font-size: 13px;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      .banner {
+        padding: 14px 16px;
+        border-radius: 14px;
+        font-size: 15px;
+        margin-bottom: 16px;
+      }
+      .banner.win { background: var(--win-bg); color: var(--win); font-weight: 600; }
+      .banner.err { background: var(--bad-bg); color: var(--bad); }
+
+      .skeleton {
+        height: 16px;
+        border-radius: 8px;
+        background: var(--card);
+        margin-bottom: 10px;
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+      .skeleton.wide { width: 70%; }
+      .skeleton.tall { height: 52px; border-radius: 14px; margin-top: 20px; }
+      @keyframes pulse { 50% { opacity: 0.45; } }
+
+      /* Переключатель состояний — только для макета. */
+      .mockbar {
+        border-top: 1px solid var(--line);
+        background: var(--card);
+        padding: 10px 12px 14px;
+      }
+      .mockbar p {
+        margin: 0 0 8px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        font-weight: 600;
+      }
+      .mockbar div { display: flex; flex-wrap: wrap; gap: 6px; }
+      .mockbar a {
+        font-size: 13px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: var(--bg);
+        color: var(--fg);
+        text-decoration: none;
+      }
+      .mockbar a[aria-current='true'] {
+        background: var(--fg);
+        color: var(--bg);
+        border-color: var(--fg);
+      }
+    </style>
+  </head>
+  <body>
+    <main id="app"></main>
+    <nav class="mockbar" id="mockbar" hidden>
+      <p>Состояния (макет)</p>
+      <div id="states"></div>
+    </nav>
+
+    <script>
+      (function () {
+        var app = document.getElementById('app');
+
+        // Подставные данные. Реальные придут с сервера после проверки
+        // подписи initData — страница сама себе ничего не доверяет.
+        var CONTEST = {
+          title: 'Розыгрыш годовой подписки',
+          // Условия — текст анонс-поста: отдельного поля у конкурса нет,
+          // чтобы описанию негде было разойтись с тем, что человек прочёл
+          // в канале.
+          terms:
+            'Нажмите «Участвовать» до 30 сентября.\nПобедителей определит бот случайным образом.',
+          participants: 128,
+          // Только места, без расшифровки приза: что именно достаётся
+          // каждому месту, организатор объявляет сам.
+          // Имена приходят с сервера уже сокращёнными — полные фамилии
+          // участников незачем отдавать на страницу, которую видят все.
+          prizes: [
+            { place: 1, winner: 'Иван П.' },
+            { place: 2, winner: 'Мария С.' },
+            { place: 3, winner: 'Пётр В.' },
+          ],
+        };
+
+        var STATES = {
+          loading: 'Загрузка',
+          open: 'Открыт',
+          joined: 'Участвую',
+          drawn: 'Завершён',
+          won: 'Завершён, я выиграл',
+          closed: 'Приём не открыт',
+          missing: 'Конкурс не найден',
+          rejected: 'Подпись не сошлась',
+        };
+
+        function el(html) {
+          var t = document.createElement('template');
+          t.innerHTML = html.trim();
+          return t.content.firstElementChild;
+        }
+
+        function esc(value) {
+          return String(value).replace(/[&<>"]/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+          });
+        }
+
+        function plural(n, one, few, many) {
+          var mod10 = n % 10;
+          var mod100 = n % 100;
+          if (mod10 === 1 && mod100 !== 11) return one;
+          if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return few;
+          return many;
+        }
+
+        function header() {
+          return (
+            '<p class="eyebrow">Конкурс</p>' +
+            '<h1>' + esc(CONTEST.title) + '</h1>' +
+            '<p class="terms">' + esc(CONTEST.terms) + '</p>'
+          );
+        }
+
+        function counter() {
+          var n = CONTEST.participants;
+          return (
+            '<div class="stat"><b>' + n + '</b><span>' +
+            plural(n, 'участник', 'участника', 'участников') +
+            '</span></div>'
+          );
+        }
+
+        /** Список победителей по местам. До розыгрыша показывать нечего. */
+        function winnerList(minePlace) {
+          var rows = CONTEST.prizes
+            .map(function (prize) {
+              var mine = prize.place === minePlace;
+              return (
+                '<li' + (mine ? ' class="mine"' : '') + '>' +
+                '<span class="place">' + prize.place + '</span>' +
+                '<span><span class="label">' + prize.place + ' место</span>' +
+                '<br><span class="winner">' +
+                (mine ? 'Это вы' : esc(prize.winner)) +
+                '</span></span></li>'
+              );
+            })
+            .join('');
+          return '<ul class="prizes">' + rows + '</ul>';
+        }
+
+        /** Сколько мест разыгрывается — до розыгрыша это всё, что известно. */
+        function placesLine() {
+          var n = CONTEST.prizes.length;
+          return (
+            '<div class="stat"><b>' + n + '</b><span>' +
+            plural(n, 'призовое место', 'призовых места', 'призовых мест') +
+            '</span></div>'
+          );
+        }
+
+        function error(text, detail) {
+          return (
+            '<p class="eyebrow">Конкурс</p>' +
+            '<div class="banner err">' + esc(text) + '</div>' +
+            (detail ? '<p class="hint">' + esc(detail) + '</p>' : '')
+          );
+        }
+
+        var VIEWS = {
+          loading: function () {
+            return (
+              '<div class="skeleton wide"></div><div class="skeleton"></div>' +
+              '<div class="skeleton"></div><div class="skeleton tall"></div>'
+            );
+          },
+
+          open: function () {
+            return (
+              header() + counter() + placesLine() +
+              '<button class="cta" type="button">Участвовать</button>' +
+              // Честное предупреждение вместо обещания, которое платформа не
+              // всегда выполняет: личка от бота доходит не всем.
+              '<p class="hint">Результаты появятся здесь и в посте канала.</p>'
+            );
+          },
+
+          joined: function () {
+            return (
+              header() + counter() + placesLine() +
+              '<div class="joined">Вы участвуете</div>' +
+              '<p class="hint">Загляните сюда после розыгрыша — результаты будут тут.</p>'
+            );
+          },
+
+          drawn: function () {
+            return (
+              header() +
+              '<div class="stat"><b>' + CONTEST.participants + '</b>' +
+              '<span>участвовали</span></div>' +
+              winnerList() +
+              '<p class="hint">Розыгрыш завершён.</p>'
+            );
+          },
+
+          won: function () {
+            return (
+              header() +
+              '<div class="banner win">Вы выиграли 1 место</div>' +
+              winnerList(1) +
+              '<p class="hint">С вами свяжутся по поводу приза.</p>'
+            );
+          },
+
+          closed: function () {
+            return (
+              header() +
+              '<div class="banner err">Приём участников ещё не открыт</div>' +
+              '<p class="hint">Загляните позже.</p>'
+            );
+          },
+
+          missing: function () {
+            return error(
+              'Конкурс не найден',
+              'Возможно, он был удалён организатором.',
+            );
+          },
+
+          rejected: function () {
+            return error(
+              'Не удалось подтвердить, что запуск настоящий',
+              'Откройте конкурс заново из поста в канале.',
+            );
+          },
+        };
+
+        function currentState() {
+          var hash = new URLSearchParams(window.location.hash.slice(1));
+          var state = hash.get('state');
+          return VIEWS[state] ? state : 'open';
+        }
+
+        function render() {
+          var state = currentState();
+          app.innerHTML = VIEWS[state]();
+
+          var cta = app.querySelector('button.cta');
+          if (cta) {
+            cta.addEventListener('click', function () {
+              // В макете нажатие только переключает состояние. Настоящая
+              // регистрация пойдёт запросом на сервер, который проверит
+              // подпись initData, — страница сама решить ничего не может.
+              CONTEST.participants += 1;
+              window.location.hash = 'state=joined';
+            });
+          }
+
+          Array.prototype.forEach.call(
+            document.querySelectorAll('.mockbar a'),
+            function (link) {
+              link.setAttribute(
+                'aria-current',
+                link.dataset.state === state ? 'true' : 'false',
+              );
+            },
+          );
+        }
+
+        function buildMockbar() {
+          var bar = document.getElementById('mockbar');
+          var box = document.getElementById('states');
+          Object.keys(STATES).forEach(function (key) {
+            var link = el('<a href="#state=' + key + '">' + STATES[key] + '</a>');
+            link.dataset.state = key;
+            box.appendChild(link);
+          });
+          bar.hidden = false;
+        }
+
+        // Переключатель нужен только пока это макет: внутри MAX данные
+        // придут от сервера, и подменять состояние руками будет нечем.
+        if (!window.WebApp || !window.WebApp.initData) {
+          buildMockbar();
+        }
+
+        window.addEventListener('hashchange', render);
+        render();
+      })();
+    </script>
+  </body>
+</html>
