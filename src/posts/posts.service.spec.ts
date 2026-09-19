@@ -16,6 +16,8 @@ function post(overrides: Partial<Post> = {}): Post {
     scheduledAt: null,
     recurrenceRule: null,
     templatePaused: false,
+    nextRunAt: null,
+    timezone: null,
     autoDeleteAt: null,
     autoDeleteAfterMinutes: null,
     status: 'draft',
@@ -61,7 +63,10 @@ function buildService() {
     group: { findMany: jest.fn() },
     mediaAsset: { count: jest.fn().mockResolvedValue(0) },
     postAttachment: { findMany: jest.fn().mockResolvedValue([]) },
-    mediaPlatformUpload: { count: jest.fn().mockResolvedValue(0) },
+    mediaPlatformUpload: {
+      count: jest.fn().mockResolvedValue(0),
+      findMany: jest.fn().mockResolvedValue([]),
+    },
     $transaction: jest.fn().mockResolvedValue([]),
   };
   const queue = {
@@ -250,6 +255,92 @@ describe('PostsService', () => {
 
       expect(remove).toHaveBeenCalled();
       expect(queue.add).toHaveBeenCalled();
+    });
+  });
+
+  describe('publishableVkGroups', () => {
+    it('returns every group while the personal token is alive', async () => {
+      const { service, vkUploaderToken, prisma } = buildService();
+      vkUploaderToken.isUsable.mockResolvedValue(true);
+
+      await expect(
+        service.publishableVkGroups(['m1'], ['g1', 'g2']),
+      ).resolves.toEqual(['g1', 'g2']);
+      // No need to consult the cache at all in the healthy case.
+      expect(prisma.mediaPlatformUpload.findMany).not.toHaveBeenCalled();
+    });
+
+    it('keeps only the groups holding every file when the token is dead', async () => {
+      const { service, vkUploaderToken, prisma } = buildService();
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+      // g1 has both files cached; g2 has one of the two; g3 has none.
+      prisma.mediaPlatformUpload.findMany.mockResolvedValue([
+        { scope: 'g1', mediaAssetId: 'm1' },
+        { scope: 'g1', mediaAssetId: 'm2' },
+        { scope: 'g2', mediaAssetId: 'm1' },
+      ]);
+
+      // Asked as an aggregate ("is any pair uncached"), this answered "no" for
+      // the whole set and dropped g1 as well — a post that needed no token,
+      // lost for good because the template's window is already claimed.
+      await expect(
+        service.publishableVkGroups(['m1', 'm2'], ['g1', 'g2', 'g3']),
+      ).resolves.toEqual(['g1']);
+    });
+
+    it('needs no token when the post has no attachments', async () => {
+      const { service, vkUploaderToken } = buildService();
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+
+      await expect(service.publishableVkGroups([], ['g1'])).resolves.toEqual([
+        'g1',
+      ]);
+    });
+  });
+
+  describe('recurring templates are not campaigns', () => {
+    it.each(['schedulePost', 'stopPost', 'resumePost'] as const)(
+      'refuses %s on a template id',
+      async (method) => {
+        const { service, prisma, queue } = buildService();
+        prisma.post.findUnique.mockResolvedValue(
+          post({ status: 'draft', recurrenceRule: '0 10 * * *' }),
+        );
+
+        // A template is a Post too, and it is created `draft` — so this used to
+        // sail through the status gate: the template flipped to `scheduled`,
+        // dispatch found zero deliveries and it settled as `sent`, all while it
+        // kept firing on schedule.
+        await expect(service[method]('tpl-1')).rejects.toBeInstanceOf(
+          AppException,
+        );
+        expect(queue.add).not.toHaveBeenCalled();
+        expect(prisma.post.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('refuses to render a template through the campaign read path', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(
+        post({ status: 'draft', recurrenceRule: '0 10 * * *' }),
+      );
+
+      // Guarding only the write paths left GET returning a template as a draft
+      // campaign with no targets — and the panel offering "Запланировать" on
+      // it, which then 400s.
+      await expect(
+        service.getPostWithDeliveries('tpl-1'),
+      ).rejects.toBeInstanceOf(AppException);
+    });
+
+    it('still accepts an occurrence, which carries only a template id', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(
+        post({ status: 'draft', recurringTemplateId: 'tpl-1' }),
+      );
+      prisma.postAttachment.findMany.mockResolvedValue([]);
+
+      await expect(service.schedulePost('occ-1')).resolves.toBeDefined();
     });
   });
 

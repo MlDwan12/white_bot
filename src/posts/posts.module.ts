@@ -6,7 +6,9 @@ import { MaxModule } from '../max/max.module';
 import { MediaModule } from '../media/media.module';
 import { QueueModule } from '../queue/queue.module';
 import { PostsController } from './posts.controller';
+import { PostTemplatesController } from './post-templates.controller';
 import { PostsService } from './posts.service';
+import { PostTemplatesService } from './post-templates.service';
 import { PostSender } from './post-sender';
 import { AttachmentUploader } from './attachment-uploader';
 import { PostDeliveryProcessor } from './post-delivery.processor';
@@ -24,14 +26,15 @@ import { PostReconcilerService } from './post-reconciler.service';
     // second set of Redis connections) behind the same token.
     QueueModule,
   ],
-  controllers: [PostsController],
+  controllers: [PostsController, PostTemplatesController],
   providers: [
     PostsService,
+    PostTemplatesService,
     PostSender,
     AttachmentUploader,
     PostDeliveryProcessor,
     PostReconcilerService,
   ],
-  exports: [PostsService],
+  exports: [PostsService, PostTemplatesService],
 })
 export class PostsModule {}

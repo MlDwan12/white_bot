@@ -68,49 +68,10 @@ export class PostsService {
    */
   async createPost(input: CreatePostInput): Promise<Post> {
     const groupIds = [...new Set(input.groupIds)];
-    if (groupIds.length === 0) {
-      throw new AppException(
-        ErrorCode.VALIDATION_ERROR,
-        'Нужно выбрать хотя бы одну группу',
-      );
-    }
-
-    const groups = await this.prisma.group.findMany({
-      where: { id: { in: groupIds } },
-      select: { id: true, status: true, title: true },
-    });
-    if (groups.length !== groupIds.length) {
-      throw new AppException(ErrorCode.NOT_FOUND, 'Часть групп не найдена');
-    }
-    const unusable = groups.filter((group) => group.status !== 'active');
-    if (unusable.length > 0) {
-      throw new AppException(
-        ErrorCode.VALIDATION_ERROR,
-        `Группы недоступны для рассылки: ${unusable.map((g) => g.title).join(', ')}`,
-      );
-    }
+    await this.assertGroupsUsable(groupIds);
 
     const attachmentIds = input.attachmentIds ?? [];
-    if (attachmentIds.length > MAX_ATTACHMENTS_PER_POST) {
-      throw new AppException(
-        ErrorCode.VALIDATION_ERROR,
-        `VK принимает не больше ${MAX_ATTACHMENTS_PER_POST} вложений в посте`,
-      );
-    }
-    if (attachmentIds.length !== new Set(attachmentIds).size) {
-      throw new AppException(
-        ErrorCode.VALIDATION_ERROR,
-        'Один и тот же файл указан во вложениях дважды',
-      );
-    }
-    if (attachmentIds.length > 0) {
-      const found = await this.prisma.mediaAsset.count({
-        where: { id: { in: attachmentIds } },
-      });
-      if (found !== attachmentIds.length) {
-        throw new AppException(ErrorCode.NOT_FOUND, 'Часть файлов не найдена');
-      }
-    }
+    await this.assertAttachmentsUsable(attachmentIds);
 
     return this.prisma.post.create({
       data: {
@@ -132,6 +93,68 @@ export class PostsService {
         },
       },
     });
+  }
+
+  /**
+   * Target checks shared with recurring templates.
+   *
+   * A template pointed at a group that already can't receive posts looks
+   * configured and never publishes: every firing skips it with a warning
+   * nobody reads. Its target list stays editable, so the group can be added
+   * back once it recovers.
+   */
+  async assertGroupsUsable(groupIds: string[]): Promise<void> {
+    if (groupIds.length === 0) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Нужно выбрать хотя бы одну группу',
+      );
+    }
+    const groups = await this.prisma.group.findMany({
+      where: { id: { in: groupIds } },
+      select: { id: true, status: true, title: true },
+    });
+    if (groups.length !== groupIds.length) {
+      throw new AppException(ErrorCode.NOT_FOUND, 'Часть групп не найдена');
+    }
+    const unusable = groups.filter((group) => group.status !== 'active');
+    if (unusable.length > 0) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        `Группы недоступны для рассылки: ${unusable.map((g) => g.title).join(', ')}`,
+      );
+    }
+  }
+
+  /**
+   * Attachment checks shared with recurring templates.
+   *
+   * Living in one place matters most for templates: a template that slips past
+   * the VK limit doesn't fail once, it produces a broken occurrence on every
+   * firing, for as long as the schedule runs.
+   */
+  async assertAttachmentsUsable(attachmentIds: string[]): Promise<void> {
+    if (attachmentIds.length > MAX_ATTACHMENTS_PER_POST) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        `VK принимает не больше ${MAX_ATTACHMENTS_PER_POST} вложений в посте`,
+      );
+    }
+    if (attachmentIds.length !== new Set(attachmentIds).size) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Один и тот же файл указан во вложениях дважды',
+      );
+    }
+    if (attachmentIds.length === 0) {
+      return;
+    }
+    const found = await this.prisma.mediaAsset.count({
+      where: { id: { in: attachmentIds } },
+    });
+    if (found !== attachmentIds.length) {
+      throw new AppException(ErrorCode.NOT_FOUND, 'Часть файлов не найдена');
+    }
   }
 
   /**
@@ -296,6 +319,8 @@ export class PostsService {
       where: { postId },
       select: { mediaAssetId: true },
     });
+    // Answered without touching deliveries at all in the common case: a
+    // text-only campaign never needs the uploader token.
     if (attachments.length === 0) {
       return false;
     }
@@ -307,7 +332,67 @@ export class PostsService {
       },
       select: { groupId: true },
     });
-    if (vkTargets.length === 0) {
+    return this.needsVkUpload(
+      attachments.map((a) => a.mediaAssetId),
+      vkTargets.map((t) => t.groupId),
+    );
+  }
+
+  /**
+   * Which of these VK groups this post can actually reach right now — all of
+   * them when the personal token is alive, and otherwise only those whose
+   * files are already uploaded into them.
+   *
+   * A recurring template needs this *before* it creates an occurrence: creating
+   * one and letting the processor discover the expired token would leave it
+   * parked in `scheduled`, and every further firing would park another — until
+   * re-authorization released a week of them into real communities at once.
+   * That is exactly what `nextRunAfter`'s "never replay missed windows" rule
+   * exists to prevent, and nothing can undo it while VK's wall.delete is
+   * unavailable.
+   */
+  async publishableVkGroups(
+    mediaAssetIds: string[],
+    vkGroupIds: string[],
+  ): Promise<string[]> {
+    if (mediaAssetIds.length === 0 || vkGroupIds.length === 0) {
+      return vkGroupIds;
+    }
+    if (await this.vkUploaderToken.isUsable()) {
+      return vkGroupIds;
+    }
+    // Answered per group, not for the set. `needsVkUpload` asks the aggregate
+    // question — "is any (file, group) pair still uncached" — which is the
+    // right question for one campaign but the wrong one here: a template that
+    // has been running for a month has every pair cached, and adding one new
+    // VK group would otherwise drop the established groups too. Their files
+    // are already on VK's side and need no token at all, which is the whole
+    // point of the cache.
+    const assetIds = [...new Set(mediaAssetIds)];
+    const cached = await this.prisma.mediaPlatformUpload.findMany({
+      where: {
+        platform: 'vk',
+        mediaAssetId: { in: assetIds },
+        scope: { in: vkGroupIds },
+      },
+      select: { scope: true, mediaAssetId: true },
+    });
+    const cachedPerGroup = new Map<string, Set<string>>();
+    for (const row of cached) {
+      const forGroup = cachedPerGroup.get(row.scope) ?? new Set<string>();
+      forGroup.add(row.mediaAssetId);
+      cachedPerGroup.set(row.scope, forGroup);
+    }
+    return vkGroupIds.filter(
+      (groupId) => cachedPerGroup.get(groupId)?.size === assetIds.length,
+    );
+  }
+
+  private async needsVkUpload(
+    mediaAssetIds: string[],
+    vkGroupIds: string[],
+  ): Promise<boolean> {
+    if (mediaAssetIds.length === 0 || vkGroupIds.length === 0) {
       return false;
     }
 
@@ -319,11 +404,11 @@ export class PostsService {
     const cached = await this.prisma.mediaPlatformUpload.count({
       where: {
         platform: 'vk',
-        mediaAssetId: { in: attachments.map((a) => a.mediaAssetId) },
-        scope: { in: vkTargets.map((t) => t.groupId) },
+        mediaAssetId: { in: mediaAssetIds },
+        scope: { in: vkGroupIds },
       },
     });
-    return cached < attachments.length * vkTargets.length;
+    return cached < mediaAssetIds.length * vkGroupIds.length;
   }
 
   /**
@@ -427,6 +512,16 @@ export class PostsService {
     if (!post) {
       throw new AppException(ErrorCode.NOT_FOUND, 'Пост не найден');
     }
+    // The same guard `findOrThrow` applies, for the same reason: without it
+    // `GET /posts/<templateId>` rendered a template as an ordinary campaign —
+    // a draft with no targets — and the panel offered "Запланировать" on it,
+    // which then 400s. Half a guard is worse than none: it invites the click.
+    if (post.recurrenceRule) {
+      throw new AppException(
+        ErrorCode.REQUEST_ERROR,
+        'Это повторяющийся шаблон — им управляют через /post-templates',
+      );
+    }
     return post;
   }
 
@@ -451,10 +546,28 @@ export class PostsService {
     }
   }
 
+  /**
+   * A campaign by id — never a recurring template.
+   *
+   * A template is stored as a `Post` too, and it is created `draft`, so
+   * `POST /posts/<templateId>/schedule` used to sail through the status gate:
+   * the template flipped to `scheduled`, dispatch found zero deliveries and
+   * `finalizeIfComplete` settled it as `sent` — while it happily kept firing on
+   * schedule. `stopPost` likewise set `stopRequested` on a row nothing on the
+   * template path ever reads. The reconciler already excludes templates from
+   * its recovery queries; the same exclusion belongs here, at the entry point.
+   * Occurrences carry `recurringTemplateId`, not `recurrenceRule`, so they pass.
+   */
   private async findOrThrow(id: string): Promise<Post> {
     const post = await this.prisma.post.findUnique({ where: { id } });
     if (!post) {
       throw new AppException(ErrorCode.NOT_FOUND, 'Пост не найден');
+    }
+    if (post.recurrenceRule) {
+      throw new AppException(
+        ErrorCode.REQUEST_ERROR,
+        'Это повторяющийся шаблон — им управляют через /post-templates',
+      );
     }
     return post;
   }

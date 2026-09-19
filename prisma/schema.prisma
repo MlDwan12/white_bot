@@ -104,6 +104,15 @@ model Post {
   scheduledAt            DateTime?
   recurrenceRule         String?
   templatePaused         Boolean    @default(false)
+  /// Только у повторяющегося шаблона: момент следующего срабатывания.
+  /// Расписание живёт здесь, а не в repeatable-джобе BullMQ, потому что
+  /// источник правды — Postgres: очистка Redis не должна тихо убивать все
+  /// повторяющиеся посты.
+  nextRunAt              DateTime?
+  /// Часовой пояс, в котором трактуется recurrenceRule. Хранится у шаблона,
+  /// а не берётся из окружения, чтобы «каждый день в 10:00» означало одно и
+  /// то же и после переезда сервера в другой часовой пояс.
+  timezone               String?
   autoDeleteAt           DateTime?
   autoDeleteAfterMinutes Int?
   status                 PostStatus @default(draft)
@@ -124,6 +133,11 @@ model Post {
   @@index([clonedFromPostId])
   @@index([recurringTemplateId])
   @@index([status, scheduledAt])
+  /// Выборка шаблонов, которым пора сработать.
+  // Created as a PARTIAL index (WHERE "recurrenceRule" IS NOT NULL) in
+  // 20260918144004_step6c_recurring_schedule — Prisma cannot express that here,
+  // and reports no diff against it.
+  @@index([templatePaused, nextRunAt])
 }
 
 /// Текущий (редактируемый) список целевых групп повторяющегося шаблона —

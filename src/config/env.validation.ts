@@ -49,4 +49,27 @@ export const envValidationSchema = Joi.object({
   // working without extra configuration; in Docker this path is a volume, so
   // files survive container rebuilds (see PLAN.md, шаг 11).
   MEDIA_STORAGE_PATH: Joi.string().default('./storage/media'),
+  // Default timezone for a recurring template's cron expression. Stored on
+  // the template itself at creation, so changing this later doesn't silently
+  // move the firing time of templates that already exist.
+  //
+  // Validated rather than accepted as any string: a typo like "Europe/Moskva"
+  // would otherwise boot fine and surface much later as a 400 blaming the cron
+  // expression, which is the one thing that isn't wrong.
+  DEFAULT_TIMEZONE: Joi.string()
+    .default('Europe/Moscow')
+    .custom((value: string, helpers) => {
+      // Checked by asking the runtime to *use* the zone rather than by
+      // matching it against `Intl.supportedValuesOf('timeZone')`: that list
+      // holds only canonical names for this particular ICU build, so it
+      // rejects `UTC` outright and accepts exactly one of
+      // `Europe/Kiev`/`Europe/Kyiv` depending on the build. The same .env
+      // would then boot on one host and not on another.
+      try {
+        new Intl.DateTimeFormat(undefined, { timeZone: value });
+        return value;
+      } catch {
+        return helpers.error('any.invalid');
+      }
+    }, 'IANA timezone'),
 });

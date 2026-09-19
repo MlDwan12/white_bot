@@ -3,6 +3,7 @@ import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import { PostReconcilerService } from './post-reconciler.service';
 import { PostsService } from './posts.service';
+import { PostTemplatesService } from './post-templates.service';
 
 /** Reads one argument of a recorded call as `T` — `mock.calls` is `any[][]`,
  * which trips the type-aware lint rules when indexed directly. */
@@ -24,6 +25,7 @@ function setup(lockAcquired = true) {
     finalizeIfComplete: jest.fn().mockResolvedValue({}),
     redispatchPending: jest.fn().mockResolvedValue(false),
   };
+  const templates = { fireDueTemplates: jest.fn().mockResolvedValue(0) };
   const redis = {
     set: jest.fn().mockResolvedValue(lockAcquired ? 'OK' : null),
   };
@@ -37,10 +39,11 @@ function setup(lockAcquired = true) {
   const service = new PostReconcilerService(
     prisma as unknown as PrismaService,
     posts as unknown as PostsService,
+    templates as unknown as PostTemplatesService,
     redis as unknown as Redis,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma, posts, redis, logger };
+  return { service, prisma, posts, templates, redis, logger };
 }
 
 describe('PostReconcilerService', () => {
@@ -144,6 +147,72 @@ describe('PostReconcilerService', () => {
     // terminate Node.
     await expect(service.runSweep()).resolves.toBeUndefined();
     expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('judges template lateness from when the sweep started', async () => {
+    const { service, templates } = setup();
+    const startedAt = new Date('2026-09-18T07:00:00.000Z');
+
+    await service.runSweep(startedAt);
+
+    // Firing runs after the recovery passes, which can take minutes. Left to
+    // default to `new Date()`, the lateness bound inside would charge every
+    // template for that backlog and abandon windows that were on time — the
+    // day's post dropped with only a warn. The *next* window is still computed
+    // from a fresh per-template clock inside the loop.
+    expect(templates.fireDueTemplates).toHaveBeenCalledWith(startedAt);
+  });
+
+  it('runs recovery before firing templates', async () => {
+    const { service, prisma, templates } = setup();
+    const order: string[] = [];
+    prisma.post.findMany.mockImplementation(() => {
+      order.push('recovery');
+      return Promise.resolve([]);
+    });
+    templates.fireDueTemplates.mockImplementation(() => {
+      order.push('templates');
+      return Promise.resolve(0);
+    });
+
+    await service.runSweep(new Date('2026-09-18T07:00:00.000Z'));
+
+    // Firing is a sequential loop with a transaction and a queue.add per
+    // template. First in the sweep, a backlog of due templates delayed the work
+    // that rescues stuck campaigns — and could outlive the sweep lock.
+    // A late firing costs nothing: nextRunAt has passed, the window is not lost.
+    expect(order[0]).toBe('recovery');
+    expect(order[order.length - 1]).toBe('templates');
+  });
+
+  it('still runs the recovery steps when firing templates fails', async () => {
+    const { service, templates, prisma, logger } = setup();
+    templates.fireDueTemplates.mockRejectedValue(new Error('БД недоступна'));
+
+    await service.runSweep(new Date('2026-09-18T07:00:00.000Z'));
+
+    // Firing templates was added as the *first* step of the sweep. Unguarded,
+    // a failure there cancelled the recovery work below — which existed first
+    // and is what rescues stuck campaigns — for that whole minute.
+    expect(prisma.post.findMany).toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('never mistakes a recurring template for a schedulable post', async () => {
+    const { service, prisma } = setup();
+
+    await service.runSweep();
+
+    // A template has no deliveries of its own: dispatching one would publish
+    // nothing while marking it `sending` forever.
+    const scheduledWhere = (
+      prisma.post.findMany.mock.calls[0] as unknown[]
+    )[0] as { where: { recurrenceRule: null } };
+    const stalledWhere = (
+      prisma.post.findMany.mock.calls[1] as unknown[]
+    )[0] as { where: { recurrenceRule: null } };
+    expect(scheduledWhere.where.recurrenceRule).toBeNull();
+    expect(stalledWhere.where.recurrenceRule).toBeNull();
   });
 
   it('swallows a sweep failure so the timer keeps running', async () => {

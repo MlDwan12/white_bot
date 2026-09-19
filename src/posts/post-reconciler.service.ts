@@ -9,6 +9,7 @@ import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import { REDIS_CLIENT } from '../queue/queue.constants';
 import { PostsService } from './posts.service';
+import { PostTemplatesService } from './post-templates.service';
 
 const SWEEP_INTERVAL_MS = 60_000;
 
@@ -43,9 +44,9 @@ const LOCK_TTL_MS = 30_000;
  * Keeps the queue in step with the database.
  *
  * Postgres holds the schedule; Redis only caches it as delayed jobs. This
- * closes the gap between them: campaigns whose job was lost (or whose time
- * passed while the app was down) get re-queued, and deliveries abandoned
- * mid-flight are resolved.
+ * closes the gap between them: recurring templates whose time has come are
+ * fired, campaigns whose job was lost (or whose time passed while the app was
+ * down) get re-queued, and deliveries abandoned mid-flight are resolved.
  *
  * Runs behind a Redis lock so that adding a second app instance later doesn't
  * produce two reconcilers racing over the same rows.
@@ -61,6 +62,7 @@ export class PostReconcilerService
   constructor(
     private readonly prisma: PrismaService,
     private readonly posts: PostsService,
+    private readonly templates: PostTemplatesService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly logger: PinoLogger,
   ) {
@@ -113,9 +115,29 @@ export class PostReconcilerService
       if (!locked) {
         return;
       }
+      // Recovery first, templates last. Firing is a sequential loop with a
+      // transaction and a queue.add per template, so on the first sweep after
+      // an outage — when every template is due — putting it first delayed the
+      // work that rescues stuck campaigns and deliveries by the whole backlog.
+      // Delaying a firing is harmless by comparison, but only because `now` is
+      // passed down: lateness is judged from when this sweep started, so a long
+      // recovery pass cannot push a template past the grace bound that would
+      // abandon its window. (Called with no argument, as it was, the default
+      // `new Date()` is read *after* recovery — which is what a 12-minute
+      // backlog turned into "every template is 13 minutes stale, drop them
+      // all". The next window is still computed from a fresh per-template
+      // clock inside the loop, so nothing regresses there.)
       await this.requeueDueScheduledPosts(now);
       await this.resolveStuckCampaigns();
       await this.resolveStuckDeliveries(now);
+      // Isolated as well: its own `findMany` sits outside the per-template
+      // try/catch inside it, and a failure there must not look like a failed
+      // sweep.
+      try {
+        await this.templates.fireDueTemplates(now);
+      } catch (err: unknown) {
+        this.logger.error({ err }, 'Не удалось поднять повторяющиеся посты');
+      }
     } catch (err: unknown) {
       // Never rethrow: this runs on a timer with nobody to catch it, and one
       // bad sweep must not stop all later ones.
@@ -137,6 +159,11 @@ export class PostReconcilerService
     const due = await this.prisma.post.findMany({
       where: {
         status: 'scheduled',
+        // Templates are excluded everywhere they could be mistaken for a
+        // schedulable post: a template has no deliveries of its own, and
+        // dispatching one would publish nothing while marking it `sending`
+        // forever.
+        recurrenceRule: null,
         OR: [
           { scheduledAt: null },
           {
@@ -172,7 +199,7 @@ export class PostReconcilerService
    */
   private async resolveStuckCampaigns(): Promise<void> {
     const stalled = await this.prisma.post.findMany({
-      where: { status: 'sending', stopRequested: false },
+      where: { status: 'sending', stopRequested: false, recurrenceRule: null },
       select: { id: true },
     });
 
