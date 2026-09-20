@@ -3,7 +3,12 @@ import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { PrismaService } from '../prisma/prisma.service';
-import { Contest, Platform, Prisma } from '../generated/prisma/client';
+import {
+  Contest,
+  ContestStatus,
+  Platform,
+  Prisma,
+} from '../generated/prisma/client';
 import { ContestNotifier } from './contest-notifier';
 import {
   ContestDrawError,
@@ -21,6 +26,18 @@ export interface CreateContestInput {
   resultsButtonLabel?: string;
   notifyWinners?: boolean;
   publishResultsInPost?: boolean;
+}
+
+export interface ContestSummary {
+  id: string;
+  title: string;
+  status: ContestStatus;
+  createdAt: Date;
+  participantsCount: number;
+  placesCount: number;
+  /** Анонс-пост, если он есть: по нему список показывает, к чему конкурс. */
+  postId: string | null;
+  postText: string | null;
 }
 
 export interface PrizeInput {
@@ -429,6 +446,59 @@ export class ContestsService {
       throw new AppException(ErrorCode.NOT_FOUND, 'Конкурс не найден');
     }
     return contest;
+  }
+
+  /**
+   * Сводка для списка конкурсов в панели. Считать участников и места здесь,
+   * а не отдельными запросами на строку: десяток конкурсов иначе даёт
+   * два десятка обращений к базе ради двух чисел.
+   */
+  async listContests(limit = 50): Promise<ContestSummary[]> {
+    const contests = await this.prisma.contest.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      include: {
+        _count: { select: { participants: true, prizes: true } },
+        post: { select: { id: true, text: true } },
+      },
+    });
+
+    return contests.map((contest) => ({
+      id: contest.id,
+      title: contest.title,
+      status: contest.status,
+      createdAt: contest.createdAt,
+      participantsCount: contest._count.participants,
+      placesCount: contest._count.prizes,
+      postId: contest.post?.id ?? null,
+      postText: contest.post?.text ?? null,
+    }));
+  }
+
+  /**
+   * Посты, которые можно взять анонсом.
+   *
+   * Не отправленные: кнопка участия вшивается в доставку **в момент
+   * отправки**, и у вышедшего поста её уже не появится — только правкой
+   * опубликованного, которая в VK пока и вовсе недоступна. Предложить такой
+   * пост значило бы отдать конкурс без единого входа для участников, да ещё
+   * и молча. По той же причине исключены шаблоны повторяющихся постов: их
+   * вхождения — отдельные строки, конкурс к ним не привязан.
+   *
+   * Пост с конкурсом отсекается заодно: связь один к одному, такой выбор
+   * `createContest` всё равно отвергнет.
+   */
+  async listAnnouncementCandidates(limit = 50) {
+    return this.prisma.post.findMany({
+      where: {
+        contest: { is: null },
+        recurrenceRule: null,
+        status: { in: ['draft', 'scheduled'] },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      select: { id: true, text: true, status: true, createdAt: true },
+    });
   }
 
   /** Приз существует и участник относится к тому же конкурсу. */

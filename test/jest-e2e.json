@@ -11,7 +11,7 @@
     "^.+\\.(t|j)s$": "ts-jest"
   },
   "transformIgnorePatterns": [
-    "/node_modules/(?!(@nestjs/config|@nestjs/bullmq|@nestjs/bull-shared|dotenv-expand|es-toolkit|@standard-schema)/)"
+    "/node_modules/(?!(@nestjs/config|@nestjs/jwt|@nestjs/throttler|@nestjs/bullmq|@nestjs/bull-shared|dotenv-expand|es-toolkit|@standard-schema)/)"
   ],
   "moduleNameMapper": {
     "^(\\.{1,2}/.*)\\.js$": "$1"

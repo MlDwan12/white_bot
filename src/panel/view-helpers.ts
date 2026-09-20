@@ -1,4 +1,6 @@
 import type {
+  ContestNotifyStatus,
+  ContestStatus,
   GroupStatus,
   PostDeliveryStatus,
   PostStatus,
@@ -112,4 +114,53 @@ export function groupLabel(status: GroupStatus): string {
 
 export function groupColor(status: GroupStatus): string {
   return GROUP_COLORS[status] ?? 'secondary';
+}
+
+const CONTEST_LABELS: Record<ContestStatus, string> = {
+  draft: 'черновик',
+  open: 'идёт приём',
+  drawn: 'разыгран',
+};
+
+const CONTEST_COLORS: Record<ContestStatus, string> = {
+  draft: 'secondary',
+  open: 'green',
+  drawn: 'blue',
+};
+
+export function contestLabel(status: ContestStatus): string {
+  return CONTEST_LABELS[status] ?? status;
+}
+
+export function contestColor(status: ContestStatus): string {
+  return CONTEST_COLORS[status] ?? 'secondary';
+}
+
+/**
+ * Что стало с уведомлением победителя. Отдельная подпись, потому что
+ * `manual_required` — не ошибка, а поручение человеку: уведомить нечем, и
+ * написать победителю придётся самому.
+ */
+const NOTIFY_LABELS: Record<ContestNotifyStatus, string> = {
+  pending: 'не отправлено',
+  sent: 'уведомлён',
+  failed: 'не доставлено',
+  manual_required: 'напишите сами',
+  notified_manually: 'уведомлён вручную',
+};
+
+const NOTIFY_COLORS: Record<ContestNotifyStatus, string> = {
+  pending: 'secondary',
+  sent: 'green',
+  failed: 'red',
+  manual_required: 'orange',
+  notified_manually: 'green',
+};
+
+export function notifyLabel(status: ContestNotifyStatus): string {
+  return NOTIFY_LABELS[status] ?? status;
+}
+
+export function notifyColor(status: ContestNotifyStatus): string {
+  return NOTIFY_COLORS[status] ?? 'secondary';
 }

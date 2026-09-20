@@ -1,0 +1,80 @@
+<h1 class="page-title mb-3">Новый конкурс</h1>
+
+<div class="row g-3">
+  <div class="col-lg-8">
+    <form method="post" action="/panel/contests" class="card">
+      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+      <div class="card-body">
+        <% if (error) { %>
+          <div class="alert alert-danger" role="alert"><%= error %></div>
+        <% } %>
+
+        <div class="mb-3">
+          <label class="form-label" for="title">Название</label>
+          <input class="form-control" id="title" name="title" required
+                 value="<%= draft.title %>" />
+          <small class="form-hint">Видно только в панели.</small>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label" for="postId">Анонс-пост</label>
+          <select class="form-select" id="postId" name="postId">
+            <option value="">— без анонса, участники вносятся вручную —</option>
+            <% posts.forEach(function (p) { %>
+              <option value="<%= p.id %>" <%= draft.postId === p.id ? 'selected' : '' %>>
+                <%= p.text.slice(0, 80) %> — <%= statusLabel(p.status) %>,
+                <%= formatDate(p.createdAt) %>
+              </option>
+            <% }); %>
+          </select>
+          <small class="form-hint">
+            В доставки этого поста добавится кнопка участия. Поэтому в списке
+            только ещё не отправленные посты без конкурса: у вышедшего кнопке
+            взяться уже неоткуда, а конкурс остался бы без входа для
+            участников.
+            <% if (posts.length >= listLimit) { %>
+              Показаны последние <%= listLimit %>.
+            <% } %>
+          </small>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label" for="joinButtonLabel">Подпись кнопки до розыгрыша</label>
+          <input class="form-control" id="joinButtonLabel" name="joinButtonLabel"
+                 placeholder="Участвовать" value="<%= draft.joinButtonLabel %>" />
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label" for="resultsButtonLabel">Подпись кнопки после розыгрыша</label>
+          <input class="form-control" id="resultsButtonLabel" name="resultsButtonLabel"
+                 placeholder="Узнать результаты" value="<%= draft.resultsButtonLabel %>" />
+          <small class="form-hint">Кнопка та же — по итогам у неё меняется подпись.</small>
+        </div>
+
+        <label class="form-check">
+          <input class="form-check-input" type="checkbox" name="notifyWinners"
+                 <%= draft.notifyWinners ? 'checked' : '' %> />
+          <span class="form-check-label">Писать победителям в личные сообщения</span>
+        </label>
+        <div class="form-hint mb-3">
+          Дойдёт не каждому: тому, кто сам не писал боту, платформа личное
+          сообщение не доставит.
+        </div>
+
+        <label class="form-check">
+          <input class="form-check-input" type="checkbox" name="publishResultsInPost"
+                 <%= draft.publishResultsInPost ? 'checked' : '' %> />
+          <span class="form-check-label">Дописать победителей в текст анонса</span>
+        </label>
+        <div class="form-hint">
+          Единственный канал, который видят все подписчики. Без анонс-поста
+          ни на что не влияет.
+        </div>
+      </div>
+      <div class="card-footer d-flex gap-2">
+        <button class="btn btn-primary" type="submit">Создать</button>
+        <a class="btn" href="/panel/contests">Отмена</a>
+      </div>
+    </form>
+  </div>
+</div>

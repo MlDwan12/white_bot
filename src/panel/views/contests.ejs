@@ -1,0 +1,56 @@
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h1 class="page-title m-0">Конкурсы</h1>
+  <a class="btn btn-primary" href="/panel/contests/new">Новый конкурс</a>
+</div>
+
+<% if (contests.length === 0) { %>
+  <div class="card">
+    <div class="card-body text-center text-secondary py-5">
+      Конкурсов пока нет. Создайте первый — анонс-пост можно привязать сразу
+      или оставить конкурс на ручном списке участников.
+    </div>
+  </div>
+<% } else { %>
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table card-table table-vcenter">
+        <thead>
+          <tr>
+            <th>Конкурс</th>
+            <th>Статус</th>
+            <th>Участники</th>
+            <th>Места</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% contests.forEach(function (c) { %>
+            <tr>
+              <td>
+                <a class="text-reset text-decoration-none" href="/panel/contests/<%= c.id %>">
+                  <strong><%= c.title %></strong>
+                </a>
+                <div class="text-secondary small">
+                  <%= formatDate(c.createdAt) %>
+                  <% if (c.postId) { %>
+                    · анонс:
+                    <a href="/panel/campaigns/<%= c.postId %>"><%= (c.postText || '').slice(0, 60) %></a>
+                  <% } else { %>
+                    · без анонса
+                  <% } %>
+                </div>
+              </td>
+              <td><span class="badge bg-<%= contestColor(c.status) %>"><%= contestLabel(c.status) %></span></td>
+              <td><%= c.participantsCount %></td>
+              <td><%= c.placesCount %></td>
+            </tr>
+          <% }); %>
+        </tbody>
+      </table>
+    </div>
+    <% if (contests.length >= listLimit) { %>
+      <div class="card-footer text-secondary">
+        Показаны последние <%= listLimit %> конкурсов.
+      </div>
+    <% } %>
+  </div>
+<% } %>

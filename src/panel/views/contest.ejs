@@ -1,0 +1,286 @@
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <div>
+    <h1 class="page-title m-0"><%= contest.title %></h1>
+    <div class="text-secondary small mt-1">
+      <span class="badge bg-<%= contestColor(contest.status) %>"><%= contestLabel(contest.status) %></span>
+      · создан <%= formatDate(contest.createdAt) %>
+      <% if (contest.postId) { %>
+        · <a href="/panel/campaigns/<%= contest.postId %>">анонс-пост</a>
+      <% } else { %>
+        · без анонса, участники только вручную
+      <% } %>
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <% if (contest.status === 'draft') { %>
+      <form method="post" action="/panel/contests/<%= contest.id %>/open" class="m-0">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <button class="btn btn-primary" type="submit">Открыть приём</button>
+      </form>
+    <% } %>
+    <% if (contest.status !== 'drawn') { %>
+      <form method="post" action="/panel/contests/<%= contest.id %>/draw" class="m-0"
+            onsubmit="return confirm('Розыгрыш проводится один раз: приём закроется, места разойдутся, победителям уйдут уведомления. Продолжить?')">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <button class="btn btn-danger" type="submit">Разыграть</button>
+      </form>
+    <% } %>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-7">
+    <div class="card mb-3">
+      <div class="card-header">
+        <h3 class="card-title">Призовые места</h3>
+      </div>
+      <div class="card-body">
+        <% if (contest.status === 'drawn') { %>
+          <p class="text-secondary m-0">
+            После розыгрыша места не меняются — менять можно только того, кто
+            их занял.
+          </p>
+        <% } else if (!prizesEditable) { %>
+          <p class="text-secondary m-0">
+            Места заведены через API — с пропусками в нумерации или переносом
+            строки в подписи. Поле с подписями воспроизвести их не может: оно
+            нумерует места подряд и делит текст по строкам, поэтому правка
+            отсюда закрыта.
+          </p>
+        <% } else { %>
+          <% if (forcedPlaces.length > 0) { %>
+            <div class="alert alert-warning" role="alert">
+              Сохранение списка снимет закрепления (места:
+              <%= forcedPlaces.join(', ') %>) — закреплять придётся заново.
+            </div>
+          <% } %>
+          <form method="post" action="/panel/contests/<%= contest.id %>/prizes" class="m-0">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+            <textarea class="form-control" name="prizes" rows="4"
+                      placeholder="Сертификат на 5000&#10;Кружка&#10;Стикерпак"><%= prizesText %></textarea>
+            <small class="form-hint">
+              По строке на место, сверху вниз: первая строка — первое место.
+              Сохранение заменяет весь список: места создаются заново, и
+              выбранные вручную победители с них снимаются.
+            </small>
+            <button class="btn btn-primary mt-2" type="submit">Сохранить места</button>
+          </form>
+        <% } %>
+      </div>
+      <% if (contest.prizes.length > 0) { %>
+        <div class="table-responsive">
+          <table class="table card-table table-vcenter">
+            <thead>
+              <tr>
+                <th class="w-1">Место</th>
+                <th>Приз</th>
+                <th>Победитель</th>
+              </tr>
+            </thead>
+            <tbody>
+              <% contest.prizes.forEach(function (prize) { %>
+                <tr>
+                  <td><%= prize.place %></td>
+                  <td><%= prize.label %></td>
+                  <td>
+                    <% if (prize.winnerParticipant) { %>
+                      <%= prize.winnerParticipant.displayName %>
+                      <% if (prize.isForced) { %>
+                        <span class="badge bg-orange ms-1">выбран вручную</span>
+                      <% } %>
+                      <div class="small">
+                        <span class="text-<%= notifyColor(prize.notifyStatus) %>">
+                          <%= notifyLabel(prize.notifyStatus) %>
+                        </span>
+                        <% if (prize.notifyError) { %>
+                          <span class="text-secondary">· <%= prize.notifyError %></span>
+                        <% } %>
+                      </div>
+                    <% } else { %>
+                      <span class="text-secondary">—</span>
+                    <% } %>
+                  </td>
+                </tr>
+              <% }); %>
+            </tbody>
+          </table>
+        </div>
+      <% } %>
+    </div>
+
+    <%
+       /* Правка победителей. До розыгрыша это «подкрутка» — она спрятана в
+          свёрнутый блок намеренно: действие законное (место можно обещать
+          заранее), но случайно кликать по нему незачем. После розыгрыша тот
+          же по смыслу экран открыт, потому что замена отпавшего победителя —
+          рядовая работа. Оба пути пишут в журнал розыгрыша. */
+    %>
+    <% if (contest.prizes.length > 0 && contest.participants.length > 0) { %>
+      <% if (contest.status === 'drawn') { %>
+        <div class="card mb-3">
+          <div class="card-header"><h3 class="card-title">Замена победителя</h3></div>
+          <div class="card-body">
+            <% contest.prizes.forEach(function (prize) { %>
+              <form method="post"
+                    action="/panel/contests/<%= contest.id %>/prizes/<%= prize.id %>/override-winner"
+                    class="mb-3 d-flex flex-wrap gap-2 align-items-end">
+                <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                <div>
+                  <label class="form-label">Место <%= prize.place %> — <%= prize.label %></label>
+                  <select class="form-select" name="participantId" required>
+                    <option value="">— выберите участника —</option>
+                    <% contest.participants.forEach(function (p) { %>
+                      <option value="<%= p.id %>"
+                        <%= prize.winnerParticipantId === p.id ? 'selected' : '' %>>
+                        <%= p.displayName %>
+                      </option>
+                    <% }); %>
+                  </select>
+                </div>
+                <input class="form-control" style="width: 16rem" name="note"
+                       placeholder="причина замены" />
+                <button class="btn" type="submit">Заменить</button>
+              </form>
+            <% }); %>
+            <p class="text-secondary small m-0">
+              Замена попадёт в журнал со старым и новым победителем, а итоги
+              объявятся заново.
+            </p>
+          </div>
+        </div>
+      <% } else { %>
+        <details class="card mb-3">
+          <summary class="card-header" style="cursor: pointer">
+            <h3 class="card-title m-0">Закрепить место за участником</h3>
+          </summary>
+          <div class="card-body">
+            <p class="text-secondary">
+              Место достанется указанному человеку, а розыгрыш разыграет
+              только оставшиеся. Отметка «выбран вручную» останется видна на
+              странице и уйдёт в журнал розыгрыша.
+            </p>
+            <% contest.prizes.forEach(function (prize) { %>
+              <form method="post"
+                    action="/panel/contests/<%= contest.id %>/prizes/<%= prize.id %>/force-winner"
+                    class="mb-2 d-flex flex-wrap gap-2 align-items-end">
+                <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                <div>
+                  <label class="form-label">Место <%= prize.place %> — <%= prize.label %></label>
+                  <select class="form-select" name="participantId" required>
+                    <option value="">— выберите участника —</option>
+                    <% contest.participants.forEach(function (p) { %>
+                      <option value="<%= p.id %>"
+                        <%= prize.isForced && prize.winnerParticipantId === p.id ? 'selected' : '' %>>
+                        <%= p.displayName %>
+                      </option>
+                    <% }); %>
+                  </select>
+                </div>
+                <button class="btn" type="submit">Закрепить</button>
+              </form>
+            <% }); %>
+          </div>
+        </details>
+      <% } %>
+    <% } %>
+
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Журнал розыгрыша</h3></div>
+      <% if (contest.drawLogs.length === 0) { %>
+        <div class="card-body text-secondary">Розыгрыша ещё не было.</div>
+      <% } else { %>
+        <div class="table-responsive">
+          <table class="table card-table table-vcenter">
+            <tbody>
+              <% contest.drawLogs.forEach(function (log) { %>
+                <tr>
+                  <td class="w-1 text-nowrap"><%= formatDate(log.drawnAt) %></td>
+                  <td>
+                    <%= log.kind === 'draw' ? 'розыгрыш' : 'правка места' %>
+                    <% if (log.note) { %>
+                      <div class="text-secondary small"><%= log.note %></div>
+                    <% } %>
+                    <% if (log.seed) { %>
+                      <%
+                         /* Сид показывается целиком: по нему и списку
+                            участников розыгрыш пересчитывается, и это
+                            единственное доказательство, что он не подкручен. */
+                      %>
+                      <div class="text-secondary small">сид <%= log.seed %></div>
+                    <% } %>
+                  </td>
+                </tr>
+              <% }); %>
+            </tbody>
+          </table>
+        </div>
+      <% } %>
+    </div>
+  </div>
+
+  <div class="col-lg-5">
+    <div class="card mb-3">
+      <div class="card-header">
+        <h3 class="card-title">Участники</h3>
+        <span class="ms-auto text-secondary"><%= contest.participants.length %></span>
+      </div>
+      <% if (contest.status !== 'drawn') { %>
+        <div class="card-body">
+          <form method="post" action="/panel/contests/<%= contest.id %>/participants" class="m-0">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+            <textarea class="form-control" name="text" rows="4"
+                      placeholder="Иван Иванов, vk.com/id123&#10;Пётр Петров @max_nick"></textarea>
+            <small class="form-hint">
+              По участнику в строке: имя и ссылка или ник. Повторы не
+              добавятся — номера таких строк покажутся после сохранения.
+            </small>
+            <div class="mt-2 d-flex gap-2 align-items-center">
+              <label class="form-label m-0" for="platform">Площадка</label>
+              <select class="form-select w-auto" id="platform" name="platform">
+                <option value="max">MAX</option>
+                <option value="vk">VK</option>
+              </select>
+              <button class="btn btn-primary ms-auto" type="submit">Добавить</button>
+            </div>
+            <small class="form-hint">
+              Нужна только строкам без ссылки и ника: по ссылке площадка
+              видна и так.
+            </small>
+          </form>
+        </div>
+      <% } %>
+      <% if (contest.participants.length > 0) { %>
+        <div class="table-responsive">
+          <table class="table card-table table-vcenter">
+            <tbody>
+              <% contest.participants.forEach(function (p) { %>
+                <tr>
+                  <td>
+                    <%= p.displayName %>
+                    <% if (p.source === 'manual') { %>
+                      <span class="badge bg-secondary ms-1">вручную</span>
+                    <% } %>
+                    <div class="text-secondary small">
+                      <%= p.platform %>
+                      <% if (p.externalUserId) { %>
+                        · <%= p.externalUserId %>
+                      <% } else { %>
+                        · без id — уведомить автоматически нечем
+                      <% } %>
+                      <% if (p.group) { %>
+                        · из «<%= p.group.title %>»
+                      <% } %>
+                    </div>
+                  </td>
+                  <td class="w-1 text-nowrap text-secondary small"><%= formatDate(p.joinedAt) %></td>
+                </tr>
+              <% }); %>
+            </tbody>
+          </table>
+        </div>
+      <% } else { %>
+        <div class="card-body text-secondary">Пока никто не участвует.</div>
+      <% } %>
+    </div>
+  </div>
+</div>

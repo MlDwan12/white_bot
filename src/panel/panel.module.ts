@@ -4,11 +4,19 @@ import { AuthModule } from '../auth/auth.module';
 import { PostsModule } from '../posts/posts.module';
 import { GroupsModule } from '../groups/groups.module';
 import { MediaModule } from '../media/media.module';
+import { ContestsModule } from '../contests/contests.module';
 import { PanelController } from './panel.controller';
 import { SilentRefreshMiddleware } from './silent-refresh.middleware';
 
 @Module({
-  imports: [PrismaModule, AuthModule, PostsModule, GroupsModule, MediaModule],
+  imports: [
+    PrismaModule,
+    AuthModule,
+    PostsModule,
+    GroupsModule,
+    MediaModule,
+    ContestsModule,
+  ],
   controllers: [PanelController],
   providers: [SilentRefreshMiddleware],
 })

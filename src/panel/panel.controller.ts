@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   Param,
+  ParseUUIDPipe,
   Post,
   Query,
   Render,
@@ -38,15 +39,20 @@ import { readCookie } from '../auth/read-cookie';
 import { PostsService } from '../posts/posts.service';
 import { PostModerationService } from '../posts/post-moderation.service';
 import { GroupsService } from '../groups/groups.service';
+import { ContestsService } from '../contests/contests.service';
 import { MediaService, MAX_FILE_BYTES } from '../media/media.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { AdminUser, Permission } from '../generated/prisma/client';
 import {
+  contestColor,
+  contestLabel,
   deliveryColor,
   deliveryLabel,
   formatDate,
   groupColor,
   groupLabel,
+  notifyColor,
+  notifyLabel,
   statusColor,
   statusLabel,
 } from './view-helpers';
@@ -58,6 +64,9 @@ import { zonedToUtc } from './zoned-time';
  * Живёт под `/panel` — по этому префиксу и конверт `{success,data}`, и
  * обработчик ошибок понимают, что здесь нужен HTML, а не JSON.
  */
+/** Сколько строк показывают списки конкурсов и постов-кандидатов. */
+const LIST_LIMIT = 50;
+
 @Controller('panel')
 export class PanelController {
   constructor(
@@ -65,6 +74,7 @@ export class PanelController {
     private readonly posts: PostsService,
     private readonly moderation: PostModerationService,
     private readonly groups: GroupsService,
+    private readonly contests: ContestsService,
     private readonly media: MediaService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
@@ -386,6 +396,413 @@ export class PanelController {
     res.redirect(`${PANEL_PREFIX}/groups?flash=group-off`);
   }
 
+  // ----- конкурсы ---------------------------------------------------------
+
+  @Get('contests')
+  @Render('layout')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('contests_manage')
+  async contestsPage(
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Query('flash') flash?: string,
+    @Query('reason') reason?: string,
+  ) {
+    return {
+      ...this.shell(req, 'Конкурсы', admin, 'contests', flash, reason),
+      page: 'contests',
+      contests: await this.contests.listContests(LIST_LIMIT),
+      listLimit: LIST_LIMIT,
+      contestColor,
+      contestLabel,
+      formatDate,
+    };
+  }
+
+  // Объявлен **до** `contests/:id`: Nest сопоставляет маршруты в порядке
+  // объявления, и ниже `new` уехал бы в карточку конкурса как id.
+  @Get('contests/new')
+  @Render('layout')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('contests_manage')
+  async newContest(
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Query('flash') flash?: string,
+  ) {
+    return {
+      ...this.shell(req, 'Новый конкурс', admin, 'contests', flash),
+      page: 'new-contest',
+      posts: await this.contests.listAnnouncementCandidates(LIST_LIMIT),
+      listLimit: LIST_LIMIT,
+      statusLabel,
+      draft: {
+        title: '',
+        postId: '',
+        joinButtonLabel: '',
+        resultsButtonLabel: '',
+        notifyWinners: true,
+        publishResultsInPost: true,
+      },
+      formatDate,
+      error: null,
+    };
+  }
+
+  @Post('contests')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async createContest(
+    @Body()
+    body: {
+      title?: string;
+      postId?: string;
+      joinButtonLabel?: string;
+      resultsButtonLabel?: string;
+      notifyWinners?: string;
+      publishResultsInPost?: string;
+    },
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    // Снятая галочка браузером не присылается вовсе, поэтому «выключено» —
+    // это отсутствие поля, а не значение `false`.
+    const notifyWinners = body.notifyWinners !== undefined;
+    const publishResultsInPost = body.publishResultsInPost !== undefined;
+
+    try {
+      const title = body.title?.trim();
+      if (!title) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Название конкурса обязательно',
+        );
+      }
+      const contest = await this.contests.createContest({
+        title,
+        // Пустое значение из `select` значит «без анонса», и подставлять
+        // его строкой нельзя: сервис принял бы её за id и не нашёл пост.
+        postId: body.postId?.trim() || undefined,
+        joinButtonLabel: body.joinButtonLabel?.trim() || undefined,
+        resultsButtonLabel: body.resultsButtonLabel?.trim() || undefined,
+        notifyWinners,
+        publishResultsInPost,
+      });
+      res.redirect(
+        `${PANEL_PREFIX}/contests/${contest.id}?flash=contest-created`,
+      );
+    } catch (err: unknown) {
+      this.logger.warn({ err }, 'Не удалось создать конкурс');
+      res.status(400).render('layout', {
+        ...this.shell(req, 'Новый конкурс', admin, 'contests'),
+        page: 'new-contest',
+        posts: await this.contests.listAnnouncementCandidates(LIST_LIMIT),
+        listLimit: LIST_LIMIT,
+        statusLabel,
+        // Форма перерисовывается с набранным: потерять название и выбор
+        // анонса из-за одной ошибки — заставить набирать всё заново.
+        draft: {
+          title: body.title ?? '',
+          postId: body.postId ?? '',
+          joinButtonLabel: body.joinButtonLabel ?? '',
+          resultsButtonLabel: body.resultsButtonLabel ?? '',
+          notifyWinners,
+          publishResultsInPost,
+        },
+        formatDate,
+        error:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось создать конкурс',
+      });
+    }
+  }
+
+  @Get('contests/:id')
+  @Render('layout')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('contests_manage')
+  async contestPage(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Query('flash') flash?: string,
+    @Query('reason') reason?: string,
+  ) {
+    const contest = await this.contests.getContest(id);
+    // Поле с подписями перенумеровывает места подряд и режет текст по
+    // переносам строк. Для мест, заведённых через API «вразбежку» (1, 3, 5)
+    // или с переносом в подписи, сохранение без единой правки молча
+    // переписало бы их — такие места правятся только там, где заведены.
+    const prizesEditable = contest.prizes.every(
+      (prize, index) =>
+        prize.place === index + 1 && !prize.label.includes('\n'),
+    );
+    return {
+      ...this.shell(req, contest.title, admin, 'contests', flash, reason),
+      page: 'contest',
+      contest,
+      prizesEditable,
+      // Места, закреплённые вручную: пересохранение списка их снимет
+      // (`setPrizes` удаляет места и создаёт заново), и человека надо
+      // предупредить **до** клика, а не показывать ему зелёный баннер над
+      // исчезнувшим закреплением.
+      forcedPlaces: contest.prizes
+        .filter((prize) => prize.isForced && prize.winnerParticipantId)
+        .map((prize) => prize.place),
+      // Подписи мест — одной строкой на место, в том же виде, в каком форма
+      // их принимает обратно.
+      prizesText: contest.prizes.map((prize) => prize.label).join('\n'),
+      contestColor,
+      contestLabel,
+      notifyColor,
+      notifyLabel,
+      formatDate,
+    };
+  }
+
+  @Post('contests/:id/open')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async openContest(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.runContestAction(
+      res,
+      id,
+      `${PANEL_PREFIX}/contests/${id}?flash=contest-opened`,
+      () => this.contests.openContest(id),
+    );
+  }
+
+  @Post('contests/:id/prizes')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async setPrizes(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { prizes?: string },
+    @Res() res: Response,
+  ): Promise<void> {
+    if (!(await this.prizesEditableFromPanel(id))) {
+      // Та же защита, что и в шаблоне: форму там не рисуют, но запрос может
+      // прийти и мимо неё — а перенумерация мест необратима.
+      res.redirect(`${PANEL_PREFIX}/contests/${id}?flash=prizes-not-editable`);
+      return;
+    }
+
+    const prizes = parsePrizes(body.prizes);
+    if (prizes.length === 0) {
+      // Пустой список сервис отвергает как `@ArrayNotEmpty`, но дойди он
+      // туда — человек получил бы ошибку валидации DTO вместо внятного
+      // «впишите хотя бы одно место».
+      res.redirect(`${PANEL_PREFIX}/contests/${id}?flash=no-prizes`);
+      return;
+    }
+    await this.runContestAction(
+      res,
+      id,
+      `${PANEL_PREFIX}/contests/${id}?flash=prizes-saved`,
+      () => this.contests.setPrizes(id, prizes),
+    );
+  }
+
+  @Post('contests/:id/participants')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async addParticipants(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { text?: string; platform?: string },
+    @Res() res: Response,
+  ): Promise<void> {
+    // Проверяем на пустоту обрезанную копию, а в сервис отдаём набранное как
+    // есть: номера строк он считает по полученной строке, и обрезка пустого
+    // начала сдвинула бы их относительно того, что человек видит в поле.
+    if (!body.text?.trim()) {
+      res.redirect(`${PANEL_PREFIX}/contests/${id}?flash=no-participants`);
+      return;
+    }
+
+    try {
+      const result = await this.contests.addParticipantsFromText(
+        id,
+        body.text,
+        // Платформа нужна только строкам без ссылки и ника: по ссылке она и
+        // так видна. Без выбора все такие участники становились бы MAX — на
+        // VK-конкурсе это молча неверная платформа у каждого ручного.
+        body.platform === 'vk' ? 'vk' : 'max',
+      );
+      // Дубли — обычное дело при повторной вставке того же списка, и без
+      // номеров строк не видно, что именно не добавилось.
+      const reason = encodeURIComponent(
+        result.duplicateLines.length > 0
+          ? `Добавлено: ${result.added}. Уже были в списке, строки: ${formatLineNumbers(result.duplicateLines)}`
+          : `Добавлено: ${result.added}`,
+      );
+      res.redirect(
+        `${PANEL_PREFIX}/contests/${id}?flash=participants-added&reason=${reason}`,
+      );
+    } catch (err: unknown) {
+      this.redirectContestFailure(
+        res,
+        id,
+        err,
+        'Не удалось добавить участников',
+      );
+    }
+  }
+
+  @Post('contests/:id/draw')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async drawContest(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.runContestAction(
+      res,
+      id,
+      `${PANEL_PREFIX}/contests/${id}?flash=contest-drawn`,
+      () => this.contests.draw(id, admin.id),
+    );
+  }
+
+  @Post('contests/:id/prizes/:prizeId/force-winner')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async forceWinner(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('prizeId', ParseUUIDPipe) prizeId: string,
+    @Body() body: { participantId?: string },
+    @Res() res: Response,
+  ): Promise<void> {
+    const participantId = body.participantId?.trim();
+    if (!participantId) {
+      res.redirect(`${PANEL_PREFIX}/contests/${id}?flash=no-participant`);
+      return;
+    }
+    if (!(await this.prizeBelongsToContest(id, prizeId))) {
+      res.redirect(`${PANEL_PREFIX}/contests/${id}?flash=wrong-prize`);
+      return;
+    }
+    await this.runContestAction(
+      res,
+      id,
+      `${PANEL_PREFIX}/contests/${id}?flash=winner-forced`,
+      () => this.contests.forceWinner(prizeId, participantId),
+    );
+  }
+
+  @Post('contests/:id/prizes/:prizeId/override-winner')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async overrideWinner(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('prizeId', ParseUUIDPipe) prizeId: string,
+    @Body() body: { participantId?: string; note?: string },
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const participantId = body.participantId?.trim();
+    if (!participantId) {
+      res.redirect(`${PANEL_PREFIX}/contests/${id}?flash=no-participant`);
+      return;
+    }
+    if (!(await this.prizeBelongsToContest(id, prizeId))) {
+      res.redirect(`${PANEL_PREFIX}/contests/${id}?flash=wrong-prize`);
+      return;
+    }
+    await this.runContestAction(
+      res,
+      id,
+      `${PANEL_PREFIX}/contests/${id}?flash=winner-replaced`,
+      () =>
+        this.contests.overrideWinner(
+          prizeId,
+          participantId,
+          body.note?.trim() || undefined,
+          admin.id,
+        ),
+    );
+  }
+
+  /**
+   * Можно ли править места этого конкурса из панели: только пока они идут
+   * подряд с первого и ни в одной подписи нет переноса строки. Всё прочее
+   * поле с подписями воспроизвести не может — см. `contestPage`.
+   */
+  private async prizesEditableFromPanel(contestId: string): Promise<boolean> {
+    const prizes = await this.prisma.contestPrize.findMany({
+      where: { contestId },
+      orderBy: { place: 'asc' },
+      select: { place: true, label: true },
+    });
+    return prizes.every(
+      (prize, index) =>
+        prize.place === index + 1 && !prize.label.includes('\n'),
+    );
+  }
+
+  /**
+   * Приз из адреса обязан принадлежать конкурсу из того же адреса.
+   *
+   * Сервис проверяет только пару «приз ↔ участник», поэтому подделанный или
+   * устаревший запрос сменил бы победителя в **чужом** конкурсе, записал бы
+   * это в его журнал — а человек остался бы на странице своего конкурса с
+   * зелёным «Победитель заменён» и без единого следа правки на экране.
+   */
+  private async prizeBelongsToContest(
+    contestId: string,
+    prizeId: string,
+  ): Promise<boolean> {
+    const prize = await this.prisma.contestPrize.findUnique({
+      where: { id: prizeId },
+      select: { contestId: true },
+    });
+    return prize?.contestId === contestId;
+  }
+
+  /**
+   * Действие над конкурсом с человеческим отказом вместо общего экрана
+   * ошибки. Отказ здесь — рядовое состояние, а не сбой: «розыгрыш уже
+   * проведён», «участников меньше, чем мест», «менять места поздно».
+   */
+  private async runContestAction(
+    res: Response,
+    contestId: string,
+    okUrl: string,
+    action: () => Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await action();
+      res.redirect(okUrl);
+    } catch (err: unknown) {
+      this.redirectContestFailure(res, contestId, err);
+    }
+  }
+
+  private redirectContestFailure(
+    res: Response,
+    contestId: string,
+    err: unknown,
+    fallback = 'Не удалось выполнить действие',
+  ): void {
+    this.logger.warn({ err, contestId }, 'Действие над конкурсом не выполнено');
+    const reason = err instanceof AppException ? err.message : fallback;
+    // Пропавший конкурс — единственный случай, когда возвращать человека на
+    // его страницу нельзя: она сама ответит «не найдено», и причина отказа
+    // пропадёт вместе с баннером.
+    const back =
+      err instanceof AppException && err.code === ErrorCode.NOT_FOUND
+        ? `${PANEL_PREFIX}/contests`
+        : `${PANEL_PREFIX}/contests/${contestId}`;
+    res.redirect(
+      `${back}?flash=contest-failed&reason=${encodeURIComponent(reason)}`,
+    );
+  }
+
   // ----- создание поста ---------------------------------------------------
 
   @Get('posts/new')
@@ -648,6 +1065,35 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
   resumed: { kind: 'success', message: 'Отправляем оставшимся' },
   uploaded: { kind: 'success', message: 'Вложение загружено' },
   'no-file': { kind: 'danger', message: 'Файл не выбран' },
+  'contest-created': { kind: 'success', message: 'Конкурс создан' },
+  'contest-opened': { kind: 'success', message: 'Приём участников открыт' },
+  'contest-drawn': { kind: 'success', message: 'Розыгрыш проведён' },
+  'prizes-saved': { kind: 'success', message: 'Призовые места сохранены' },
+  'participants-added': { kind: 'success', message: 'Список обработан' },
+  'winner-forced': {
+    kind: 'warning',
+    message: 'Место закреплено за участником до розыгрыша',
+  },
+  'winner-replaced': { kind: 'warning', message: 'Победитель заменён' },
+  'prizes-not-editable': {
+    kind: 'danger',
+    message:
+      'Эти призовые места заведены через API и из панели не правятся — иначе сохранение перенумеровало бы их',
+  },
+  'no-prizes': {
+    kind: 'danger',
+    message: 'Впишите хотя бы одно призовое место',
+  },
+  'no-participants': { kind: 'danger', message: 'Список участников пуст' },
+  'no-participant': { kind: 'danger', message: 'Участник не выбран' },
+  'wrong-prize': {
+    kind: 'danger',
+    message: 'Это призовое место относится к другому конкурсу',
+  },
+  'contest-failed': {
+    kind: 'danger',
+    message: 'Действие над конкурсом не выполнено',
+  },
   edited: { kind: 'success', message: 'Текст обновлён во всех группах' },
   deleted: { kind: 'success', message: 'Удалено из выбранных групп' },
   partial: {
@@ -679,6 +1125,41 @@ export function parseTags(value: string | undefined): string[] {
         .filter(Boolean),
     ),
   ];
+}
+
+/**
+ * Призовые места из одного поля: строка — подпись, номер строки — место.
+ *
+ * Парой полей на место было бы точнее (API позволяет произвольные номера),
+ * но добавление строк без JS означает перезагрузку страницы на каждое место,
+ * а панель по замыслу работает и без него. Пустые строки выбрасываются, и
+ * места нумеруются подряд: строка, случайно оставленная посередине, иначе
+ * создала бы место с пустой подписью.
+ */
+/**
+ * Номера строк-дублей для баннера. Список обрезается, потому что `shell`
+ * режет причину по 300 символам: полторы сотни номеров уехали бы в адрес
+ * целиком, а на экране оборвались бы посреди числа — и прочесть, какие
+ * именно строки пропущены, стало бы нельзя.
+ */
+const MAX_SHOWN_LINES = 20;
+
+export function formatLineNumbers(lines: number[]): string {
+  if (lines.length <= MAX_SHOWN_LINES) {
+    return lines.join(', ');
+  }
+  const shown = lines.slice(0, MAX_SHOWN_LINES).join(', ');
+  return `${shown} и ещё ${lines.length - MAX_SHOWN_LINES}`;
+}
+
+export function parsePrizes(
+  value: string | undefined,
+): { place: number; label: string }[] {
+  return (value ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((label, index) => ({ place: index + 1, label }));
 }
 
 function asArray(value: string | string[] | undefined): string[] {
