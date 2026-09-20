@@ -218,6 +218,16 @@ export class MaxApiClient {
     );
   }
 
+  /**
+   * Имя бота (`id2311395309_bot`) — для ссылок на его диалог. Берётся из
+   * `getMyInfo`, который SDK делает при старте опроса, а не из настроек:
+   * токен однозначно определяет бота, и второе место, которое могло бы с ним
+   * разойтись, не нужно. До завершения старта — `null`.
+   */
+  botUsername(): string | null {
+    return this.bot?.botInfo?.username ?? null;
+  }
+
   private buildSendExtra(options: MaxSendOptions) {
     const attachments = [...(options.attachments ?? [])];
     if (options.buttons?.length) {

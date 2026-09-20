@@ -51,6 +51,7 @@ function setup(
     },
   };
   const max = {
+    botUsername: jest.fn().mockReturnValue('test_bot'),
     editMessage: jest.fn().mockResolvedValue(undefined),
     sendMessageToUser: jest.fn().mockResolvedValue({ messageId: 'm1' }),
     getMessageBody: jest.fn().mockResolvedValue({
@@ -97,7 +98,18 @@ describe('ContestNotifier', () => {
     ];
     expect(messageId).toBe('mid.1');
     expect(text).toBe('Анонс');
-    expect(options.buttons[0][0].text).toBe('Узнать результаты');
+    // Одна кнопка-ссылка на бота с подписью результатов: тот, кто её
+    // нажмёт, попадает в диалог, и бот отвечает списком победителей — а
+    // победитель, у которого поздравление не дошло, получает его при старте.
+    expect(options.buttons).toEqual([
+      [
+        {
+          type: 'link',
+          text: 'Узнать результаты',
+          url: `https://max.ru/test_bot?start=c_${CONTEST_ID}`,
+        },
+      ],
+    ]);
     // Правка заменяет сообщение целиком: без переданного медиа картинка
     // анонса исчезла бы у всех подписчиков.
     expect(options.attachments).toEqual([

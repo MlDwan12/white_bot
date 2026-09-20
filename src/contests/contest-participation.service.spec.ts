@@ -44,6 +44,7 @@ function setup(contest: ReturnType<typeof contestRow> | null = contestRow()) {
       count: jest.fn().mockResolvedValue(3),
     },
     contestPrize: { findMany: jest.fn().mockResolvedValue([]) },
+    postDelivery: { findMany: jest.fn().mockResolvedValue([]) },
   };
   const logger = { setContext: jest.fn(), info: jest.fn(), warn: jest.fn() };
   const service = new ContestParticipationService(
@@ -235,5 +236,293 @@ describe('ContestParticipationService.resultsMessage', () => {
     const { service } = setup();
 
     expect(await service.resultsMessage(CONTEST_ID)).toBe('Конкурс завершён.');
+  });
+});
+
+describe('startedFromLink', () => {
+  const profile = () => request().user;
+
+  const winner = (overrides: Record<string, unknown> = {}) => ({
+    id: 'prize-1',
+    place: 1,
+    label: 'Главный приз',
+    notifyStatus: 'manual_required',
+    winnerParticipant: { platform: 'max', externalUserId: '42' },
+    ...overrides,
+  });
+
+  function setupDrawn(
+    prizes: unknown[],
+    contestOverrides: Record<string, unknown> = {},
+  ) {
+    return setup(contestRow({ status: 'drawn', prizes, ...contestOverrides }));
+  }
+
+  describe('до розыгрыша — это и есть участие', () => {
+    it('записывает нового участника и сообщает, что счётчик надо обновить', async () => {
+      const { service, prisma } = setup(
+        contestRow({ status: 'open', prizes: [] }),
+      );
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(prisma.contestParticipant.create).toHaveBeenCalled();
+      expect(reply.text).toContain('Вы участвуете в конкурсе «Конкурс»');
+      expect(reply.text).toContain('Итоги пришлю сюда');
+      expect(reply.joined).toBe(true);
+    });
+
+    it('повторный старт не пишет второго участника и не перерисовывает посты', async () => {
+      // Ссылку нажимают по несколько раз — счётчик при этом расти не должен,
+      // а лишняя правка сообщения ничего не даёт.
+      const { service, prisma } = setup(
+        contestRow({ status: 'open', prizes: [] }),
+      );
+      prisma.contestParticipant.create.mockRejectedValue(uniqueViolation());
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.text).toContain('Вы уже участвуете');
+      expect(reply.joined).toBe(false);
+    });
+
+    it('пока приём не открыт, участие не пишет и говорит об этом', async () => {
+      const { service, prisma } = setup(
+        contestRow({ status: 'draft', prizes: [] }),
+      );
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
+      expect(reply.text).toBe('Приём участников ещё не открыт.');
+      expect(reply.joined).toBe(false);
+    });
+
+    it('запоминает группу, если анонс вышел ровно в одну', async () => {
+      // Со ссылки группы нет: человек приходит в диалог, а не из канала.
+      // Одна группа — однозначный ответ, две — уже угадывание.
+      const { service, prisma } = setup(
+        contestRow({ status: 'open', prizes: [] }),
+      );
+      prisma.postDelivery.findMany.mockResolvedValue([
+        { externalMessageId: 'mid.1', groupId: 'only-group' },
+      ]);
+
+      await service.startedFromLink(CONTEST_ID, profile());
+
+      const data = callArg<{ data: { groupId: string | null } }>(
+        prisma.contestParticipant.create,
+      ).data;
+      expect(data.groupId).toBe('only-group');
+    });
+
+    it('оставляет группу пустой, если анонс вышел в несколько', async () => {
+      const { service, prisma } = setup(
+        contestRow({ status: 'open', prizes: [] }),
+      );
+      prisma.postDelivery.findMany.mockResolvedValue([
+        { externalMessageId: 'mid.1', groupId: 'g1' },
+        { externalMessageId: 'mid.2', groupId: 'g2' },
+      ]);
+
+      await service.startedFromLink(CONTEST_ID, profile());
+
+      const data = callArg<{ data: { groupId: string | null } }>(
+        prisma.contestParticipant.create,
+      ).data;
+      expect(data.groupId).toBeNull();
+    });
+  });
+
+  describe('после розыгрыша', () => {
+    it('победитель, открывший диалог позже, получает поздравление', async () => {
+      const { service } = setupDrawn([winner()]);
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.text).toBe(
+        'Поздравляем! Вы заняли 1 место в конкурсе «Конкурс»: Главный приз.',
+      );
+      expect(reply.prizeIdsToMark).toEqual(['prize-1']);
+    });
+
+    it('уже уведомлённого победителя не помечает заново', async () => {
+      // `notified_manually` — отметка человека, автоматика её затирать не
+      // должна; `sent` повторять незачем.
+      const { service } = setupDrawn([
+        winner({ id: 'a', notifyStatus: 'sent' }),
+        winner({ id: 'b', place: 2, notifyStatus: 'notified_manually' }),
+        winner({ id: 'c', place: 3, notifyStatus: 'failed' }),
+      ]);
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.prizeIdsToMark).toEqual(['c']);
+    });
+
+    it('не победителю отвечает списком победителей и не регистрирует участие', async () => {
+      const { service, prisma } = setupDrawn([winner()]);
+      prisma.contestPrize.findMany.mockResolvedValue([
+        {
+          place: 1,
+          label: 'Главный приз',
+          winnerParticipant: { displayName: 'Пётр' },
+        },
+      ]);
+
+      const reply = await service.startedFromLink(CONTEST_ID, {
+        ...profile(),
+        externalUserId: '999',
+      });
+
+      expect(reply.text).toContain('Конкурс завершён');
+      expect(reply.text).toContain('1. Главный приз — Пётр');
+      expect(reply.text).not.toContain('Поздравляем');
+      expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
+      expect(reply.prizeIdsToMark).toEqual([]);
+    });
+
+    it('победитель с другой площадки того же id не считается', async () => {
+      // id пользователей VK и MAX — независимые пространства: совпадение
+      // числа не делает людей одним человеком.
+      const { service } = setupDrawn([
+        winner({ winnerParticipant: { platform: 'vk', externalUserId: '42' } }),
+      ]);
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.text).not.toContain('Поздравляем');
+    });
+
+    it('уважает отключённое автоуведомление победителей', async () => {
+      // Владелец конкурса запретил писать победителям в личку — ссылка на
+      // бота не должна обходить это решение.
+      const { service } = setupDrawn([winner()], { notifyWinners: false });
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.text).not.toContain('Поздравляем');
+      expect(reply.prizeIdsToMark).toEqual([]);
+    });
+  });
+
+  describe('победитель и уведомитель не мешают друг другу', () => {
+    it('место в `pending` принадлежит уведомителю — поздравления здесь нет', async () => {
+      // Розыгрыш только что прошёл, и уведомитель вот-вот пришлёт своё.
+      // Ответь мы тоже — победитель получил бы два одинаковых поздравления.
+      const { service, prisma } = setupDrawn([
+        winner({ notifyStatus: 'pending' }),
+      ]);
+      prisma.contestPrize.findMany.mockResolvedValue([
+        {
+          place: 1,
+          label: 'Главный приз',
+          winnerParticipant: { displayName: 'Иван' },
+        },
+      ]);
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.text).not.toContain('Поздравляем');
+      expect(reply.text).toContain('1. Главный приз — Иван');
+      expect(reply.prizeIdsToMark).toEqual([]);
+    });
+
+    it('уже поздравленному победителю показывает список, а не второе поздравление', async () => {
+      const { service, prisma } = setupDrawn([
+        winner({ notifyStatus: 'sent' }),
+      ]);
+      prisma.contestPrize.findMany.mockResolvedValue([
+        {
+          place: 1,
+          label: 'Главный приз',
+          winnerParticipant: { displayName: 'Иван' },
+        },
+      ]);
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.text).not.toContain('Поздравляем');
+      expect(reply.prizeIdsToMark).toEqual([]);
+    });
+  });
+
+  it('несуществующему конкурсу отвечает без исключения', async () => {
+    const { service } = setup(null);
+
+    const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+    expect(reply.text).toContain('не найден');
+  });
+});
+
+describe('announcementRefresh', () => {
+  it('считает счётчик заново и отдаёт сообщения во все MAX-группы', async () => {
+    // Свежее число, а не значение из ответа `join`: правки от разных
+    // участников идут вперемешку, и устаревшее перезаписало бы новое.
+    const { service, prisma } = setup(contestRow({ status: 'open' }));
+    prisma.postDelivery.findMany.mockResolvedValue([
+      { externalMessageId: 'mid.1', groupId: 'g1' },
+      { externalMessageId: 'mid.2', groupId: 'g2' },
+    ]);
+
+    const refresh = await service.announcementRefresh(CONTEST_ID);
+
+    expect(refresh).toMatchObject({
+      text: 'Текст анонса',
+      buttonText: 'Участвовать (3)',
+      messageIds: ['mid.1', 'mid.2'],
+    });
+    expect(prisma.contestParticipant.count).toHaveBeenCalled();
+  });
+
+  it('после розыгрыша ничего не отдаёт — пост принадлежит уведомителю', async () => {
+    // Запоздавшая правка счётчика затёрла бы победителей, дописанных в пост.
+    const { service } = setup(contestRow({ status: 'drawn' }));
+
+    expect(await service.announcementRefresh(CONTEST_ID)).toBeNull();
+  });
+
+  it('у конкурса без анонса или несуществующего — null', async () => {
+    expect(
+      await setup(contestRow({ post: null })).service.announcementRefresh(
+        CONTEST_ID,
+      ),
+    ).toBeNull();
+    expect(
+      await setup(null).service.announcementRefresh(CONTEST_ID),
+    ).toBeNull();
+  });
+});
+
+describe('markWinnersNotified', () => {
+  it('помечает места отправленными', async () => {
+    const { service, prisma } = setup();
+    (prisma as Record<string, unknown>).contestPrize = {
+      findMany: jest.fn(),
+      updateMany: jest.fn().mockResolvedValue({ count: 2 }),
+    };
+
+    await service.markWinnersNotified(['a', 'b']);
+
+    const args = callArg<{
+      where: { id: { in: string[] } };
+      data: { notifyStatus: string; notifyError: null };
+    }>(
+      (prisma.contestPrize as unknown as { updateMany: jest.Mock }).updateMany,
+    );
+    expect(args.where.id.in).toEqual(['a', 'b']);
+    expect(args.data.notifyStatus).toBe('sent');
+    expect(args.data.notifyError).toBeNull();
+  });
+
+  it('пустой список — без обращения к базе', async () => {
+    const { service, prisma } = setup();
+    const updateMany = jest.fn();
+    (prisma as Record<string, unknown>).contestPrize = { updateMany };
+
+    await service.markWinnersNotified([]);
+
+    expect(updateMany).not.toHaveBeenCalled();
   });
 });

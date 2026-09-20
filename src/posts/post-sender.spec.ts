@@ -28,6 +28,8 @@ function setup() {
   const vk = { wallPost: jest.fn().mockResolvedValue({ postId: 777 }) };
   const max = {
     sendMessageToChat: jest.fn().mockResolvedValue({ messageId: 'mid-9' }),
+    editMessage: jest.fn().mockResolvedValue(undefined),
+    botUsername: jest.fn().mockReturnValue('test_bot'),
   };
   const tokenEncryption = { decrypt: jest.fn().mockReturnValue('plain-token') };
   const attachments = {
@@ -104,5 +106,68 @@ describe('PostSender', () => {
       attachments: [],
     });
     expect(result).toEqual({ externalMessageId: 'mid-9' });
+  });
+});
+
+describe('PostSender: кнопки конкурса в MAX', () => {
+  const CONTEST_ID = '11111111-1111-4111-8111-111111111111';
+  const button = { contestId: CONTEST_ID, label: 'Участвовать (2)' };
+  const maxGroup = () => group({ platform: 'max', externalId: '-100' });
+
+  type Row = { type: string; text: string; url?: string; payload?: string }[];
+
+  it('отправляет одну кнопку-ссылку на бота с подписью участия', async () => {
+    const { sender, max } = setup();
+
+    await sender.send(post(), maxGroup(), [], button);
+
+    const options = (max.sendMessageToChat.mock.calls as unknown[][])[0][2] as {
+      buttons: Row[];
+    };
+    expect(options.buttons).toEqual([
+      [
+        {
+          type: 'link',
+          text: 'Участвовать (2)',
+          url: `https://max.ru/test_bot?start=c_${CONTEST_ID}`,
+        },
+      ],
+    ]);
+  });
+
+  it('при правке возвращает ту же клавиатуру, иначе правка снесла бы кнопку', async () => {
+    const { sender, max } = setup();
+
+    await sender.edit(post(), maxGroup(), 'mid.1', [], button);
+
+    const options = (max.editMessage.mock.calls as unknown[][])[0][2] as {
+      buttons: Row[];
+    };
+    expect(options.buttons[0].map((b) => b.type)).toEqual(['link']);
+  });
+
+  it('пока имя бота неизвестно, публикует пост с кнопкой-колбэком', async () => {
+    // Имя приходит из getMyInfo после старта опроса. Отправка в первые секунды
+    // не должна падать и не должна ставить ссылку в никуда.
+    const { sender, max } = setup();
+    max.botUsername.mockReturnValue(null);
+
+    await sender.send(post(), maxGroup(), [], button);
+
+    const options = (max.sendMessageToChat.mock.calls as unknown[][])[0][2] as {
+      buttons: Row[];
+    };
+    expect(options.buttons[0].map((b) => b.type)).toEqual(['callback']);
+  });
+
+  it('без конкурса клавиатуры нет вовсе', async () => {
+    const { sender, max } = setup();
+
+    await sender.send(post(), maxGroup(), [], null);
+
+    const options = (max.sendMessageToChat.mock.calls as unknown[][])[0][2] as {
+      buttons?: Row[];
+    };
+    expect(options.buttons).toBeUndefined();
   });
 });

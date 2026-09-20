@@ -5,7 +5,13 @@ import { MaxApiClient } from '../max/max-api.client';
 import { MaxAdminResolver } from '../max/max-admin.resolver';
 import { PostSender } from '../posts/post-sender';
 import { ContestParticipationService } from './contest-participation.service';
-import { announcementText, contestJoinPayload } from './contest-button';
+import {
+  announcementText,
+  contestDmUrl,
+  contestJoinPayload,
+  contestKeyboard,
+  winnerCongratulation,
+} from './contest-button';
 
 /**
  * Всё, что происходит «наружу» по завершении розыгрыша: подмена кнопки под
@@ -91,15 +97,15 @@ export class ContestNotifier {
         }
         await this.max.editMessage(delivery.externalMessageId, text, {
           attachments: current.attachments,
-          buttons: [
-            [
-              {
-                type: 'callback',
-                text: contest.resultsButtonLabel,
-                payload: contestJoinPayload(contest.id),
-              },
-            ],
-          ],
+          // Ссылка на бота остаётся и после розыгрыша: победитель, который
+          // открыл диалог позже, получает поздравление сразу при старте.
+          buttons: contestKeyboard(
+            {
+              text: contest.resultsButtonLabel,
+              payload: contestJoinPayload(contest.id),
+            },
+            contestDmUrl(this.max.botUsername(), contest.id),
+          ),
         });
       } catch (err: unknown) {
         this.logger.warn(
@@ -170,7 +176,7 @@ export class ContestNotifier {
       try {
         await this.max.sendMessageToUser(
           Number(winner.externalUserId),
-          `Поздравляем! Вы заняли ${prize.place} место в конкурсе «${contest.title}»: ${prize.label}.`,
+          winnerCongratulation(prize.place, contest.title, prize.label),
         );
         await this.markNotify(prize.id, 'sent');
       } catch (err: unknown) {

@@ -4,7 +4,11 @@ import { AttachmentUploader } from './attachment-uploader';
 import { TokenEncryptionService } from '../common/crypto/token-encryption.service';
 import { VkApiClient } from '../vk/vk-api.client';
 import { MaxApiClient } from '../max/max-api.client';
-import { contestJoinPayload } from '../contests/contest-button';
+import {
+  contestDmUrl,
+  contestJoinPayload,
+  contestKeyboard,
+} from '../contests/contest-button';
 
 /**
  * Конкурс, чья кнопка участия вшивается в сообщение. Передаётся сюда, а не
@@ -116,7 +120,7 @@ export class PostSender {
     await this.max.editMessage(
       externalMessageId,
       PostSender.resolveText(post, 'max'),
-      { attachments, buttons: contestButtons(contestButton) },
+      { attachments, buttons: this.contestButtons(contestButton) },
     );
   }
 
@@ -165,7 +169,7 @@ export class PostSender {
     contestButton?: ContestButton | null,
   ): Promise<SendResult> {
     const attachments = await this.attachments.maxAttachments(assets);
-    const buttons = contestButtons(contestButton);
+    const buttons = this.contestButtons(contestButton);
     const { messageId } = await this.max.sendMessageToChat(
       Number(group.externalId),
       PostSender.resolveText(post, 'max'),
@@ -173,19 +177,20 @@ export class PostSender {
     );
     return { externalMessageId: messageId };
   }
-}
 
-/** Клавиатура с кнопкой участия — или ничего, если конкурса нет. */
-function contestButtons(button?: ContestButton | null) {
-  return button
-    ? [
-        [
-          {
-            type: 'callback' as const,
-            text: button.label,
-            payload: contestJoinPayload(button.contestId),
-          },
-        ],
-      ]
-    : undefined;
+  /**
+   * Клавиатура с кнопкой участия и ссылкой на бота — или ничего, если
+   * конкурса нет. Сама сборка живёт в `contestKeyboard`: её же зовут ответ на
+   * нажатие и подмена после розыгрыша, и расхождение между ними стирало бы
+   * вторую кнопку.
+   */
+  private contestButtons(button?: ContestButton | null) {
+    if (!button) {
+      return undefined;
+    }
+    return contestKeyboard(
+      { text: button.label, payload: contestJoinPayload(button.contestId) },
+      contestDmUrl(this.max.botUsername(), button.contestId),
+    );
+  }
 }

@@ -90,7 +90,14 @@ function setup() {
     }),
     sendMessageToUser: jest.fn().mockResolvedValue({ messageId: 'm1' }),
     sendMessageToChat: jest.fn().mockResolvedValue({ messageId: 'm1' }),
+    getMessageBody: jest.fn().mockResolvedValue({
+      text: 'Анонс',
+      attachments: [{ type: 'image', payload: { token: 'tok' } }],
+      unsupported: [],
+    }),
+    editMessage: jest.fn().mockResolvedValue(undefined),
     answerCallback: jest.fn().mockResolvedValue(undefined),
+    botUsername: jest.fn().mockReturnValue('test_bot'),
   };
   const logger = {
     setContext: jest.fn(),
@@ -104,6 +111,18 @@ function setup() {
       status: 'joined',
       message: 'Вы участвуете в конкурсе!',
     }),
+    startedFromLink: jest.fn().mockResolvedValue({
+      text: 'Вы участвуете! Итоги пришлю сюда.',
+      prizeIdsToMark: [],
+      joined: false,
+    }),
+    announcementRefresh: jest.fn().mockResolvedValue({
+      text: 'Анонс',
+      buttonText: 'Участвовать (5)',
+      payload: 'contest:join:x',
+      messageIds: ['mid.1', 'mid.2'],
+    }),
+    markWinnersNotified: jest.fn().mockResolvedValue(undefined),
   };
 
   const handlers = new MaxBotHandlers(
@@ -372,6 +391,250 @@ describe('MaxBotHandlers', () => {
       await harness.fireCommand('start', { chatId: 42, message: {} });
 
       expect(api.sendMessageToChat).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('bot_started по ссылке с кнопки конкурса', () => {
+    const CONTEST = '11111111-1111-4111-8111-111111111111';
+    const started = (payload: string | null | undefined) => ({
+      update: {
+        payload,
+        user: { user_id: 42, first_name: 'Иван', last_name: 'Иванов' },
+        chat_id: 900,
+      },
+    });
+
+    it('записывает участника и отвечает в открытом диалоге', async () => {
+      const { harness, api, contests } = setup();
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(contests.startedFromLink).toHaveBeenCalledWith(
+        CONTEST,
+        expect.objectContaining({
+          externalUserId: '42',
+          displayName: 'Иван',
+          lastName: 'Иванов',
+        }),
+      );
+      expect(api.sendMessageToChat).toHaveBeenCalledWith(
+        900,
+        'Вы участвуете! Итоги пришлю сюда.',
+      );
+    });
+
+    it('после записи обновляет счётчик и возвращает картинку анонса', async () => {
+      // Правка заменяет сообщение целиком: без переданного медиа картинка
+      // исчезла бы у всех подписчиков.
+      const { harness, api, contests } = setup();
+      contests.startedFromLink.mockResolvedValue({
+        text: 'Вы участвуете!',
+        prizeIdsToMark: [],
+        joined: true,
+      });
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(contests.announcementRefresh).toHaveBeenCalledWith(CONTEST);
+      expect(api.editMessage).toHaveBeenCalledTimes(2);
+      const [id, text, options] = api.editMessage.mock.calls[0] as [
+        string,
+        string,
+        { buttons: unknown; attachments: unknown },
+      ];
+      expect(id).toBe('mid.1');
+      expect(text).toBe('Анонс');
+      expect(options.attachments).toEqual([
+        { type: 'image', payload: { token: 'tok' } },
+      ]);
+      expect(options.buttons).toEqual([
+        [
+          {
+            type: 'link',
+            text: 'Участвовать (5)',
+            url: `https://max.ru/test_bot?start=c_${CONTEST}`,
+          },
+        ],
+      ]);
+    });
+
+    it('без новой записи посты не перерисовываются', async () => {
+      // Повторный старт по ссылке — обычное дело; правка сообщения ничего бы
+      // не дала, зато стоила бы запросов.
+      const { harness, api, contests } = setup();
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(contests.announcementRefresh).not.toHaveBeenCalled();
+      expect(api.editMessage).not.toHaveBeenCalled();
+    });
+
+    it('сбой правки одного сообщения не мешает остальным и не роняет обработчик', async () => {
+      const { harness, api, contests } = setup();
+      contests.startedFromLink.mockResolvedValue({
+        text: 'Вы участвуете!',
+        prizeIdsToMark: [],
+        joined: true,
+      });
+      api.editMessage.mockRejectedValueOnce(new Error('too old'));
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(api.editMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('параллельные вступления сводятся к одному проходу со свежими данными', async () => {
+      // Правки от разных участников не должны идти вперемешку: запоздавшая
+      // откатила бы счётчик назад, а число запросов росло бы с числом
+      // нажавших.
+      const { harness, api, contests } = setup();
+      contests.startedFromLink.mockResolvedValue({
+        text: 'ok',
+        prizeIdsToMark: [],
+        joined: true,
+      });
+      const refresh = (count: number) => ({
+        text: 'Анонс',
+        buttonText: `Участвовать (${count})`,
+        payload: 'p',
+        messageIds: ['mid.1'],
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      contests.announcementRefresh
+        .mockImplementationOnce(async () => {
+          await gate;
+          return refresh(4);
+        })
+        .mockResolvedValue(refresh(5));
+
+      const first = harness.fire('bot_started', started(`c_${CONTEST}`));
+      const second = harness.fire('bot_started', started(`c_${CONTEST}`));
+      // Второй не ждёт первого: он лишь помечает «нужен ещё проход».
+      await second;
+      expect(api.editMessage).not.toHaveBeenCalled();
+
+      release();
+      await first;
+
+      expect(contests.announcementRefresh).toHaveBeenCalledTimes(2);
+      const lastCall = api.editMessage.mock.calls.at(-1) as [
+        string,
+        string,
+        { buttons: { text: string }[][] },
+      ];
+      // Последней ушла свежая версия — счётчик не откатился на 4.
+      expect(lastCall[2].buttons[0][0].text).toBe('Участвовать (5)');
+    });
+
+    it('помечает места уведомлёнными после успешной отправки', async () => {
+      const { harness, contests } = setup();
+      contests.startedFromLink.mockResolvedValue({
+        text: 'Поздравляем!',
+        prizeIdsToMark: ['prize-1'],
+      });
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(contests.markWinnersNotified).toHaveBeenCalledWith(['prize-1']);
+    });
+
+    it('не помечает место уведомлённым, если отправка не удалась', async () => {
+      // Иначе победитель числился бы поздравленным, не получив ничего, и
+      // пометки «напишите сами» в панели уже не было бы.
+      const { harness, api, contests } = setup();
+      contests.startedFromLink.mockResolvedValue({
+        text: 'Поздравляем!',
+        prizeIdsToMark: ['prize-1'],
+      });
+      api.sendMessageToChat.mockRejectedValue(new Error('boom'));
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(contests.markWinnersNotified).not.toHaveBeenCalled();
+    });
+
+    it('обновляет счётчик, даже если ответить в диалоге не вышло', async () => {
+      // Участие уже записано, и пост без свежего счётчика был бы неправдой.
+      const { harness, api, contests } = setup();
+      contests.startedFromLink.mockResolvedValue({
+        text: 'Вы участвуете!',
+        prizeIdsToMark: [],
+        joined: true,
+      });
+      api.sendMessageToChat.mockRejectedValue(new Error('boom'));
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(api.editMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('молчит на старт без метки и на чужую метку', async () => {
+      const { harness, api, contests } = setup();
+
+      await harness.fire('bot_started', started(null));
+      await harness.fire('bot_started', started('ref_partner'));
+      await harness.fire('bot_started', started('c_not-a-uuid'));
+
+      expect(contests.startedFromLink).not.toHaveBeenCalled();
+      expect(api.sendMessageToChat).not.toHaveBeenCalled();
+    });
+
+    it('сбой сервиса не роняет обработчик, а человеку отвечают, что делать', async () => {
+      // Кнопка — ссылка, и без слова от бота человек видит пустой диалог и
+      // не знает, записан ли он. Повторное нажатие безопасно, так что о нём
+      // и просим.
+      const { harness, api, contests, logger } = setup();
+      contests.startedFromLink.mockRejectedValue(new Error('db down'));
+
+      await expect(
+        harness.fire('bot_started', started(`c_${CONTEST}`)),
+      ).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalled();
+      expect(api.sendMessageToChat).toHaveBeenCalledWith(
+        900,
+        expect.stringContaining('ещё раз'),
+      );
+      expect(api.editMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('ответ на нажатие «Участвовать» в старом посте', () => {
+    const CONTEST = '11111111-1111-4111-8111-111111111111';
+
+    it('переводит пост на кнопку-ссылку, а не оставляет две разные кнопки', async () => {
+      const { harness, api, contests } = setup();
+      contests.join.mockResolvedValue({
+        status: 'joined',
+        message: 'Вы участвуете в конкурсе!',
+        refresh: {
+          text: 'Анонс',
+          buttonText: 'Участвовать (1)',
+          payload: `contest:join:${CONTEST}`,
+        },
+      });
+
+      await harness.fireAction(`contest:join:${CONTEST}`, {
+        user: { user_id: 42, first_name: 'Иван' },
+        callback: { callback_id: 'cb-1' },
+        chatId: 900,
+        update: { message: { body: { attachments: [] } } },
+      });
+
+      const [, replacement] = api.answerCallback.mock.calls[0] as [
+        string,
+        { buttons: unknown },
+      ];
+      expect(replacement.buttons).toEqual([
+        [
+          {
+            type: 'link',
+            text: 'Участвовать (1)',
+            url: `https://max.ru/test_bot?start=c_${CONTEST}`,
+          },
+        ],
+      ]);
     });
   });
 });

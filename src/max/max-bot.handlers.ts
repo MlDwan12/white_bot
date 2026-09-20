@@ -8,8 +8,15 @@ import { MaxApiClient } from './max-api.client';
 import {
   ContestParticipationService,
   type JoinOutcome,
+  type PlatformUserProfile,
+  type StartedFromLink,
 } from '../contests/contest-participation.service';
-import { CONTEST_JOIN_PAYLOAD } from '../contests/contest-button';
+import {
+  CONTEST_JOIN_PAYLOAD,
+  CONTEST_START_PAYLOAD,
+  contestDmUrl,
+  contestKeyboard,
+} from '../contests/contest-button';
 import {
   toRequestAttachments,
   unsupportedAttachmentTypes,
@@ -24,6 +31,36 @@ export function groupReviewPayload(
   groupId: string,
 ): string {
   return `group:${action}:${groupId}`;
+}
+
+/** Пользователь MAX в том виде, в каком его несут апдейты. */
+interface MaxUserLike {
+  user_id: number;
+  name?: string | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  username?: string | null;
+  is_bot?: boolean;
+}
+
+/**
+ * Профиль участника из пользователя MAX — одинаково для нажатия кнопки и для
+ * старта бота по ссылке: оба пути записывают одного и того же человека, и
+ * два разных способа собрать имя дали бы одному участнику два вида в списке.
+ */
+function toProfile(user: MaxUserLike): PlatformUserProfile {
+  return {
+    externalUserId: String(user.user_id),
+    // Имя нужно только для читаемого списка победителей; дедуп идёт по id,
+    // так что отсутствие имени ничего не ломает.
+    displayName:
+      user.name ?? user.first_name ?? user.username ?? `id${user.user_id}`,
+    firstName: user.first_name,
+    lastName: user.last_name,
+    username: user.username,
+    isBot: user.is_bot,
+    raw: user,
+  };
 }
 
 /**
@@ -47,6 +84,9 @@ export class MaxBotHandlers {
   ) {
     this.logger.setContext(MaxBotHandlers.name);
   }
+
+  /** Конкурсы, у которых сейчас идёт перерисовка счётчика, — см. `redrawAnnouncements`. */
+  private readonly redrawing = new Map<string, { again: boolean }>();
 
   register(): void {
     const bot = this.bot;
@@ -73,6 +113,17 @@ export class MaxBotHandlers {
         return;
       }
       await this.handleStart(senderId, chatId);
+    });
+
+    // «Начать» в диалоге с ботом — в том числе после перехода по ссылке с
+    // кнопки конкурса. Обычная команда `/start` сюда не попадает: это другое
+    // событие, поэтому обработчик выше её не ловит.
+    bot.on('bot_started', async (ctx) => {
+      await this.handleBotStarted(
+        ctx.update.payload,
+        ctx.update.user,
+        ctx.update.chat_id,
+      );
     });
 
     bot.on('bot_added', async (ctx) => {
@@ -196,14 +247,7 @@ export class MaxBotHandlers {
    */
   private async handleContestJoin(
     contestId: string,
-    user: {
-      user_id: number;
-      name?: string | null;
-      first_name?: string | null;
-      last_name?: string | null;
-      username?: string | null;
-      is_bot?: boolean;
-    },
+    user: MaxUserLike,
     callbackId: string,
     chatId: number | null | undefined,
     attachments?: Attachment[] | null,
@@ -213,21 +257,7 @@ export class MaxBotHandlers {
       outcome = await this.contests.join({
         contestId,
         platform: 'max',
-        user: {
-          externalUserId: String(user.user_id),
-          // Имя нужно только для читаемого списка победителей; дедуп идёт по
-          // id, так что отсутствие имени ничего не ломает.
-          displayName:
-            user.name ??
-            user.first_name ??
-            user.username ??
-            `id${user.user_id}`,
-          firstName: user.first_name,
-          lastName: user.last_name,
-          username: user.username,
-          isBot: user.is_bot,
-          raw: user,
-        },
+        user: toProfile(user),
         groupExternalId: String(chatId ?? ''),
       });
     } catch (err: unknown) {
@@ -257,15 +287,16 @@ export class MaxBotHandlers {
       outcome.refresh
         ? {
             text: outcome.refresh.text,
-            buttons: [
-              [
-                {
-                  type: 'callback' as const,
-                  text: outcome.refresh.buttonText,
-                  payload: outcome.refresh.payload,
-                },
-              ],
-            ],
+            // Та же клавиатура, что и при отправке: ответ заменяет сообщение
+            // целиком, и без второй кнопки ссылка на бота пропала бы после
+            // первого же клика.
+            buttons: contestKeyboard(
+              {
+                text: outcome.refresh.buttonText,
+                payload: outcome.refresh.payload,
+              },
+              contestDmUrl(this.api.botUsername(), contestId),
+            ),
             // Без этого первое же нажатие стёрло бы картинку анонса у всех.
             attachments: toRequestAttachments(attachments),
           }
@@ -273,6 +304,167 @@ export class MaxBotHandlers {
     );
 
     await this.sendPrivately(user.user_id, outcome.message);
+  }
+
+  /**
+   * Человек перешёл по ссылке с кнопки конкурса. Метку разбираем только у
+   * нашей ссылки; любой другой старт (без метки или с чужой) остаётся как
+   * был — молчим, а не отвечаем незнакомцу про конкурс, которого он не
+   * выбирал.
+   */
+  private async handleBotStarted(
+    payload: string | null | undefined,
+    user: MaxUserLike,
+    chatId: number,
+  ): Promise<void> {
+    const contestId = CONTEST_START_PAYLOAD.exec(payload ?? '')?.[1];
+    if (!contestId) {
+      return;
+    }
+
+    let reply: StartedFromLink;
+    try {
+      reply = await this.contests.startedFromLink(contestId, toProfile(user));
+    } catch (err: unknown) {
+      this.logger.error(
+        { err, contestId, userId: user.user_id },
+        'Не удалось обработать запуск бота по ссылке конкурса',
+      );
+      // Кнопка — ссылка, и человек видит пустой диалог: без слова от бота он
+      // не поймёт, записан он или нет. Повторное нажатие безопасно — участие
+      // дедуплицируется, — так что прямо об этом и просим.
+      await this.replyBestEffort(
+        chatId,
+        'Не получилось обработать участие. Нажмите кнопку под постом ещё раз — повторное нажатие ничего не сломает.',
+        contestId,
+        user.user_id,
+      );
+      return;
+    }
+
+    const replied = await this.replyBestEffort(
+      chatId,
+      reply.text,
+      contestId,
+      user.user_id,
+    );
+    this.logger.info(
+      {
+        contestId,
+        userId: user.user_id,
+        chatId,
+        lateWinner: reply.prizeIdsToMark.length > 0,
+        joined: reply.joined,
+      },
+      'Обработан запуск бота по ссылке конкурса',
+    );
+    // Места помечаются только после успешной отправки: иначе победитель
+    // числился бы поздравленным, не получив ничего, и пометки «напишите
+    // сами» в панели уже не было бы.
+    if (replied) {
+      await this.contests.markWinnersNotified(reply.prizeIdsToMark);
+    }
+    // Счётчик обновляется независимо от ответа: участие уже записано.
+    if (reply.joined) {
+      await this.redrawAnnouncements(contestId);
+    }
+  }
+
+  /** Ответ в диалоге, провал которого только логируется. */
+  private async replyBestEffort(
+    chatId: number,
+    text: string,
+    contestId: string,
+    userId: number,
+  ): Promise<boolean> {
+    try {
+      await this.api.sendMessageToChat(chatId, text);
+      return true;
+    } catch (err: unknown) {
+      // Диалог только что открыт, так что провал — уже настоящий сбой, а не
+      // ожидаемое «бот не может писать». Участие при этом записано.
+      this.logger.warn(
+        { err, contestId, userId },
+        'Не удалось ответить в диалоге, открытом по ссылке конкурса',
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Обновляет счётчик на кнопке у анонса — после записи нового участника.
+   *
+   * Правка заменяет сообщение целиком, поэтому вложения снимаются с текущей
+   * версии и передаются заново, иначе картинка исчезла бы у всех. Провал по
+   * одному сообщению не должен мешать остальным: участие уже записано.
+   *
+   * Правки от разных участников идут вперемешку, и с каждой уходило бы по
+   * два запроса на каждое сообщение — последовательно, внутри обработчика
+   * события. Поэтому на конкурс работает один проход: пока он идёт, остальные
+   * лишь отмечают «нужен ещё один» и возвращаются сразу, а проход по
+   * окончании повторяется со **свежими** данными. Так счётчик не откатывается
+   * назад из-за запоздавшей правки, а число запросов не растёт с числом
+   * нажавших.
+   */
+  private async redrawAnnouncements(contestId: string): Promise<void> {
+    const running = this.redrawing.get(contestId);
+    if (running) {
+      running.again = true;
+      return;
+    }
+    const state = { again: false };
+    this.redrawing.set(contestId, state);
+    try {
+      do {
+        state.again = false;
+        await this.redrawOnce(contestId);
+      } while (state.again);
+    } finally {
+      this.redrawing.delete(contestId);
+    }
+  }
+
+  private async redrawOnce(contestId: string): Promise<void> {
+    let redraw: Awaited<
+      ReturnType<ContestParticipationService['announcementRefresh']>
+    >;
+    try {
+      redraw = await this.contests.announcementRefresh(contestId);
+    } catch (err: unknown) {
+      this.logger.warn(
+        { err, contestId },
+        'Не удалось собрать данные для обновления счётчика под анонсом',
+      );
+      return;
+    }
+    if (!redraw) {
+      return;
+    }
+
+    const buttons = contestKeyboard(
+      { text: redraw.buttonText, payload: redraw.payload },
+      contestDmUrl(this.api.botUsername(), contestId),
+    );
+    for (const messageId of redraw.messageIds) {
+      try {
+        const current = await this.api.getMessageBody(messageId);
+        if (current.unsupported.length > 0) {
+          this.logger.warn(
+            { contestId, dropped: current.unsupported },
+            'Вложения анонса, которые нечем пересобрать, потеряются при правке',
+          );
+        }
+        await this.api.editMessage(messageId, redraw.text, {
+          attachments: current.attachments,
+          buttons,
+        });
+      } catch (err: unknown) {
+        this.logger.warn(
+          { err, contestId, messageId },
+          'Не удалось обновить счётчик участников под анонсом',
+        );
+      }
+    }
   }
 
   /**
