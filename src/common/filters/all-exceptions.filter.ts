@@ -11,6 +11,7 @@ import { ApiErrorResponse } from '../api-response.interface';
 import { AppException } from '../app-exception';
 import { ErrorCode } from '../error-code.enum';
 import { sanitizeUrl } from '../../logger/sanitize-url';
+import { PANEL_PREFIX, isPanelRequest } from '../panel.constants';
 
 /**
  * Catches every exception (Nest's own HttpException tree and anything
@@ -39,6 +40,27 @@ export class AllExceptionsFilter implements ExceptionFilter {
       },
       'Unhandled request error',
     );
+
+    if (isPanelRequest(request.path)) {
+      // Человеку в браузере нужен экран, а не `{"success":false}`.
+      // Неаутентифицированного отправляем на вход — это самый частый случай
+      // и единственное, что он может сделать дальше.
+      if (status === 401) {
+        response.redirect(`${PANEL_PREFIX}/login`);
+        return;
+      }
+      response.status(status).render('layout', {
+        page: 'error',
+        title: 'Ошибка',
+        admin: null,
+        active: '',
+        csrfToken: '',
+        flash: null,
+        status,
+        message: body.error.message,
+      });
+      return;
+    }
 
     response.status(status).json(body);
   }

@@ -1,0 +1,79 @@
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h1 class="page-title m-0">Кампании</h1>
+  <a class="btn btn-primary" href="/panel/posts/new">Новый пост</a>
+</div>
+
+<% if (campaigns.length === 0) { %>
+  <div class="card">
+    <div class="card-body text-center text-secondary py-5">
+      Кампаний пока нет. Создайте первый пост.
+    </div>
+  </div>
+<% } else { %>
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table card-table table-vcenter">
+        <thead>
+          <tr>
+            <th>Пост</th>
+            <th>Статус</th>
+            <th>Доставки</th>
+            <th class="w-1"></th>
+          </tr>
+        </thead>
+        <tbody>
+          <% campaigns.forEach(function (c) { %>
+            <tr>
+              <td>
+                <div class="text-truncate" style="max-width: 32rem"><%= c.text %></div>
+                <div class="text-secondary small"><%= formatDate(c.createdAt) %></div>
+              </td>
+              <td><span class="badge bg-<%= statusColor(c.status) %>"><%= statusLabel(c.status) %></span></td>
+              <td>
+                <span class="text-green"><%= c.sent %></span> /
+                <%= c.total %>
+                <% if (c.failed > 0) { %>
+                  <span class="text-red ms-2">ошибок: <%= c.failed %></span>
+                <% } %>
+                <% if (c.pending > 0) { %>
+                  <span class="text-secondary ms-2">в работе: <%= c.pending %></span>
+                <% } %>
+                <% if (c.skipped > 0) { %>
+                  <span class="text-secondary ms-2">пропущено: <%= c.skipped %></span>
+                <% } %>
+              </td>
+              <td>
+                <div class="d-flex gap-2">
+                  <% if (c.status === 'draft') { %>
+                    <%
+                       /* Без этого черновик — тупик: сохранить можно, а
+                          отправить неоткуда. Сюда же попадает кампания,
+                          у которой создание прошло, а постановка в очередь
+                          сорвалась (например, истёк личный токен VK). */
+                    %>
+                    <form method="post" action="/panel/campaigns/<%= c.id %>/send" class="m-0">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <button class="btn btn-sm btn-primary" type="submit">Отправить</button>
+                    </form>
+                  <% } %>
+                  <% if (c.status === 'sending' || c.status === 'scheduled') { %>
+                    <form method="post" action="/panel/campaigns/<%= c.id %>/stop" class="m-0">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <button class="btn btn-sm" type="submit">Стоп</button>
+                    </form>
+                  <% } %>
+                  <% if (c.skipped > 0 || c.failed > 0) { %>
+                    <form method="post" action="/panel/campaigns/<%= c.id %>/resume" class="m-0">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <button class="btn btn-sm" type="submit">Отправить оставшимся</button>
+                    </form>
+                  <% } %>
+                </div>
+              </td>
+            </tr>
+          <% }); %>
+        </tbody>
+      </table>
+    </div>
+  </div>
+<% } %>

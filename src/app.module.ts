@@ -15,6 +15,7 @@ import { PostsModule } from './posts/posts.module';
 import { MediaModule } from './media/media.module';
 import { ContestsModule } from './contests/contests.module';
 import { AuthModule } from './auth/auth.module';
+import { PanelModule } from './panel/panel.module';
 import { HealthController } from './health/health.controller';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -39,6 +40,7 @@ import { buildPinoConfig } from './logger/pino-logger.config';
     PostsModule,
     ContestsModule,
     AuthModule,
+    PanelModule,
     // Ограничитель нужен прежде всего форме входа: argon2 намеренно
     // медленный, и без него вход — это и перебор паролей, и нагрузка.
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),

@@ -37,6 +37,22 @@ const DISPATCH_FAILURE_RETENTION_S = 24 * 60 * 60;
 /** What "Отправить оставшимся" picks up: everything that didn't get through. */
 const RESUMABLE: PostDeliveryStatus[] = ['failed', 'skipped_by_stop'];
 
+export interface CampaignSummary {
+  id: string;
+  text: string;
+  status: Post['status'];
+  createdAt: Date;
+  scheduledAt: Date | null;
+  /** Всего целевых групп в кампании. */
+  total: number;
+  sent: number;
+  failed: number;
+  /** Ещё в работе: `pending` плюс `sending`. */
+  pending: number;
+  skipped: number;
+  unknown: number;
+}
+
 export interface CreatePostInput {
   text: string;
   vkTextOverride?: string;
@@ -544,6 +560,58 @@ export class PostsService {
         'Не удалось снять джобы поста из очереди — остановка сработает по флагу',
       );
     }
+  }
+
+  /**
+   * Список кампаний для панели: статус и прогресс по группам.
+   *
+   * Счётчики считаются в базе группировкой, а не выгрузкой всех доставок:
+   * кампания на сотню групп иначе тянула бы сотню строк ради пяти чисел, и
+   * список постов рос бы в памяти вместе с историей рассылок.
+   *
+   * Повторяющиеся шаблоны сюда не попадают — они живут своим списком, как и
+   * везде в проекте.
+   */
+  async listCampaigns(limit = 50): Promise<CampaignSummary[]> {
+    const posts = await this.prisma.post.findMany({
+      where: { recurrenceRule: null },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    });
+    if (posts.length === 0) {
+      return [];
+    }
+
+    const counts = await this.prisma.postDelivery.groupBy({
+      by: ['postId', 'status'],
+      where: { postId: { in: posts.map((post) => post.id) } },
+      _count: { _all: true },
+    });
+
+    const byPost = new Map<string, Record<string, number>>();
+    for (const row of counts) {
+      const bucket = byPost.get(row.postId) ?? {};
+      bucket[row.status] = row._count._all;
+      byPost.set(row.postId, bucket);
+    }
+
+    return posts.map((post) => {
+      const bucket = byPost.get(post.id) ?? {};
+      const total = Object.values(bucket).reduce((sum, n) => sum + n, 0);
+      return {
+        id: post.id,
+        text: post.text,
+        status: post.status,
+        createdAt: post.createdAt,
+        scheduledAt: post.scheduledAt,
+        total,
+        sent: bucket.sent ?? 0,
+        failed: bucket.failed ?? 0,
+        pending: (bucket.pending ?? 0) + (bucket.sending ?? 0),
+        skipped: bucket.skipped_by_stop ?? 0,
+        unknown: bucket.unknown ?? 0,
+      };
+    });
   }
 
   /**

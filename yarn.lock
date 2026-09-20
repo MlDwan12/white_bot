@@ -1515,6 +1515,11 @@
   resolved "https://registry.yarnpkg.com/@pkgr/core/-/core-0.3.6.tgz#3569708bd4be4d8870ba32bf1c456dac81600d97"
   integrity sha512-SEeaJLb3qBNF/OaXnaR1NmmBbFYk1zC0ZH/52fATcRPLFg/p791YrcyFFy44Bo9sLaGuSuLp5Q6axbb/O+v/RA==
 
+"@popperjs/core@^2.11.8":
+  version "2.11.8"
+  resolved "https://registry.yarnpkg.com/@popperjs/core/-/core-2.11.8.tgz#6b79032e760a0899cd4204710beede972a3a185f"
+  integrity sha512-P1st0aksCrn9sGZhp8GMYwBnQsbvAWsZAX44oXNNvLHGqAOcoVxmjZiohstwQ7SqKnbR47akdNi+uleWD8+g6A==
+
 "@prisma/adapter-pg@^7.10.0":
   version "7.10.0"
   resolved "https://registry.yarnpkg.com/@prisma/adapter-pg/-/adapter-pg-7.10.0.tgz#8181c52b8406e7c8e9d6d52aa8b1e1f95aefa40e"
@@ -1731,6 +1736,13 @@
   version "1.1.0"
   resolved "https://registry.yarnpkg.com/@standard-schema/spec/-/spec-1.1.0.tgz#a79b55dbaf8604812f52d140b2c9ab41bc150bb8"
   integrity sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==
+
+"@tabler/core@^1.5.1":
+  version "1.5.1"
+  resolved "https://registry.yarnpkg.com/@tabler/core/-/core-1.5.1.tgz#d083f17521acb7df4bc231bc79e653bfeae268c9"
+  integrity sha512-PI9rJq4H4lBh53YP/J+m5Uz6lqVQbsGPmWCMN34IP4KQQ/wy28YMO6a3Eiz1cQHdFFr+3MlU3yYhXdzvFGJfqw==
+  dependencies:
+    "@popperjs/core" "^2.11.8"
 
 "@tokenizer/inflate@^0.4.1":
   version "0.4.1"
@@ -3489,6 +3501,11 @@ effect@3.20.0:
   dependencies:
     "@standard-schema/spec" "^1.0.0"
     fast-check "^3.23.1"
+
+ejs@^6.0.1:
+  version "6.0.1"
+  resolved "https://registry.yarnpkg.com/ejs/-/ejs-6.0.1.tgz#88ea8ce00335c3575d7c3602dd76e84b0bd60f43"
+  integrity sha512-UaaM14yby8U3k02ihS1Bmj5Kz2d7CCQM1scxpgs4Mhkq8F1wR2gl3+Ts4h5Ne4Mnt7M9m4Dw7jsuMr3+xO4vZA==
 
 electron-to-chromium@^1.5.427:
   version "1.5.430"

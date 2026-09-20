@@ -7,6 +7,8 @@ export const ACCESS_COOKIE = 'wb_access';
 export const REFRESH_COOKIE = 'wb_refresh';
 export const CSRF_COOKIE = 'wb_csrf';
 export const CSRF_HEADER = 'x-csrf-token';
+/** Скрытое поле формы — для страниц панели, которые шлются без JS. */
+export const CSRF_FIELD = '_csrf';
 
 /**
  * Токены живут только в куках и никогда не попадают в тело ответа: положи их

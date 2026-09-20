@@ -1,0 +1,26 @@
+<div class="container-tight py-6" style="max-width: 24rem">
+  <div class="card card-md">
+    <div class="card-body">
+      <h1 class="card-title text-center mb-4">Вход в панель</h1>
+
+      <% if (error) { %>
+        <div class="alert alert-danger" role="alert"><%= error %></div>
+      <% } %>
+
+      <form method="post" action="/panel/login" autocomplete="on">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <div class="mb-3">
+          <label class="form-label" for="email">Email</label>
+          <input class="form-control" id="email" type="email" name="email"
+                 value="<%= email %>" required autofocus autocomplete="username" />
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="password">Пароль</label>
+          <input class="form-control" id="password" type="password" name="password"
+                 required autocomplete="current-password" />
+        </div>
+        <button class="btn btn-primary w-100" type="submit">Войти</button>
+      </form>
+    </div>
+  </div>
+</div>

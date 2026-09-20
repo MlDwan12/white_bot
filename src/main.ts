@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { ConfigService } from '@nestjs/config';
@@ -14,6 +15,27 @@ async function bootstrap() {
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
   // Токены входа живут в куках, а их без разбора не прочесть.
   app.use(cookieParser());
+
+  // Панель — серверный рендер: страницы собираются здесь, а не в браузере,
+  // поэтому она работает без обязательного JS и без отдельной сборки
+  // фронтенда. Шаблоны лежат в `src/panel/views` и копируются в `dist`
+  // вместе с кодом (см. `nest-cli.json`).
+  app.setBaseViewsDir(join(__dirname, 'panel', 'views'));
+  app.setViewEngine('ejs');
+
+  // CSS и JS темы раздаём со своего сервера, а не с внешнего CDN: панель
+  // поедет на российский хостинг, где зарубежный CDN может быть медленным
+  // или недоступным, и каждый админ ходил бы за ним сам.
+  app.useStaticAssets(
+    join(__dirname, '..', 'node_modules', '@tabler', 'core', 'dist'),
+    {
+      prefix: '/panel/assets',
+      // Файлы версионированы вместе с пакетом; менять их могут только
+      // обновлением зависимости.
+      maxAge: '7d',
+      immutable: true,
+    },
+  );
   // Without this, SIGTERM (docker stop / pod eviction) never triggers
   // OnModuleDestroy, so PrismaService never disconnects and leaks
   // connections against Postgres's connection limit on every restart.

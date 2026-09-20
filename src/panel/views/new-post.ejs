@@ -1,0 +1,86 @@
+<h1 class="page-title mb-3">Новый пост</h1>
+
+<div class="row g-3">
+  <div class="col-lg-8">
+    <form method="post" action="/panel/posts" class="card">
+      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+      <div class="card-body">
+        <% if (error) { %>
+          <div class="alert alert-danger" role="alert"><%= error %></div>
+        <% } %>
+        <div class="mb-3">
+          <label class="form-label" for="text">Текст</label>
+          <textarea class="form-control" id="text" name="text" rows="6" required><%= draft.text %></textarea>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Куда отправить</label>
+          <% if (groups.length === 0) { %>
+            <div class="text-secondary">Нет активных групп.</div>
+          <% } else { %>
+            <% groups.forEach(function (g) { %>
+              <label class="form-check">
+                <input class="form-check-input" type="checkbox" name="groupIds"
+                       value="<%= g.id %>"
+                       <%= draft.groupIds.includes(g.id) ? 'checked' : '' %> />
+                <span class="form-check-label">
+                  <%= g.title %>
+                  <span class="badge bg-secondary ms-1"><%= g.platform %></span>
+                </span>
+              </label>
+            <% }); %>
+          <% } %>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label" for="scheduledAt">Когда</label>
+          <input class="form-control" id="scheduledAt" type="datetime-local"
+                 name="scheduledAt" value="<%= draft.scheduledAt %>" />
+          <small class="form-hint">Пусто — отправить сразу.</small>
+        </div>
+
+        <% if (media.length > 0) { %>
+          <div class="mb-3">
+            <label class="form-label">Вложения</label>
+            <% media.forEach(function (m) { %>
+              <label class="form-check">
+                <input class="form-check-input" type="checkbox" name="attachmentIds"
+                       value="<%= m.id %>"
+                       <%= draft.attachmentIds.includes(m.id) ? 'checked' : '' %> />
+                <span class="form-check-label"><%= m.filename %> <span class="text-secondary small"><%= m.kind %></span></span>
+              </label>
+            <% }); %>
+          </div>
+        <% } %>
+      </div>
+      <div class="card-footer d-flex gap-2">
+        <button class="btn btn-primary" type="submit" name="action" value="send">Отправить</button>
+        <button class="btn" type="submit" name="action" value="draft">Сохранить черновик</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="col-lg-4">
+    <%
+      /*
+         Загрузка файла отдельной формой, а не полем в форме поста.
+         Причина не в лени: браузер отправляет форму целиком, и приложить файл
+         «по дороге» означало бы либо собирать всю форму на fetch (панель
+         перестанет работать без JS), либо терять набранный текст при каждой
+         загрузке. Здесь файл загружается сам по себе и появляется в списке
+         слева, а текст никуда не девается.
+      */
+    %>
+    <form method="post" action="/panel/media" enctype="multipart/form-data" class="card">
+      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+      <div class="card-body">
+        <label class="form-label" for="file">Загрузить вложение</label>
+        <input class="form-control" id="file" type="file" name="file" required />
+        <small class="form-hint">Появится в списке вложений слева.</small>
+      </div>
+      <div class="card-footer">
+        <button class="btn w-100" type="submit">Загрузить</button>
+      </div>
+    </form>
+  </div>
+</div>

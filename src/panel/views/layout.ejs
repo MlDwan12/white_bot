@@ -1,0 +1,66 @@
+<!doctype html>
+<!--
+  Общий каркас страниц панели.
+
+  ЭКРАНИРОВАНИЕ. В EJS тег со знаком равенства экранирует значение, а тег со
+  знаком минуса вставляет как есть. Второй вид используется только для
+  заведомо своей разметки — здесь это подключение страницы. Любые данные
+  (тексты постов, имена участников конкурсов, названия групп) выводятся
+  только экранирующим тегом: имя участника приходит с платформы, то есть от
+  постороннего человека, и одна ошибка здесь выполнила бы его скрипт в
+  браузере админа, у которого открыта сессия со всеми правами.
+
+  И да: внутри EJS-комментария нельзя писать последовательность закрытия
+  тега — она закроет тег раньше времени. Поэтому пояснение выше словами.
+-->
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title><%= title %> — white_bot</title>
+    <link rel="stylesheet" href="/panel/assets/css/tabler.min.css" />
+  </head>
+  <body class="layout-fluid">
+    <div class="page">
+      <% if (admin) { %>
+        <header class="navbar navbar-expand-md navbar-light d-print-none">
+          <div class="container-xl">
+            <span class="navbar-brand fw-bold">white_bot</span>
+            <ul class="navbar-nav flex-row gap-3">
+              <li class="nav-item<%= active === 'campaigns' ? ' active' : '' %>">
+                <a class="nav-link" href="/panel/campaigns">Кампании</a>
+              </li>
+              <li class="nav-item<%= active === 'new-post' ? ' active' : '' %>">
+                <a class="nav-link" href="/panel/posts/new">Новый пост</a>
+              </li>
+            </ul>
+            <div class="ms-auto d-flex align-items-center gap-2">
+              <span class="text-secondary small"><%= admin.email %></span>
+              <form method="post" action="/panel/logout" class="m-0">
+                <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                <button class="btn btn-sm" type="submit">Выйти</button>
+              </form>
+            </div>
+          </div>
+        </header>
+      <% } %>
+
+      <div class="page-body">
+        <div class="container-xl">
+          <% if (flash) { %>
+            <div class="alert alert-<%= flash.kind %>" role="alert">
+              <%= flash.message %>
+            </div>
+          <% } %>
+          <%
+            /* В EJS нет встроенных layout'ов: страница подключается сюда
+               сама. Поэтому все хендлеры рендерят `layout` и передают имя
+               страницы в `page`. */
+          %>
+          <%- include(page) %>
+        </div>
+      </div>
+    </div>
+    <script src="/panel/assets/js/tabler.min.js" defer></script>
+  </body>
+</html>

@@ -6,6 +6,7 @@ import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { AdminAuthGuard } from './admin-auth.guard';
 import { CsrfGuard } from './csrf.guard';
+import { CsrfInterceptor } from './csrf.interceptor';
 import { PasswordService } from './password.service';
 import { SessionService } from './session.service';
 
@@ -29,6 +30,7 @@ import { SessionService } from './session.service';
     SessionService,
     AdminAuthGuard,
     CsrfGuard,
+    CsrfInterceptor,
   ],
   exports: [
     AuthService,

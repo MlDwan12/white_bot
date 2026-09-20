@@ -154,6 +154,37 @@ describe('CsrfGuard', () => {
     expect(() => guard.canActivate(context)).toThrow();
   });
 
+  it('accepts a hidden form field when there is no header', () => {
+    // Панель по замыслу работает без JS, а обычная форма заголовки ставить
+    // не умеет. Защита не слабеет: чужой сайт не может прочитать куку,
+    // чтобы подставить её значение в поле.
+    const request = {
+      cookies: { [CSRF_COOKIE]: 'token-abc' },
+      method: 'POST',
+      headers: {},
+      body: { _csrf: 'token-abc' },
+    } as unknown as AdminRequest;
+    const context = {
+      switchToHttp: () => ({ getRequest: () => request }),
+    } as unknown as ExecutionContext;
+
+    expect(guard.canActivate(context)).toBe(true);
+  });
+
+  it('refuses a form field that does not match the cookie', () => {
+    const request = {
+      cookies: { [CSRF_COOKIE]: 'token-abc' },
+      method: 'POST',
+      headers: {},
+      body: { _csrf: 'token-xyz' },
+    } as unknown as AdminRequest;
+    const context = {
+      switchToHttp: () => ({ getRequest: () => request }),
+    } as unknown as ExecutionContext;
+
+    expect(() => guard.canActivate(context)).toThrow();
+  });
+
   it('refuses a write when the cookie is missing entirely', () => {
     const { context } = contextWith(
       {},
