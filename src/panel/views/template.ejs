@@ -1,0 +1,101 @@
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <div>
+    <h1 class="page-title m-0">Повторяющийся пост</h1>
+    <div class="text-secondary small mt-1">
+      <span class="badge bg-<%= templateColor(template.state) %>"><%= templateLabel(template.state) %></span>
+      · <%= describeSchedule(template.recurrenceRule) %>
+      <% if (template.nextRunAt) { %>
+        · следующий запуск <%= formatDate(template.nextRunAt) %>
+      <% } %>
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <%
+       /* Кнопка возобновления нужна и разоружённому шаблону — тому, у кого
+          следующий запуск не назначен вовсе. Именно возобновление его и
+          чинит (оно пересчитывает `nextRunAt`), а по одному лишь признаку
+          паузы кнопка ему не доставалась: шаблон стоял мёртвым с кнопкой
+          «Пауза», которая ничего не меняла. */
+    %>
+    <% if (template.templatePaused || !template.nextRunAt) { %>
+      <form method="post" action="/panel/templates/<%= template.id %>/resume" class="m-0">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <button class="btn btn-primary" type="submit">
+          <%= template.templatePaused ? 'Возобновить' : 'Запустить заново' %>
+        </button>
+      </form>
+    <% } else { %>
+      <form method="post" action="/panel/templates/<%= template.id %>/pause" class="m-0">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <button class="btn" type="submit">Пауза</button>
+      </form>
+    <% } %>
+  </div>
+</div>
+
+<% if (templateHint(template.state)) { %>
+  <div class="alert alert-danger" role="alert"><%= templateHint(template.state) %></div>
+<% } %>
+
+<div class="row g-3">
+  <div class="col-lg-7">
+    <form method="post" action="/panel/templates/<%= template.id %>" class="card">
+      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+      <div class="card-header"><h3 class="card-title">Что публикуется</h3></div>
+      <div class="card-body">
+        <% if (error) { %>
+          <div class="alert alert-danger" role="alert"><%= error %></div>
+        <% } %>
+        <p class="text-secondary">
+          Правка коснётся только будущих публикаций: уже вышедшие посты —
+          самостоятельные записи и не меняются.
+        </p>
+        <%- include('template-fields') %>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Что уже вышло</h3>
+        <%
+           /* Список режется по лимиту, а в шапке без пояснения стояло бы «100»
+              у шаблона, вышедшего 365 раз, — при том что список шаблонов
+              показывает настоящее число. */
+        %>
+        <span class="ms-auto text-secondary">
+          <%= occurrences.length >= occurrencesLimit ? 'последние ' + occurrencesLimit : occurrences.length %>
+        </span>
+      </div>
+      <% if (occurrences.length === 0) { %>
+        <div class="card-body text-secondary">
+          Публикаций ещё не было.
+        </div>
+      <% } else { %>
+        <div class="table-responsive">
+          <table class="table card-table table-vcenter">
+            <tbody>
+              <% occurrences.forEach(function (o) { %>
+                <tr>
+                  <td class="text-nowrap">
+                    <a href="/panel/campaigns/<%= o.id %>"><%= formatDate(o.createdAt) %></a>
+                  </td>
+                  <td>
+                    <span class="badge bg-<%= statusColor(o.status) %>"><%= statusLabel(o.status) %></span>
+                  </td>
+                </tr>
+              <% }); %>
+            </tbody>
+          </table>
+        </div>
+        <div class="card-footer text-secondary small">
+          Каждая строка — отдельная кампания со своей разбивкой по группам.
+        </div>
+      <% } %>
+    </div>
+  </div>
+</div>

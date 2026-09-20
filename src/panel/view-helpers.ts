@@ -1,3 +1,4 @@
+import type { TemplateState } from '../posts/post-templates.service';
 import type {
   ContestNotifyStatus,
   ContestStatus,
@@ -163,4 +164,41 @@ export function notifyLabel(status: ContestNotifyStatus): string {
 
 export function notifyColor(status: ContestNotifyStatus): string {
   return NOTIFY_COLORS[status] ?? 'secondary';
+}
+
+const TEMPLATE_LABELS: Record<TemplateState, string> = {
+  running: 'работает',
+  paused: 'на паузе',
+  disarmed: 'не запустится',
+  no_targets: 'некуда публиковать',
+};
+
+const TEMPLATE_COLORS: Record<TemplateState, string> = {
+  running: 'green',
+  paused: 'secondary',
+  // Красный у обоих намеренно: и сломанное правило, и потеря последней
+  // активной группы означают одно — постов не будет, а выглядит шаблон
+  // живым. Это ровно тот отказ, который замечают через неделю.
+  disarmed: 'red',
+  no_targets: 'red',
+};
+
+export function templateLabel(state: TemplateState): string {
+  return TEMPLATE_LABELS[state] ?? state;
+}
+
+export function templateColor(state: TemplateState): string {
+  return TEMPLATE_COLORS[state] ?? 'secondary';
+}
+
+/** Пояснение к тревожным состояниям: что именно сломалось и что с этим делать. */
+export function templateHint(state: TemplateState): string | null {
+  switch (state) {
+    case 'disarmed':
+      return 'Расписание не разобралось или шаблон разоружён — следующий запуск не назначен. Сохраните расписание заново.';
+    case 'no_targets':
+      return 'Ни одна из целевых групп не активна: публиковать некуда, хотя расписание идёт.';
+    default:
+      return null;
+  }
 }

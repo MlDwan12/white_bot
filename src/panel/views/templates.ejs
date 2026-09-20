@@ -1,0 +1,66 @@
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h1 class="page-title m-0">Повторяющиеся посты</h1>
+  <a class="btn btn-primary" href="/panel/templates/new">Новый повторяющийся</a>
+</div>
+
+<% if (templates.length === 0) { %>
+  <div class="card">
+    <div class="card-body text-center text-secondary py-5">
+      Повторяющихся постов пока нет. Такой пост публикуется сам по расписанию,
+      каждый раз новой записью.
+    </div>
+  </div>
+<% } else { %>
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table card-table table-vcenter">
+        <thead>
+          <tr>
+            <th>Пост</th>
+            <th>Расписание</th>
+            <th>Состояние</th>
+            <th>Следующий запуск</th>
+            <th>Вышло</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% templates.forEach(function (t) { %>
+            <tr>
+              <td>
+                <a class="text-reset text-decoration-none" href="/panel/templates/<%= t.id %>">
+                  <div class="text-truncate" style="max-width: 26rem"><%= t.text %></div>
+                </a>
+                <div class="text-secondary small">групп: <%= t.targetsCount %></div>
+              </td>
+              <td>
+                <%= describeSchedule(t.recurrenceRule) %>
+                <% if (t.timezone) { %>
+                  <div class="text-secondary small"><%= t.timezone %></div>
+                <% } %>
+              </td>
+              <td>
+                <span class="badge bg-<%= templateColor(t.state) %>"><%= templateLabel(t.state) %></span>
+                <% if (templateHint(t.state)) { %>
+                  <div class="text-secondary small" style="max-width: 18rem"><%= templateHint(t.state) %></div>
+                <% } %>
+              </td>
+              <td class="text-nowrap">
+                <% if (t.nextRunAt) { %>
+                  <%= formatDate(t.nextRunAt) %>
+                <% } else { %>
+                  <span class="text-secondary">—</span>
+                <% } %>
+              </td>
+              <td><%= t.occurrencesCount %></td>
+            </tr>
+          <% }); %>
+        </tbody>
+      </table>
+    </div>
+    <% if (templates.length >= listLimit) { %>
+      <div class="card-footer text-secondary">
+        Показаны последние <%= listLimit %>.
+      </div>
+    <% } %>
+  </div>
+<% } %>

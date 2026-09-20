@@ -161,6 +161,23 @@ function target(groupId: string, status = 'active', platform = 'vk') {
 
 describe('PostTemplatesService', () => {
   describe('createTemplate', () => {
+    it('rejects blank text before storing anything', async () => {
+      // Каждое срабатывание рождало бы пост, который VK и MAX отвергают.
+      // Панель не проходит валидацию DTO, поэтому проверка живёт в сервисе.
+      const { service, prisma } = setup();
+
+      for (const text of ['', '   ', '\n\t']) {
+        await expect(
+          service.createTemplate({
+            text,
+            recurrenceRule: '0 10 * * *',
+            groupIds: ['g1'],
+          }),
+        ).rejects.toBeInstanceOf(AppException);
+      }
+      expect(prisma.post.create).not.toHaveBeenCalled();
+    });
+
     it('rejects an invalid schedule before storing anything', async () => {
       const { service, prisma } = setup();
 
@@ -628,6 +645,20 @@ describe('PostTemplatesService', () => {
   });
 
   describe('updateTemplate', () => {
+    it('rejects blank text but lets an edit without text through', async () => {
+      const { service, prisma } = setup();
+
+      await expect(
+        service.updateTemplate('tpl-1', { text: '   ' }),
+      ).rejects.toBeInstanceOf(AppException);
+      expect(prisma.post.update).not.toHaveBeenCalled();
+
+      // Поле не передано — «не трогать», а не «стереть».
+      await expect(
+        service.updateTemplate('tpl-1', { groupIds: ['g1'] }),
+      ).resolves.toBeDefined();
+    });
+
     it('replaces the target list and the template row in one transaction', async () => {
       const { service, prisma } = setup();
 

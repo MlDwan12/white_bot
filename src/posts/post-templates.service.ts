@@ -4,12 +4,12 @@ import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { PrismaService } from '../prisma/prisma.service';
-import { Post } from '../generated/prisma/client';
+import { GroupStatus, Post } from '../generated/prisma/client';
 import { PostsService } from './posts.service';
 import { assertValidRecurrence, nextRunAfter } from './recurrence';
 
 /** Occurrences returned by one `listOccurrences` call. */
-const OCCURRENCE_PAGE_SIZE = 100;
+export const OCCURRENCE_PAGE_SIZE = 100;
 
 /**
  * How late a window may still be published.
@@ -54,6 +54,59 @@ export interface UpdateTemplateInput {
 }
 
 /**
+ * Пустой текст шаблона — отказ на входе, а не тихая порча: каждое срабатывание
+ * рождало бы пост, который VK и MAX отвергают. Проверка стоит в сервисе, а не
+ * только в DTO, потому что сюда ходит и панель, и она DTO не проходит.
+ */
+function assertTemplateText(text: string): void {
+  if (text.trim().length === 0) {
+    throw new AppException(
+      ErrorCode.VALIDATION_ERROR,
+      'Текст повторяющегося поста не может быть пустым',
+    );
+  }
+}
+
+export type TemplateState = 'running' | 'paused' | 'disarmed' | 'no_targets';
+
+export interface TemplateSummary {
+  id: string;
+  text: string;
+  recurrenceRule: string;
+  timezone: string | null;
+  nextRunAt: Date | null;
+  createdAt: Date;
+  targetsCount: number;
+  occurrencesCount: number;
+  state: TemplateState;
+}
+
+/**
+ * Состояние шаблона одним значением — см. `getTemplate` о том, почему каждая
+ * из трёх «тихих остановок» названа отдельно.
+ *
+ * `disarmed` проверяется **раньше** `paused`: одновременно верны обе, когда
+ * путь срабатывания разоружил шаблон со сломавшимся правилом, а админ потом
+ * поставил его на паузу — и сообщить о паузе значило бы спрятать сломанное
+ * правило за состоянием, которое человек выбрал сам.
+ */
+export function templateState(input: {
+  nextRunAt: Date | null;
+  templatePaused: boolean;
+  targetStatuses: GroupStatus[];
+}): TemplateState {
+  if (!input.nextRunAt) {
+    return 'disarmed';
+  }
+  if (input.templatePaused) {
+    return 'paused';
+  }
+  return input.targetStatuses.some((status) => status === 'active')
+    ? 'running'
+    : 'no_targets';
+}
+
+/**
  * Recurring posts.
  *
  * A template is a `Post` carrying a `recurrenceRule`; it never goes through
@@ -79,6 +132,7 @@ export class PostTemplatesService {
   }
 
   async createTemplate(input: CreateTemplateInput): Promise<Post> {
+    assertTemplateText(input.text);
     const timezone = input.timezone ?? this.defaultTimezone;
     assertValidRecurrence(input.recurrenceRule, timezone);
 
@@ -117,6 +171,9 @@ export class PostTemplatesService {
 
   /** Edits affect future firings only; already published occurrences are untouched. */
   async updateTemplate(id: string, input: UpdateTemplateInput): Promise<Post> {
+    if (input.text !== undefined) {
+      assertTemplateText(input.text);
+    }
     const template = await this.findTemplateOrThrow(id);
 
     const recurrenceRule = input.recurrenceRule ?? template.recurrenceRule!;
@@ -567,6 +624,43 @@ export class PostTemplatesService {
   }
 
   /**
+   * Сводка для списка шаблонов в панели.
+   *
+   * Состояние считается тем же правилом, что и в `getTemplate`, и по той же
+   * причине: шаблон, который перестал публиковать, но выглядит «работает», —
+   * это отказ, который замечают через неделю пропавших постов. Считать его
+   * в шаблоне списка было бы тем же правилом во втором экземпляре, а такие
+   * расходятся молча.
+   */
+  async listTemplates(limit = 50): Promise<TemplateSummary[]> {
+    const templates = await this.prisma.post.findMany({
+      where: { recurrenceRule: { not: null } },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      include: {
+        templateTargets: { select: { group: { select: { status: true } } } },
+        _count: { select: { occurrences: true } },
+      },
+    });
+
+    return templates.map((template) => ({
+      id: template.id,
+      text: template.text,
+      recurrenceRule: template.recurrenceRule!,
+      timezone: template.timezone,
+      nextRunAt: template.nextRunAt,
+      createdAt: template.createdAt,
+      targetsCount: template.templateTargets.length,
+      occurrencesCount: template._count.occurrences,
+      state: templateState({
+        nextRunAt: template.nextRunAt,
+        templatePaused: template.templatePaused,
+        targetStatuses: template.templateTargets.map((t) => t.group.status),
+      }),
+    }));
+  }
+
+  /**
    * Most recent occurrences first, capped: an hourly template running for a
    * year has ~8760 of them, and the panel shows the latest ones.
    */
@@ -605,13 +699,11 @@ export class PostTemplatesService {
     // the broken rule behind a state the admin chose, and the resume button
     // would answer with a raw cron error and no explanation. A template paused
     // the ordinary way keeps its `nextRunAt`, so it still reads as `paused`.
-    const state = !template.nextRunAt
-      ? 'disarmed'
-      : template.templatePaused
-        ? 'paused'
-        : targets.some((t) => t.group.status === 'active')
-          ? 'running'
-          : 'no_targets';
+    const state = templateState({
+      nextRunAt: template.nextRunAt,
+      templatePaused: template.templatePaused,
+      targetStatuses: targets.map((t) => t.group.status),
+    });
     return { ...template, state, targets: targets.map((t) => t.group) };
   }
 

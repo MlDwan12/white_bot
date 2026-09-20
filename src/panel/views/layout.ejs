@@ -37,6 +37,11 @@
                   <a class="nav-link" href="/panel/posts/new">Новый пост</a>
                 </li>
               <% } %>
+              <% if (can('posts_manage')) { %>
+                <li class="nav-item<%= active === 'templates' ? ' active' : '' %>">
+                  <a class="nav-link" href="/panel/templates">Повторяющиеся</a>
+                </li>
+              <% } %>
               <% if (can('contests_manage')) { %>
                 <li class="nav-item<%= active === 'contests' ? ' active' : '' %>">
                   <a class="nav-link" href="/panel/contests">Конкурсы</a>

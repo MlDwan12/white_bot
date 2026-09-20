@@ -1,0 +1,151 @@
+<%
+   /* Поля повторяющегося поста — общие для создания и правки.
+
+      Вынесены в один файл намеренно: две копии одной формы расходятся молча,
+      и расходятся они обычно в том поле, которое добавили последним, — а
+      заметно это становится, когда шаблон публикует не то или не туда. */
+%>
+<div class="mb-3">
+  <label class="form-label" for="text">Текст</label>
+  <textarea class="form-control" id="text" name="text" rows="6" required><%= draft.text %></textarea>
+</div>
+
+<details class="mb-3" <%= draft.vkTextOverride || draft.maxTextOverride ? 'open' : '' %>>
+  <summary style="cursor: pointer">Разный текст для VK и MAX</summary>
+  <div class="mt-2">
+    <label class="form-label" for="vkTextOverride">Текст для VK</label>
+    <textarea class="form-control" id="vkTextOverride" name="vkTextOverride" rows="3"><%= draft.vkTextOverride %></textarea>
+    <small class="form-hint">Пусто — публикуется общий текст.</small>
+  </div>
+  <div class="mt-2">
+    <label class="form-label" for="maxTextOverride">Текст для MAX</label>
+    <textarea class="form-control" id="maxTextOverride" name="maxTextOverride" rows="3"><%= draft.maxTextOverride %></textarea>
+  </div>
+</details>
+
+<div class="mb-3">
+  <label class="form-label">Расписание</label>
+  <div class="d-flex flex-wrap gap-3 mb-2">
+    <label class="form-check m-0">
+      <input class="form-check-input" type="radio" name="mode" value="daily"
+             <%= draft.schedule.mode === 'daily' ? 'checked' : '' %> />
+      <span class="form-check-label">Ежедневно</span>
+    </label>
+    <label class="form-check m-0">
+      <input class="form-check-input" type="radio" name="mode" value="weekly"
+             <%= draft.schedule.mode === 'weekly' ? 'checked' : '' %> />
+      <span class="form-check-label">Еженедельно</span>
+    </label>
+    <label class="form-check m-0">
+      <input class="form-check-input" type="radio" name="mode" value="monthly"
+             <%= draft.schedule.mode === 'monthly' ? 'checked' : '' %> />
+      <span class="form-check-label">Ежемесячно</span>
+    </label>
+    <label class="form-check m-0">
+      <input class="form-check-input" type="radio" name="mode" value="custom"
+             <%= draft.schedule.mode === 'custom' ? 'checked' : '' %> />
+      <span class="form-check-label">Своё выражение</span>
+    </label>
+  </div>
+
+  <div class="row g-2">
+    <div class="col-auto">
+      <label class="form-label" for="time">Время</label>
+      <input class="form-control" id="time" type="time" name="time"
+             value="<%= draft.schedule.time %>" />
+    </div>
+    <div class="col-auto">
+      <label class="form-label" for="weekday">День недели</label>
+      <select class="form-select" id="weekday" name="weekday">
+        <% weekdays.forEach(function (d) { %>
+          <option value="<%= d.value %>" <%= draft.schedule.weekday === d.value ? 'selected' : '' %>>
+            <%= d.label %>
+          </option>
+        <% }); %>
+      </select>
+      <small class="form-hint">Для «еженедельно».</small>
+    </div>
+    <div class="col-auto">
+      <label class="form-label" for="monthday">Число месяца</label>
+      <select class="form-select" id="monthday" name="monthday">
+        <% for (let day = 1; day <= maxPresetMonthday; day++) { %>
+          <option value="<%= day %>" <%= draft.schedule.monthday === day ? 'selected' : '' %>>
+            <%= day %>
+          </option>
+        <% } %>
+      </select>
+      <%
+         /* Числа позже 28-го в списке нет: такое расписание пропускало бы
+            короткие месяцы целиком, то есть «ежемесячно» выходило бы семь
+            раз в год. Кому нужно именно это — пишет своё выражение. */
+      %>
+      <small class="form-hint">Для «ежемесячно», 1–<%= maxPresetMonthday %>.</small>
+    </div>
+  </div>
+
+  <div class="mt-2">
+    <label class="form-label" for="custom">Своё cron-выражение</label>
+    <input class="form-control" id="custom" name="custom"
+           value="<%= draft.schedule.custom %>" placeholder="0 10 * * 1" />
+    <small class="form-hint">
+      Пять полей: минуты часы день месяц день-недели. Примеры:
+      <code>0 10 * * *</code> — каждый день в 10:00,
+      <code>*/15 * * * *</code> — каждые 15 минут,
+      <code>0 9 1 * *</code> — 1-го числа в 9:00.
+      Учитывается, только если выбрано «Своё выражение».
+    </small>
+  </div>
+</div>
+
+<div class="mb-3">
+  <label class="form-label" for="timezone">Часовой пояс</label>
+  <input class="form-control" id="timezone" name="timezone" value="<%= draft.timezone %>" />
+  <small class="form-hint">
+    В нём читается расписание, поэтому «каждый день в 10:00» означает одно и
+    то же и после переезда сервера.
+  </small>
+</div>
+
+<div class="mb-3">
+  <label class="form-label">Куда публиковать</label>
+  <% if (groups.length === 0) { %>
+    <div class="text-secondary">Нет активных групп.</div>
+  <% } else { %>
+    <% groups.forEach(function (g) { %>
+      <label class="form-check">
+        <input class="form-check-input" type="checkbox" name="groupIds"
+               value="<%= g.id %>"
+               <%= draft.groupIds.includes(g.id) ? 'checked' : '' %> />
+        <span class="form-check-label">
+          <%= g.title %>
+          <span class="badge bg-secondary ms-1"><%= g.platform %></span>
+          <% if (g.status !== 'active') { %>
+            <%
+               /* Неактивная цель из списка не убирается: группа может
+                  восстановиться, а срабатывание её просто пропускает.
+                  Спрятать её значило бы снимать её с шаблона при каждом
+                  сохранении формы. */
+            %>
+            <span class="badge bg-red ms-1">неактивна</span>
+          <% } %>
+        </span>
+      </label>
+    <% }); %>
+  <% } %>
+</div>
+
+<% if (media.length > 0) { %>
+  <div class="mb-3">
+    <label class="form-label">Вложения</label>
+    <% media.forEach(function (m) { %>
+      <label class="form-check">
+        <input class="form-check-input" type="checkbox" name="attachmentIds"
+               value="<%= m.id %>"
+               <%= draft.attachmentIds.includes(m.id) ? 'checked' : '' %> />
+        <span class="form-check-label"><%= m.filename %>
+          <span class="badge bg-secondary ms-1"><%= m.kind %></span>
+        </span>
+      </label>
+    <% }); %>
+  </div>
+<% } %>

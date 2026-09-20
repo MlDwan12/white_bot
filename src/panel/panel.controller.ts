@@ -40,6 +40,10 @@ import { PostsService } from '../posts/posts.service';
 import { PostModerationService } from '../posts/post-moderation.service';
 import { GroupsService } from '../groups/groups.service';
 import { ContestsService } from '../contests/contests.service';
+import {
+  OCCURRENCE_PAGE_SIZE,
+  PostTemplatesService,
+} from '../posts/post-templates.service';
 import { MediaService, MAX_FILE_BYTES } from '../media/media.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { AdminUser, Permission } from '../generated/prisma/client';
@@ -53,10 +57,59 @@ import {
   groupLabel,
   notifyColor,
   notifyLabel,
+  templateColor,
+  templateHint,
+  templateLabel,
   statusColor,
   statusLabel,
 } from './view-helpers';
+import {
+  DEFAULT_SCHEDULE,
+  MAX_PRESET_MONTHDAY,
+  WEEKDAYS,
+  buildCron,
+  describeSchedule,
+  parseCron,
+  sameSchedule,
+} from './cron-preset';
+import type { ScheduleForm, SchedulePreset } from './cron-preset';
 import { zonedToUtc } from './zoned-time';
+
+interface TemplateFormBody {
+  text?: string;
+  vkTextOverride?: string;
+  maxTextOverride?: string;
+  timezone?: string;
+  groupIds?: string | string[];
+  attachmentIds?: string | string[];
+  mode?: string;
+  time?: string;
+  weekday?: string;
+  monthday?: string;
+  custom?: string;
+}
+
+interface TemplateDraft {
+  text: string;
+  vkTextOverride: string;
+  maxTextOverride: string;
+  timezone: string;
+  groupIds: string[];
+  attachmentIds: string[];
+  schedule: ScheduleForm;
+}
+
+function isSchedulePreset(value: string | undefined): value is SchedulePreset {
+  return (
+    value === 'daily' ||
+    value === 'weekly' ||
+    value === 'monthly' ||
+    value === 'custom'
+  );
+}
+
+/** Сколько строк показывают списки конкурсов и постов-кандидатов. */
+const LIST_LIMIT = 50;
 
 /**
  * Веб-панель: серверный рендер, обычные HTML-формы, без обязательного JS.
@@ -64,9 +117,6 @@ import { zonedToUtc } from './zoned-time';
  * Живёт под `/panel` — по этому префиксу и конверт `{success,data}`, и
  * обработчик ошибок понимают, что здесь нужен HTML, а не JSON.
  */
-/** Сколько строк показывают списки конкурсов и постов-кандидатов. */
-const LIST_LIMIT = 50;
-
 @Controller('panel')
 export class PanelController {
   constructor(
@@ -75,6 +125,7 @@ export class PanelController {
     private readonly moderation: PostModerationService,
     private readonly groups: GroupsService,
     private readonly contests: ContestsService,
+    private readonly templates: PostTemplatesService,
     private readonly media: MediaService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
@@ -394,6 +445,356 @@ export class PanelController {
   ): Promise<void> {
     await this.groups.deactivate(id);
     res.redirect(`${PANEL_PREFIX}/groups?flash=group-off`);
+  }
+
+  // ----- повторяющиеся шаблоны --------------------------------------------
+
+  @Get('templates')
+  @Render('layout')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  async templatesPage(
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Query('flash') flash?: string,
+    @Query('reason') reason?: string,
+  ) {
+    return {
+      ...this.shell(req, 'Повторяющиеся', admin, 'templates', flash, reason),
+      page: 'templates',
+      templates: await this.templates.listTemplates(LIST_LIMIT),
+      listLimit: LIST_LIMIT,
+      describeSchedule,
+      templateColor,
+      templateLabel,
+      templateHint,
+      formatDate,
+    };
+  }
+
+  // До `templates/:id`: Nest сопоставляет маршруты по порядку объявления.
+  @Get('templates/new')
+  @Render('layout')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  async newTemplate(
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Query('flash') flash?: string,
+  ) {
+    return {
+      ...this.shell(req, 'Новый повторяющийся', admin, 'templates', flash),
+      page: 'template-form',
+      groups: await this.activeGroups(),
+      media: await this.recentMedia(),
+      weekdays: WEEKDAYS,
+      maxPresetMonthday: MAX_PRESET_MONTHDAY,
+      draft: this.emptyTemplateDraft(),
+      template: null,
+      error: null,
+    };
+  }
+
+  @Post('templates')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async createTemplate(
+    @Body() body: TemplateFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const draft = this.templateDraftFrom(body);
+    try {
+      const template = await this.templates.createTemplate({
+        text: body.text ?? '',
+        vkTextOverride: body.vkTextOverride?.trim() || undefined,
+        maxTextOverride: body.maxTextOverride?.trim() || undefined,
+        recurrenceRule: buildCron(draft.schedule),
+        timezone: body.timezone?.trim() || undefined,
+        groupIds: draft.groupIds,
+        attachmentIds: draft.attachmentIds,
+      });
+      res.redirect(
+        `${PANEL_PREFIX}/templates/${template.id}?flash=template-created`,
+      );
+    } catch (err: unknown) {
+      await this.renderTemplateForm(res, req, admin, draft, null, err);
+    }
+  }
+
+  @Get('templates/:id')
+  @Render('layout')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  async templatePage(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Query('flash') flash?: string,
+    @Query('reason') reason?: string,
+  ) {
+    return this.templateCard(req, admin, id, { flash, reason });
+  }
+
+  @Post('templates/:id')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async updateTemplate(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: TemplateFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const draft = this.templateDraftFrom(body);
+    try {
+      const stored = await this.templates.getTemplate(id);
+      await this.templates.updateTemplate(id, {
+        text: body.text ?? '',
+        // Поля формы — полная правда о тексте: пустое означает «снять
+        // переопределение», а не «не трогать». Иначе снять его из панели
+        // было бы нечем, и шаблон публиковал бы в VK текст, которого в
+        // панели не видно.
+        vkTextOverride: body.vkTextOverride?.trim() || null,
+        maxTextOverride: body.maxTextOverride?.trim() || null,
+        // Если расписание по смыслу то же, что сохранено, отдаём сохранённую
+        // строку: пересобранная из полей могла бы отличаться записью
+        // (`0 09` и `0 9`), и сервис принял бы это за смену расписания —
+        // см. `sameSchedule`.
+        recurrenceRule: sameSchedule(
+          parseCron(stored.recurrenceRule ?? ''),
+          draft.schedule,
+        )
+          ? (stored.recurrenceRule ?? buildCron(draft.schedule))
+          : buildCron(draft.schedule),
+        timezone: body.timezone?.trim() || this.defaultTimezone(),
+        groupIds: draft.groupIds,
+        attachmentIds: draft.attachmentIds,
+      });
+      res.redirect(`${PANEL_PREFIX}/templates/${id}?flash=template-saved`);
+    } catch (err: unknown) {
+      this.logger.warn({ err, templateId: id }, 'Не удалось сохранить шаблон');
+      // Форма перерисовывается с набранным, как и при создании: переписанный
+      // текст, новый выбор групп и расписание набираются долго, а редирект на
+      // карточку показал бы сохранённое старое и выбросил бы всё это из-за
+      // одной опечатки в cron.
+      res.status(400).render(
+        'layout',
+        await this.templateCard(req, admin, id, {
+          draft,
+          error:
+            err instanceof AppException
+              ? err.message
+              : 'Не удалось сохранить шаблон',
+        }),
+      );
+    }
+  }
+
+  @Post('templates/:id/pause')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async pauseTemplate(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.templates.setPaused(id, true);
+    res.redirect(`${PANEL_PREFIX}/templates/${id}?flash=template-paused`);
+  }
+
+  @Post('templates/:id/resume')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async resumeTemplate(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    try {
+      await this.templates.setPaused(id, false);
+      res.redirect(`${PANEL_PREFIX}/templates/${id}?flash=template-resumed`);
+    } catch (err: unknown) {
+      // Возобновление пересчитывает следующий запуск, то есть заново
+      // разбирает правило — а разоружённый шаблон как раз тот, у кого оно
+      // сломано. Общий экран ошибки показал бы сырое сообщение cron-parser
+      // вместо страницы, где правило можно починить.
+      this.logger.warn(
+        { err, templateId: id },
+        'Не удалось возобновить шаблон',
+      );
+      const reason =
+        err instanceof AppException
+          ? err.message
+          : 'Не удалось возобновить шаблон';
+      res.redirect(
+        `${PANEL_PREFIX}/templates/${id}?flash=template-failed&reason=${encodeURIComponent(reason)}`,
+      );
+    }
+  }
+
+  /**
+   * Всё, что нужно странице шаблона. Одно место для двух путей: обычного
+   * показа и перерисовки после отказа при сохранении — иначе вторая копия
+   * набора полей разошлась бы с первой на первом же добавленном поле.
+   */
+  private async templateCard(
+    req: Request,
+    admin: AdminUser,
+    id: string,
+    options: {
+      draft?: TemplateDraft;
+      error?: string | null;
+      flash?: string;
+      reason?: string;
+    } = {},
+  ) {
+    const template = await this.templates.getTemplate(id);
+    const occurrences = await this.templates.listOccurrences(id);
+    const attachedIds = await this.templateAttachmentIds(id);
+    return {
+      ...this.shell(
+        req,
+        'Повторяющийся пост',
+        admin,
+        'templates',
+        options.flash,
+        options.reason,
+      ),
+      page: 'template',
+      template,
+      occurrences,
+      occurrencesLimit: OCCURRENCE_PAGE_SIZE,
+      // Список групп — все активные плюс те, что уже в целях шаблона:
+      // неактивная цель остаётся в списке намеренно (группа может
+      // восстановиться), и спрятать её из формы значило бы снимать её с
+      // шаблона при каждом сохранении.
+      groups: await this.groupsForTemplate(template.targets.map((g) => g.id)),
+      media: await this.mediaForTemplate(attachedIds),
+      weekdays: WEEKDAYS,
+      maxPresetMonthday: MAX_PRESET_MONTHDAY,
+      draft: options.draft ?? {
+        text: template.text,
+        vkTextOverride: template.vkTextOverride ?? '',
+        maxTextOverride: template.maxTextOverride ?? '',
+        timezone: template.timezone ?? this.defaultTimezone(),
+        groupIds: template.targets.map((g) => g.id),
+        attachmentIds: attachedIds,
+        schedule: parseCron(template.recurrenceRule ?? ''),
+      },
+      describeSchedule,
+      templateColor,
+      templateLabel,
+      templateHint,
+      statusColor,
+      statusLabel,
+      formatDate,
+      error: options.error ?? null,
+    };
+  }
+
+  /**
+   * Вложения для формы шаблона: уже прикреплённые — первыми и в порядке
+   * `position`, затем свежие загрузки.
+   *
+   * Оба условия держат форму честной. Правка отправляет список вложений
+   * целиком, а сервис заменяет их разом, поэтому прикреплённое, которого в
+   * форме нет (шаблон завели давно, и картинка выпала из последних двадцати
+   * загрузок), при первом же сохранении опечатки молча исчезло бы из всех
+   * будущих публикаций. А порядок нужен потому, что браузер шлёт отмеченные
+   * галочки в порядке страницы, и `position` по нему пересчитывается: без
+   * этого каждое сохранение переставляло бы картинки местами.
+   */
+  private async mediaForTemplate(attachedIds: string[]) {
+    const attached = attachedIds.length
+      ? await this.prisma.mediaAsset.findMany({
+          where: { id: { in: attachedIds } },
+          select: { id: true, filename: true, kind: true },
+        })
+      : [];
+    const byId = new Map(attached.map((asset) => [asset.id, asset]));
+    const inOrder = attachedIds.flatMap((id) => byId.get(id) ?? []);
+    const rest = (await this.recentMedia()).filter(
+      (asset) => !byId.has(asset.id),
+    );
+    return [...inOrder, ...rest];
+  }
+
+  private defaultTimezone(): string {
+    return this.config.getOrThrow<string>('DEFAULT_TIMEZONE');
+  }
+
+  private emptyTemplateDraft(): TemplateDraft {
+    return {
+      text: '',
+      vkTextOverride: '',
+      maxTextOverride: '',
+      timezone: this.defaultTimezone(),
+      groupIds: [],
+      attachmentIds: [],
+      schedule: DEFAULT_SCHEDULE,
+    };
+  }
+
+  private templateDraftFrom(body: TemplateFormBody): TemplateDraft {
+    return {
+      text: body.text ?? '',
+      vkTextOverride: body.vkTextOverride ?? '',
+      maxTextOverride: body.maxTextOverride ?? '',
+      timezone: body.timezone ?? this.defaultTimezone(),
+      groupIds: asArray(body.groupIds),
+      attachmentIds: asArray(body.attachmentIds),
+      schedule: {
+        mode: isSchedulePreset(body.mode) ? body.mode : 'daily',
+        time: body.time ?? DEFAULT_SCHEDULE.time,
+        weekday: Number(body.weekday ?? DEFAULT_SCHEDULE.weekday),
+        monthday: Number(body.monthday ?? DEFAULT_SCHEDULE.monthday),
+        custom: body.custom ?? '',
+      },
+    };
+  }
+
+  /** Активные группы плюс те, что уже в целях шаблона (даже неактивные). */
+  private async groupsForTemplate(targetIds: string[]) {
+    const all = await this.groups.listGroups();
+    return all.filter(
+      (group) => group.status === 'active' || targetIds.includes(group.id),
+    );
+  }
+
+  private async templateAttachmentIds(id: string): Promise<string[]> {
+    const attachments = await this.prisma.postAttachment.findMany({
+      where: { postId: id },
+      orderBy: { position: 'asc' },
+      select: { mediaAssetId: true },
+    });
+    return attachments.map((a) => a.mediaAssetId);
+  }
+
+  private async renderTemplateForm(
+    res: Response,
+    req: Request,
+    admin: AdminUser,
+    draft: TemplateDraft,
+    template: { id: string } | null,
+    err: unknown,
+  ): Promise<void> {
+    this.logger.warn({ err }, 'Не удалось сохранить повторяющийся пост');
+    // Форма перерисовывается с набранным: расписание, выбор групп и текст
+    // набираются долго, и терять их из-за одной опечатки в cron незачем.
+    res.status(400).render('layout', {
+      ...this.shell(req, 'Новый повторяющийся', admin, 'templates'),
+      page: 'template-form',
+      groups: await this.activeGroups(),
+      media: await this.recentMedia(),
+      weekdays: WEEKDAYS,
+      maxPresetMonthday: MAX_PRESET_MONTHDAY,
+      draft,
+      template,
+      error:
+        err instanceof AppException
+          ? err.message
+          : 'Не удалось сохранить повторяющийся пост',
+    });
   }
 
   // ----- конкурсы ---------------------------------------------------------
@@ -1065,6 +1466,17 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
   resumed: { kind: 'success', message: 'Отправляем оставшимся' },
   uploaded: { kind: 'success', message: 'Вложение загружено' },
   'no-file': { kind: 'danger', message: 'Файл не выбран' },
+  'template-created': { kind: 'success', message: 'Повторяющийся пост создан' },
+  'template-saved': {
+    kind: 'success',
+    message: 'Сохранено — изменения коснутся будущих публикаций',
+  },
+  'template-paused': { kind: 'warning', message: 'Публикации приостановлены' },
+  'template-resumed': { kind: 'success', message: 'Публикации возобновлены' },
+  'template-failed': {
+    kind: 'danger',
+    message: 'Не удалось изменить повторяющийся пост',
+  },
   'contest-created': { kind: 'success', message: 'Конкурс создан' },
   'contest-opened': { kind: 'success', message: 'Приём участников открыт' },
   'contest-drawn': { kind: 'success', message: 'Розыгрыш проведён' },

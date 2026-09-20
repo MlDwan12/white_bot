@@ -1,0 +1,24 @@
+<h1 class="page-title mb-3">Новый повторяющийся пост</h1>
+
+<div class="row g-3">
+  <div class="col-lg-8">
+    <form method="post" action="/panel/templates" class="card">
+      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+      <div class="card-body">
+        <% if (error) { %>
+          <div class="alert alert-danger" role="alert"><%= error %></div>
+        <% } %>
+        <p class="text-secondary">
+          Каждое срабатывание создаёт отдельный пост — снимок текста, вложений
+          и списка групп на тот момент. Правка шаблона меняет только будущие
+          публикации, уже вышедшие остаются как есть.
+        </p>
+        <%- include('template-fields') %>
+      </div>
+      <div class="card-footer d-flex gap-2">
+        <button class="btn btn-primary" type="submit">Создать</button>
+        <a class="btn" href="/panel/templates">Отмена</a>
+      </div>
+    </form>
+  </div>
+</div>
