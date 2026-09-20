@@ -19,6 +19,52 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title><%= title %> — white_bot</title>
     <link rel="stylesheet" href="/panel/assets/css/tabler.min.css" />
+    <style>
+      /*
+        Палитра меток и цветного текста.
+
+        Раньше метки были `badge bg-<цвет>` без цвета текста: в Tabler у
+        такого бейджа задан только фон, и надпись сливалась с ним (зелёное на
+        зелёном). Документация Tabler предлагает пару `bg-X text-X-fg` или
+        светлый `bg-X-lt`, но обе не дотягивают до стандарта читаемости WCAG AA
+        (4,5:1): у зелёного, оранжевого, голубого и жёлтого выходит 2–3.
+
+        Поэтому здесь свои пары: светлый тон фона (14% цвета на белом) и
+        затемнённый текст того же оттенка. Каждая пара даёт контраст не ниже
+        7:1 (посчитано по формуле WCAG), то есть читается и мелким шрифтом.
+        Менять цвета — только с пересчётом контраста.
+      */
+      .tag {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 0.25rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        line-height: 1.4;
+        white-space: nowrap;
+      }
+      .tag-green { background: #e2f4e5; color: #185b23; }
+      .tag-red { background: #f9e3e3; color: #8d2626; }
+      .tag-orange { background: #feeadc; color: #853804; }
+      .tag-azure { background: #e5f1fb; color: #24537a; }
+      .tag-blue { background: #dcebf9; color: #044d90; }
+      .tag-yellow { background: #fef2db; color: #714900; }
+      .tag-secondary { background: #eaebed; color: #494e57; }
+      .tag-purple { background: #f4e4f7; color: #762a89; }
+      .tag-teal { background: #ddf3ec; color: #075b42; }
+      .tag-dark { background: #e0e3e8; color: #1f2937; }
+      /* Цветной текст без фона — те же затемнённые оттенки. */
+      .tone-green { color: #185b23; }
+      .tone-red { color: #8d2626; }
+      .tone-orange { color: #853804; }
+      .tone-azure { color: #24537a; }
+      .tone-blue { color: #044d90; }
+      .tone-yellow { color: #714900; }
+      .tone-secondary { color: #494e57; }
+      .tone-purple { color: #762a89; }
+      .tone-teal { color: #075b42; }
+      .tone-dark { color: #1f2937; }
+    </style>
   </head>
   <body class="layout-fluid">
     <div class="page">
@@ -29,7 +75,7 @@
             <ul class="navbar-nav flex-row gap-3">
               <% if (can('posts_manage')) { %>
                 <li class="nav-item<%= active === 'campaigns' ? ' active' : '' %>">
-                  <a class="nav-link" href="/panel/campaigns">Кампании</a>
+                  <a class="nav-link" href="/panel/campaigns">Посты</a>
                 </li>
               <% } %>
               <% if (can('posts_manage')) { %>

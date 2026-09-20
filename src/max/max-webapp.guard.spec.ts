@@ -75,7 +75,12 @@ describe('MaxWebAppGuard', () => {
   });
 
   it('rejects a tampered signature', () => {
-    const tampered = launchData().replace(/.$/, '0');
+    // Последняя цифра подписи — шестнадцатеричная, и «замена на 0» в одном
+    // случае из шестнадцати ничего не меняла: данные оставались подлинными,
+    // и тест случайно падал. Берём заведомо другой символ.
+    const tampered = launchData().replace(/.$/, (last) =>
+      last === '0' ? '1' : '0',
+    );
     const { context } = contextWith(`MaxWebApp ${tampered}`);
 
     expect(() => buildGuard(TOKEN).canActivate(context)).toThrow(AppException);

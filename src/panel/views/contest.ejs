@@ -2,7 +2,7 @@
   <div>
     <h1 class="page-title m-0"><%= contest.title %></h1>
     <div class="text-secondary small mt-1">
-      <span class="badge bg-<%= contestColor(contest.status) %>"><%= contestLabel(contest.status) %></span>
+      <span class="tag tag-<%= contestColor(contest.status) %>"><%= contestLabel(contest.status) %></span>
       · создан <%= formatDate(contest.createdAt) %>
       <% if (contest.postId) { %>
         · <a href="/panel/campaigns/<%= contest.postId %>">анонс-пост</a>
@@ -86,10 +86,10 @@
                     <% if (prize.winnerParticipant) { %>
                       <%= prize.winnerParticipant.displayName %>
                       <% if (prize.isForced) { %>
-                        <span class="badge bg-orange ms-1">выбран вручную</span>
+                        <span class="tag tag-orange ms-1">выбран вручную</span>
                       <% } %>
                       <div class="small">
-                        <span class="text-<%= notifyColor(prize.notifyStatus) %>">
+                        <span class="tone-<%= notifyColor(prize.notifyStatus) %>">
                           <%= notifyLabel(prize.notifyStatus) %>
                         </span>
                         <% if (prize.notifyError) { %>
@@ -258,10 +258,10 @@
                   <td>
                     <%= p.displayName %>
                     <% if (p.source === 'manual') { %>
-                      <span class="badge bg-secondary ms-1">вручную</span>
+                      <span class="tag tag-secondary ms-1">вручную</span>
                     <% } %>
                     <div class="text-secondary small">
-                      <%= p.platform %>
+                      <%= platformLabel(p.platform) %>
                       <% if (p.externalUserId) { %>
                         · <%= p.externalUserId %>
                       <% } else { %>

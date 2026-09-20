@@ -46,7 +46,11 @@ import {
 } from '../posts/post-templates.service';
 import { MediaService, MAX_FILE_BYTES } from '../media/media.service';
 import { PrismaService } from '../prisma/prisma.service';
-import type { AdminUser, Permission } from '../generated/prisma/client';
+import type {
+  AdminUser,
+  MediaAsset,
+  Permission,
+} from '../generated/prisma/client';
 import {
   contestColor,
   contestLabel,
@@ -55,8 +59,12 @@ import {
   formatDate,
   groupColor,
   groupLabel,
+  groupKindLabel,
+  mediaKindLabel,
   notifyColor,
   notifyLabel,
+  platformColor,
+  platformLabel,
   templateColor,
   templateHint,
   templateLabel,
@@ -106,6 +114,27 @@ function isSchedulePreset(value: string | undefined): value is SchedulePreset {
     value === 'monthly' ||
     value === 'custom'
   );
+}
+
+/** Поля формы «Новый пост» — как их присылает браузер. */
+interface PostFormBody {
+  text?: string;
+  groupIds?: string | string[];
+  attachmentIds?: string | string[];
+  scheduledAt?: string;
+  action?: string;
+  /**
+   * Имя файла, выбранного в поле загрузки. Форма поста уходит как
+   * urlencoded, и браузер прикладывает к ней **только имя** — сам файл нет.
+   */
+  file?: string;
+}
+
+interface PostDraft {
+  text: string;
+  groupIds: string[];
+  attachmentIds: string[];
+  scheduledAt: string;
 }
 
 /** Сколько строк показывают списки конкурсов и постов-кандидатов. */
@@ -208,7 +237,7 @@ export class PanelController {
     @Query('flash') flash?: string,
   ) {
     return {
-      ...this.shell(req, 'Кампании', admin, 'campaigns', flash),
+      ...this.shell(req, 'Посты', admin, 'campaigns', flash),
       page: 'campaigns',
       campaigns: await this.posts.listCampaigns(),
       statusColor,
@@ -229,7 +258,7 @@ export class PanelController {
   ) {
     const post = await this.posts.getPostWithDeliveries(id);
     return {
-      ...this.shell(req, 'Кампания', admin, 'campaigns', flash),
+      ...this.shell(req, 'Пост', admin, 'campaigns', flash),
       page: 'campaign',
       post,
       // Править и удалять можно только там, где пост действительно вышел и
@@ -669,7 +698,7 @@ export class PanelController {
       // восстановиться), и спрятать её из формы значило бы снимать её с
       // шаблона при каждом сохранении.
       groups: await this.groupsForTemplate(template.targets.map((g) => g.id)),
-      media: await this.mediaForTemplate(attachedIds),
+      media: await this.mediaWithPinned(attachedIds),
       weekdays: WEEKDAYS,
       maxPresetMonthday: MAX_PRESET_MONTHDAY,
       draft: options.draft ?? {
@@ -693,8 +722,8 @@ export class PanelController {
   }
 
   /**
-   * Вложения для формы шаблона: уже прикреплённые — первыми и в порядке
-   * `position`, затем свежие загрузки.
+   * Вложения для формы (поста или шаблона): уже выбранные — первыми и в
+   * заданном порядке (у шаблона это `position`), затем свежие загрузки.
    *
    * Оба условия держат форму честной. Правка отправляет список вложений
    * целиком, а сервис заменяет их разом, поэтому прикреплённое, которого в
@@ -704,7 +733,7 @@ export class PanelController {
    * галочки в порядке страницы, и `position` по нему пересчитывается: без
    * этого каждое сохранение переставляло бы картинки местами.
    */
-  private async mediaForTemplate(attachedIds: string[]) {
+  private async mediaWithPinned(attachedIds: string[]) {
     const attached = attachedIds.length
       ? await this.prisma.mediaAsset.findMany({
           where: { id: { in: attachedIds } },
@@ -1207,7 +1236,6 @@ export class PanelController {
   // ----- создание поста ---------------------------------------------------
 
   @Get('posts/new')
-  @Render('layout')
   @UseGuards(AdminAuthGuard)
   // Только `posts_manage`: список групп здесь — часть создания поста, а не
   // отдельная возможность. С двумя правами админ видел бы пункт меню и
@@ -1216,16 +1244,14 @@ export class PanelController {
   async newPost(
     @Req() req: Request,
     @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
     @Query('flash') flash?: string,
-  ) {
-    return {
-      ...this.shell(req, 'Новый пост', admin, 'new-post', flash),
-      page: 'new-post',
-      groups: await this.activeGroups(),
-      media: await this.recentMedia(),
-      draft: { text: '', groupIds: [], attachmentIds: [], scheduledAt: '' },
-      error: null,
-    };
+  ): Promise<void> {
+    // Через тот же `renderNewPost`, что и повторные показы формы: две копии
+    // набора полей разошлись бы на первом же добавленном.
+    await this.renderNewPost(res, req, admin, this.postDraftFrom({}), {
+      flash,
+    });
   }
 
   private async activeGroups() {
@@ -1246,30 +1272,35 @@ export class PanelController {
   @UseGuards(AdminAuthGuard, CsrfGuard)
   @RequirePermissions('posts_manage')
   async createPost(
-    @Body()
-    body: {
-      text?: string;
-      groupIds?: string | string[];
-      attachmentIds?: string | string[];
-      scheduledAt?: string;
-      action?: string;
-    },
+    @Body() body: PostFormBody,
     @Req() req: Request,
     @CurrentAdmin() admin: AdminUser,
     @Res() res: Response,
   ): Promise<void> {
-    const groupIds = asArray(body.groupIds);
-    const attachmentIds = asArray(body.attachmentIds);
+    const draft = this.postDraftFrom(body);
+
+    // Файл, выбранный в поле загрузки, но не загруженный кнопкой «Загрузить»,
+    // к посту **не прикрепится**: эта форма уходит без тела файла. Молча
+    // отправить пост без картинки, которую человек выбрал, нельзя — из VK его
+    // потом не удалить. Поэтому отказываем и говорим, что сделать.
+    const pendingFile = body.file?.trim();
+    if (pendingFile) {
+      await this.renderNewPost(res, req, admin, draft, {
+        status: 400,
+        error: `Вы выбрали файл «${pendingFile}», но не загрузили его, поэтому пост не создан. Выберите файл заново, нажмите «Загрузить», а потом отправляйте.`,
+      });
+      return;
+    }
 
     try {
       const scheduledAt = this.parseSchedule(body.scheduledAt);
       const post = await this.posts.createPost({
-        text: body.text ?? '',
+        text: draft.text,
         // Браузер шлёт одно значение строкой, а несколько — массивом. Без
         // приведения кампания с одной группой ушла бы с `groupIds: 'uuid'`,
         // и валидация отвергла бы её как не массив.
-        groupIds,
-        attachmentIds,
+        groupIds: draft.groupIds,
+        attachmentIds: draft.attachmentIds,
         scheduledAt,
       });
 
@@ -1283,21 +1314,48 @@ export class PanelController {
       // Форма перерисовывается с тем, что человек набрал. Уронить его в
       // общий экран ошибки — значит потерять текст, выбор групп и
       // расписание из-за одной непоставленной галочки.
-      res.status(400).render('layout', {
-        ...this.shell(req, 'Новый пост', admin, 'new-post'),
-        page: 'new-post',
-        groups: await this.activeGroups(),
-        media: await this.recentMedia(),
-        draft: {
-          text: body.text ?? '',
-          groupIds,
-          attachmentIds,
-          scheduledAt: body.scheduledAt ?? '',
-        },
+      await this.renderNewPost(res, req, admin, draft, {
+        status: 400,
         error:
           err instanceof AppException ? err.message : 'Не удалось создать пост',
       });
     }
+  }
+
+  private postDraftFrom(body: PostFormBody): PostDraft {
+    return {
+      text: body.text ?? '',
+      groupIds: asArray(body.groupIds),
+      attachmentIds: asArray(body.attachmentIds),
+      scheduledAt: body.scheduledAt ?? '',
+    };
+  }
+
+  /**
+   * Страница «Новый пост» с набранным. Одна отрисовка для трёх путей: отказ
+   * при создании, загрузка файла и ошибка загрузки — иначе три копии набора
+   * полей разошлись бы на первом добавленном.
+   *
+   * Вложения из черновика всегда попадают в список, даже если они старше
+   * последних загрузок: после загрузки нового файла отмеченный раньше мог бы
+   * выпасть из «свежих 20», его галочка исчезла бы, и он молча не попал бы
+   * в пост.
+   */
+  private async renderNewPost(
+    res: Response,
+    req: Request,
+    admin: AdminUser,
+    draft: PostDraft,
+    options: { status?: number; flash?: string; error?: string | null } = {},
+  ): Promise<void> {
+    res.status(options.status ?? 200).render('layout', {
+      ...this.shell(req, 'Новый пост', admin, 'new-post', options.flash),
+      page: 'new-post',
+      groups: await this.activeGroups(),
+      media: await this.mediaWithPinned(draft.attachmentIds),
+      draft,
+      error: options.error ?? null,
+    });
   }
 
   /**
@@ -1338,20 +1396,63 @@ export class PanelController {
   )
   async uploadMedia(
     @UploadedFile() file: Express.Multer.File | undefined,
+    @Body() body: PostFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
     @Res() res: Response,
   ): Promise<void> {
+    // Форма приходит целиком — со всем набранным, — и возвращается тем же:
+    // раньше загрузка редиректила на пустую страницу, и текст, группы и срок
+    // пропадали. Любой исход, в том числе отказ, рисуется с этим черновиком.
+    const draft = this.postDraftFrom(body);
+
     if (!file) {
-      res.redirect(`${PANEL_PREFIX}/posts/new?flash=no-file`);
+      await this.renderNewPost(res, req, admin, draft, {
+        status: 400,
+        error: 'Файл не выбран',
+      });
       return;
     }
-    await this.media.upload({
-      buffer: file.buffer,
-      // Multer отдаёт имя в latin1; без перекодировки кириллица приезжает
-      // кракозябрами — а это имя видит получатель документа.
-      filename: Buffer.from(file.originalname, 'latin1').toString('utf8'),
-      declaredMimeType: file.mimetype,
-    });
-    res.redirect(`${PANEL_PREFIX}/posts/new?flash=uploaded`);
+
+    let asset: MediaAsset;
+    try {
+      asset = await this.media.upload({
+        buffer: file.buffer,
+        // Multer отдаёт имя в latin1; без перекодировки кириллица приезжает
+        // кракозябрами — а это имя видит получатель документа.
+        filename: Buffer.from(file.originalname, 'latin1').toString('utf8'),
+        declaredMimeType: file.mimetype,
+      });
+    } catch (err: unknown) {
+      if (!(err instanceof AppException)) {
+        this.logger.error({ err }, 'Не удалось загрузить вложение');
+      }
+      await this.renderNewPost(res, req, admin, draft, {
+        status: 400,
+        error:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось загрузить файл',
+      });
+      return;
+    }
+
+    // Отрисовка — вне `try`: сбой чтения списков после успешной загрузки не
+    // должен выдаваться за сбой загрузки (файл уже сохранён, и повтор дал бы
+    // копию).
+    await this.renderNewPost(
+      res,
+      req,
+      admin,
+      // Новый файл отмечается сам: человек только что его выбрал, и
+      // заставлять его искать и отмечать галочкой то же самое — лишний шаг,
+      // на котором легко отправить пост без вложения.
+      {
+        ...draft,
+        attachmentIds: [...new Set([...draft.attachmentIds, asset.id])],
+      },
+      { flash: 'uploaded' },
+    );
   }
 
   /** Поля, которые нужны каждому шаблону. */
@@ -1378,6 +1479,14 @@ export class PanelController {
       title,
       admin: admin ? { email: admin.email } : null,
       can: (permission: Permission) => permissions.has(permission),
+      // Названия и цвета, нужные почти каждой странице (метка платформы у
+      // группы встречается в шести шаблонах). Кладутся сюда, а не в каждый
+      // обработчик: забытый в одном из десятка обработчиков помощник
+      // превратил бы страницу в ошибку 500.
+      platformLabel,
+      platformColor,
+      groupKindLabel,
+      mediaKindLabel,
       active,
       // Значение берётся из куки: шаблон обязан положить его в скрытое поле,
       // а сторонний сайт прочитать чужую куку не может — в этом и смысл
@@ -1465,7 +1574,6 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
   stopped: { kind: 'warning', message: 'Рассылка остановлена' },
   resumed: { kind: 'success', message: 'Отправляем оставшимся' },
   uploaded: { kind: 'success', message: 'Вложение загружено' },
-  'no-file': { kind: 'danger', message: 'Файл не выбран' },
   'template-created': { kind: 'success', message: 'Повторяющийся пост создан' },
   'template-saved': {
     kind: 'success',

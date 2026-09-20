@@ -1,12 +1,12 @@
 <div class="d-flex align-items-center justify-content-between mb-3">
-  <h1 class="page-title m-0">Кампании</h1>
+  <h1 class="page-title m-0">Посты</h1>
   <a class="btn btn-primary" href="/panel/posts/new">Новый пост</a>
 </div>
 
 <% if (campaigns.length === 0) { %>
   <div class="card">
     <div class="card-body text-center text-secondary py-5">
-      Кампаний пока нет. Создайте первый пост.
+      Постов пока нет. Создайте первый.
     </div>
   </div>
 <% } else { %>
@@ -30,12 +30,12 @@
                 </a>
                 <div class="text-secondary small"><%= formatDate(c.createdAt) %></div>
               </td>
-              <td><span class="badge bg-<%= statusColor(c.status) %>"><%= statusLabel(c.status) %></span></td>
+              <td><span class="tag tag-<%= statusColor(c.status) %>"><%= statusLabel(c.status) %></span></td>
               <td>
-                <span class="text-green"><%= c.sent %></span> /
+                <span class="tone-green"><%= c.sent %></span> /
                 <%= c.total %>
                 <% if (c.failed > 0) { %>
-                  <span class="text-red ms-2">ошибок: <%= c.failed %></span>
+                  <span class="tone-red ms-2">ошибок: <%= c.failed %></span>
                 <% } %>
                 <% if (c.pending > 0) { %>
                   <span class="text-secondary ms-2">в работе: <%= c.pending %></span>

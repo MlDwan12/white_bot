@@ -59,6 +59,25 @@ export class MediaService {
       );
     }
 
+    // Тот же файл под тем же именем — не новая загрузка. Панель отвечает на
+    // загрузку страницей, а не редиректом, поэтому обновление страницы
+    // отправляет форму повторно; без этой проверки каждое обновление плодило
+    // бы копию файла в хранилище и в списке вложений. Имя входит в условие
+    // намеренно: его видит получатель документа, и подсовывать старое имя
+    // тому, кто загрузил тот же файл под новым, нельзя.
+    const checksum = MediaStorageService.checksum(input.buffer);
+    const existing = await this.prisma.mediaAsset.findFirst({
+      where: {
+        checksum,
+        filename: input.filename,
+        sizeBytes: input.buffer.byteLength,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (existing) {
+      return existing;
+    }
+
     const image = await MediaService.probeImage(input.buffer);
     const kind: MediaKind = image ? 'image' : 'document';
     const mimeType = image
@@ -80,7 +99,7 @@ export class MediaService {
           kind,
           mimeType,
           sizeBytes: input.buffer.byteLength,
-          checksum: MediaStorageService.checksum(input.buffer),
+          checksum,
           storagePath: stored.relativePath,
           optimizedPath: optimized?.relativePath ?? null,
           optimizedSizeBytes: optimized?.sizeBytes ?? null,

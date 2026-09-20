@@ -39,7 +39,7 @@
                 <% } %>
               </td>
               <td>
-                <span class="badge bg-<%= templateColor(t.state) %>"><%= templateLabel(t.state) %></span>
+                <span class="tag tag-<%= templateColor(t.state) %>"><%= templateLabel(t.state) %></span>
                 <% if (templateHint(t.state)) { %>
                   <div class="text-secondary small" style="max-width: 18rem"><%= templateHint(t.state) %></div>
                 <% } %>

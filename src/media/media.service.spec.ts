@@ -35,6 +35,8 @@ function setup() {
   const prisma = {
     mediaAsset: {
       create: jest.fn(({ data }: { data: object }) => Promise.resolve(data)),
+      // По умолчанию такого файла ещё нет — обычная новая загрузка.
+      findFirst: jest.fn().mockResolvedValue(null),
     },
   };
   const logger = { setContext: jest.fn(), warn: jest.fn() };
@@ -48,12 +50,52 @@ function setup() {
 }
 
 /** The row MediaService asked Prisma to create. */
-function createdAsset(prisma: { mediaAsset: { create: jest.Mock } }) {
+function createdAsset(prisma: {
+  mediaAsset: { create: jest.Mock; findFirst: jest.Mock };
+}) {
   const calls = prisma.mediaAsset.create.mock.calls as unknown[][];
   return (calls[0][0] as { data: Record<string, unknown> }).data;
 }
 
 describe('MediaService', () => {
+  describe('повторная загрузка', () => {
+    it('тот же файл под тем же именем возвращает уже загруженный, не плодя копию', async () => {
+      // Панель отвечает на загрузку страницей, а не редиректом, и обновление
+      // страницы отправляет форму повторно: без этого каждое обновление
+      // добавляло бы копию файла в хранилище и в список вложений.
+      const { service, prisma, storage } = setup();
+      const existing = { id: 'asset-1', filename: 'договор.txt' };
+      prisma.mediaAsset.findFirst.mockResolvedValue(existing);
+
+      const result = await service.upload({
+        filename: 'договор.txt',
+        buffer: Buffer.from('одно и то же'),
+      });
+
+      expect(result).toBe(existing);
+      expect(prisma.mediaAsset.create).not.toHaveBeenCalled();
+      expect(storage.write).not.toHaveBeenCalled();
+    });
+
+    it('ищет по содержимому и имени вместе, а не только по содержимому', async () => {
+      // Имя видит получатель документа: тому, кто загрузил тот же файл под
+      // новым именем, нельзя отдавать запись со старым.
+      const { service, prisma } = setup();
+
+      await service.upload({
+        filename: 'новое-имя.txt',
+        buffer: Buffer.from('одно и то же'),
+      });
+
+      const where = (
+        prisma.mediaAsset.findFirst.mock.calls as unknown[][]
+      )[0][0] as { where: Record<string, unknown> };
+      expect(where.where).toMatchObject({ filename: 'новое-имя.txt' });
+      expect(where.where.checksum).toEqual(expect.any(String));
+      expect(prisma.mediaAsset.create).toHaveBeenCalled();
+    });
+  });
+
   describe('type detection', () => {
     it('identifies an image by its bytes, ignoring the declared type', async () => {
       const { service, prisma } = setup();

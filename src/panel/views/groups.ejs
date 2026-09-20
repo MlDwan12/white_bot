@@ -14,7 +14,7 @@
         <div class="d-flex align-items-center gap-2 mb-2">
           <div class="flex-fill">
             <strong><%= g.title %></strong>
-            <span class="badge bg-secondary ms-1"><%= g.kind %></span>
+            <span class="tag tag-secondary ms-1"><%= groupKindLabel(g.kind) %></span>
           </div>
           <form method="post" action="/panel/groups/<%= g.id %>/confirm" class="m-0 d-flex gap-2">
             <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
@@ -50,7 +50,7 @@
               <tr>
                 <td>
                   <strong><%= g.title %></strong>
-                  <span class="badge bg-secondary ms-1"><%= g.platform %></span>
+                  <span class="tag tag-<%= platformColor(g.platform) %> ms-1"><%= platformLabel(g.platform) %></span>
                   <div class="text-secondary small">
                     id <%= g.externalId %>
                     <% if (g.tokenMask) { %>
@@ -64,7 +64,7 @@
                   </div>
                 </td>
                 <td>
-                  <span class="badge bg-<%= groupColor(g.status) %>"><%= groupLabel(g.status) %></span>
+                  <span class="tag tag-<%= groupColor(g.status) %>"><%= groupLabel(g.status) %></span>
                 </td>
                 <td>
                   <% if (can('groups_tags_edit')) { %>

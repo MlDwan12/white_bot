@@ -202,3 +202,41 @@ export function templateHint(state: TemplateState): string | null {
       return null;
   }
 }
+
+/**
+ * Платформа человеческим названием и своим цветом.
+ *
+ * Раньше в списках групп стояло сырое `vk`/`max` в серой метке — а метка,
+ * ещё и нечитаемая, не отвечала на главный вопрос при выборе получателей:
+ * «куда именно это уйдёт». Цвета разные намеренно: платформу должно быть
+ * видно по цвету, до чтения.
+ */
+const PLATFORM_LABELS: Record<string, string> = { vk: 'VK', max: 'MAX' };
+const PLATFORM_COLORS: Record<string, string> = { vk: 'blue', max: 'purple' };
+
+export function platformLabel(platform: string): string {
+  return PLATFORM_LABELS[platform] ?? platform;
+}
+
+export function platformColor(platform: string): string {
+  return PLATFORM_COLORS[platform] ?? 'secondary';
+}
+
+const GROUP_KIND_LABELS: Record<string, string> = {
+  channel: 'канал',
+  chat: 'чат',
+  community: 'сообщество',
+};
+
+export function groupKindLabel(kind: string): string {
+  return GROUP_KIND_LABELS[kind] ?? kind;
+}
+
+const MEDIA_KIND_LABELS: Record<string, string> = {
+  image: 'картинка',
+  document: 'документ',
+};
+
+export function mediaKindLabel(kind: string): string {
+  return MEDIA_KIND_LABELS[kind] ?? kind;
+}

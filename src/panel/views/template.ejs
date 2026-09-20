@@ -2,7 +2,7 @@
   <div>
     <h1 class="page-title m-0">Повторяющийся пост</h1>
     <div class="text-secondary small mt-1">
-      <span class="badge bg-<%= templateColor(template.state) %>"><%= templateLabel(template.state) %></span>
+      <span class="tag tag-<%= templateColor(template.state) %>"><%= templateLabel(template.state) %></span>
       · <%= describeSchedule(template.recurrenceRule) %>
       <% if (template.nextRunAt) { %>
         · следующий запуск <%= formatDate(template.nextRunAt) %>
@@ -85,7 +85,7 @@
                     <a href="/panel/campaigns/<%= o.id %>"><%= formatDate(o.createdAt) %></a>
                   </td>
                   <td>
-                    <span class="badge bg-<%= statusColor(o.status) %>"><%= statusLabel(o.status) %></span>
+                    <span class="tag tag-<%= statusColor(o.status) %>"><%= statusLabel(o.status) %></span>
                   </td>
                 </tr>
               <% }); %>
@@ -93,7 +93,7 @@
           </table>
         </div>
         <div class="card-footer text-secondary small">
-          Каждая строка — отдельная кампания со своей разбивкой по группам.
+          Каждая строка — отдельный пост со своей разбивкой по группам.
         </div>
       <% } %>
     </div>

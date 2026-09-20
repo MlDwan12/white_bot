@@ -8,6 +8,10 @@ import {
   formatDate,
   statusColor,
   statusLabel,
+  groupKindLabel,
+  mediaKindLabel,
+  platformColor,
+  platformLabel,
 } from './view-helpers';
 
 describe('view-helpers', () => {
@@ -67,5 +71,33 @@ describe('view-helpers', () => {
     // то, ради чего на страницу и заходят.
     expect(groupColor('active')).not.toBe(groupColor('token_invalid'));
     expect(groupColor('active')).not.toBe(groupColor('bot_removed'));
+  });
+});
+
+describe('платформа и виды в интерфейсе', () => {
+  it('называет платформы по-человечески', () => {
+    // Раньше в списке групп стояло сырое `vk`/`max` в нечитаемой метке, и по
+    // ней нельзя было понять, куда уйдёт пост.
+    expect(platformLabel('vk')).toBe('VK');
+    expect(platformLabel('max')).toBe('MAX');
+  });
+
+  it('красит платформы по-разному, чтобы их различал цвет ещё до чтения', () => {
+    expect(platformColor('vk')).not.toBe(platformColor('max'));
+  });
+
+  it('незнакомую платформу показывает как есть и нейтрально', () => {
+    // Новая платформа не должна ронять страницу или прятаться пустой меткой.
+    expect(platformLabel('telegram')).toBe('telegram');
+    expect(platformColor('telegram')).toBe('secondary');
+  });
+
+  it('переводит виды группы и вложения, незнакомое оставляет как есть', () => {
+    expect(groupKindLabel('channel')).toBe('канал');
+    expect(groupKindLabel('chat')).toBe('чат');
+    expect(groupKindLabel('что-то')).toBe('что-то');
+    expect(mediaKindLabel('image')).toBe('картинка');
+    expect(mediaKindLabel('document')).toBe('документ');
+    expect(mediaKindLabel('video')).toBe('video');
   });
 });

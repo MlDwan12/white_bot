@@ -1,9 +1,23 @@
 <h1 class="page-title mb-3">Новый пост</h1>
 
+<%
+   /* Вся страница — одна форма, включая загрузку файла.
+
+      Раньше загрузка была отдельной формой, и после неё страница
+      перерисовывалась пустой: набранный текст, выбранные группы и срок
+      пропадали. Теперь кнопка «Загрузить» отправляет **всю** форму вместе с
+      файлом на другой адрес (`formaction`), а сервер возвращает страницу с
+      набранным и сам отмечает новое вложение. Работает без JavaScript.
+
+      Порядок в документе важен: неявную отправку по Enter в поле формы
+      выполняет первая кнопка отправки, и это должна оставаться «Отправить»,
+      а не «Загрузить» — поэтому блок загрузки стоит правее и ниже. */
+%>
+<form method="post" action="/panel/posts">
+<input type="hidden" name="_csrf" value="<%= csrfToken %>" />
 <div class="row g-3">
   <div class="col-lg-8">
-    <form method="post" action="/panel/posts" class="card">
-      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <div class="card">
       <div class="card-body">
         <% if (error) { %>
           <div class="alert alert-danger" role="alert"><%= error %></div>
@@ -25,7 +39,7 @@
                        <%= draft.groupIds.includes(g.id) ? 'checked' : '' %> />
                 <span class="form-check-label">
                   <%= g.title %>
-                  <span class="badge bg-secondary ms-1"><%= g.platform %></span>
+                  <span class="tag tag-<%= platformColor(g.platform) %> ms-1"><%= platformLabel(g.platform) %></span>
                 </span>
               </label>
             <% }); %>
@@ -47,7 +61,7 @@
                 <input class="form-check-input" type="checkbox" name="attachmentIds"
                        value="<%= m.id %>"
                        <%= draft.attachmentIds.includes(m.id) ? 'checked' : '' %> />
-                <span class="form-check-label"><%= m.filename %> <span class="text-secondary small"><%= m.kind %></span></span>
+                <span class="form-check-label"><%= m.filename %> <span class="text-secondary small"><%= mediaKindLabel(m.kind) %></span></span>
               </label>
             <% }); %>
           </div>
@@ -57,30 +71,31 @@
         <button class="btn btn-primary" type="submit" name="action" value="send">Отправить</button>
         <button class="btn" type="submit" name="action" value="draft">Сохранить черновик</button>
       </div>
-    </form>
+    </div>
   </div>
 
   <div class="col-lg-4">
-    <%
-      /*
-         Загрузка файла отдельной формой, а не полем в форме поста.
-         Причина не в лени: браузер отправляет форму целиком, и приложить файл
-         «по дороге» означало бы либо собирать всю форму на fetch (панель
-         перестанет работать без JS), либо терять набранный текст при каждой
-         загрузке. Здесь файл загружается сам по себе и появляется в списке
-         слева, а текст никуда не девается.
-      */
-    %>
-    <form method="post" action="/panel/media" enctype="multipart/form-data" class="card">
-      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <div class="card">
       <div class="card-body">
         <label class="form-label" for="file">Загрузить вложение</label>
-        <input class="form-control" id="file" type="file" name="file" required />
-        <small class="form-hint">Появится в списке вложений слева.</small>
+        <input class="form-control" id="file" type="file" name="file" />
+        <small class="form-hint">
+          Файл до 50 МБ. После загрузки он появится в списке слева и
+          отметится сам, а всё набранное сохранится. Выбранный файл к посту
+          прикрепляется только кнопкой «Загрузить» — «Отправить» его не
+          берёт.
+        </small>
       </div>
       <div class="card-footer">
-        <button class="btn w-100" type="submit">Загрузить</button>
+        <%
+           /* `formnovalidate`: у текста стоит `required`, и без этого
+              загрузить файл до того, как текст набран, было бы нельзя.
+              `formenctype`: сама форма — обычная, а файлу нужен multipart. */
+        %>
+        <button class="btn w-100" type="submit" formaction="/panel/media"
+                formenctype="multipart/form-data" formnovalidate>Загрузить</button>
       </div>
-    </form>
+    </div>
   </div>
 </div>
+</form>

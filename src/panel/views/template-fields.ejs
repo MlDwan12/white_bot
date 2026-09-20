@@ -118,7 +118,7 @@
                <%= draft.groupIds.includes(g.id) ? 'checked' : '' %> />
         <span class="form-check-label">
           <%= g.title %>
-          <span class="badge bg-secondary ms-1"><%= g.platform %></span>
+          <span class="tag tag-<%= platformColor(g.platform) %> ms-1"><%= platformLabel(g.platform) %></span>
           <% if (g.status !== 'active') { %>
             <%
                /* Неактивная цель из списка не убирается: группа может
@@ -126,7 +126,7 @@
                   Спрятать её значило бы снимать её с шаблона при каждом
                   сохранении формы. */
             %>
-            <span class="badge bg-red ms-1">неактивна</span>
+            <span class="tag tag-red ms-1">неактивна</span>
           <% } %>
         </span>
       </label>
@@ -143,7 +143,7 @@
                value="<%= m.id %>"
                <%= draft.attachmentIds.includes(m.id) ? 'checked' : '' %> />
         <span class="form-check-label"><%= m.filename %>
-          <span class="badge bg-secondary ms-1"><%= m.kind %></span>
+          <span class="tag tag-secondary ms-1"><%= mediaKindLabel(m.kind) %></span>
         </span>
       </label>
     <% }); %>
