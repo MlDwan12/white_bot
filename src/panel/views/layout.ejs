@@ -27,12 +27,21 @@
           <div class="container-xl">
             <span class="navbar-brand fw-bold">white_bot</span>
             <ul class="navbar-nav flex-row gap-3">
-              <li class="nav-item<%= active === 'campaigns' ? ' active' : '' %>">
-                <a class="nav-link" href="/panel/campaigns">Кампании</a>
-              </li>
-              <li class="nav-item<%= active === 'new-post' ? ' active' : '' %>">
-                <a class="nav-link" href="/panel/posts/new">Новый пост</a>
-              </li>
+              <% if (can('posts_manage')) { %>
+                <li class="nav-item<%= active === 'campaigns' ? ' active' : '' %>">
+                  <a class="nav-link" href="/panel/campaigns">Кампании</a>
+                </li>
+              <% } %>
+              <% if (can('posts_manage')) { %>
+                <li class="nav-item<%= active === 'new-post' ? ' active' : '' %>">
+                  <a class="nav-link" href="/panel/posts/new">Новый пост</a>
+                </li>
+              <% } %>
+              <% if (can('groups_view')) { %>
+                <li class="nav-item<%= active === 'groups' ? ' active' : '' %>">
+                  <a class="nav-link" href="/panel/groups">Группы</a>
+                </li>
+              <% } %>
             </ul>
             <div class="ms-auto d-flex align-items-center gap-2">
               <span class="text-secondary small"><%= admin.email %></span>
@@ -50,6 +59,9 @@
           <% if (flash) { %>
             <div class="alert alert-<%= flash.kind %>" role="alert">
               <%= flash.message %>
+              <% if (flashReason) { %>
+                <div class="small mt-1"><%= flashReason %></div>
+              <% } %>
             </div>
           <% } %>
           <%

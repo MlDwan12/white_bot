@@ -1,0 +1,140 @@
+<h1 class="page-title mb-3">Группы</h1>
+
+<% if (pending.length > 0 && can('groups_pendingMax_review')) { %>
+  <div class="card mb-3 border-warning">
+    <div class="card-header">
+      <h3 class="card-title">Ждут подтверждения</h3>
+    </div>
+    <div class="card-body">
+      <p class="text-secondary">
+        Бот добавлен в эти чаты и каналы MAX, но рассылать туда нельзя,
+        пока вы не подтвердите.
+      </p>
+      <% pending.forEach(function (g) { %>
+        <div class="d-flex align-items-center gap-2 mb-2">
+          <div class="flex-fill">
+            <strong><%= g.title %></strong>
+            <span class="badge bg-secondary ms-1"><%= g.kind %></span>
+          </div>
+          <form method="post" action="/panel/groups/<%= g.id %>/confirm" class="m-0 d-flex gap-2">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+            <input class="form-control form-control-sm" style="width: 14rem"
+                   name="tags" placeholder="теги через запятую" />
+            <button class="btn btn-sm btn-primary" type="submit">Подтвердить</button>
+          </form>
+          <form method="post" action="/panel/groups/<%= g.id %>/reject" class="m-0">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+            <button class="btn btn-sm" type="submit">Отклонить</button>
+          </form>
+        </div>
+      <% }); %>
+    </div>
+  </div>
+<% } %>
+
+<div class="row g-3">
+  <div class="col-lg-<%= can('groups_manage') ? '8' : '12' %>">
+    <div class="card">
+      <div class="table-responsive">
+        <table class="table card-table table-vcenter">
+          <thead>
+            <tr>
+              <th>Группа</th>
+              <th>Статус</th>
+              <th>Теги</th>
+              <th class="w-1"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <% groups.forEach(function (g) { %>
+              <tr>
+                <td>
+                  <strong><%= g.title %></strong>
+                  <span class="badge bg-secondary ms-1"><%= g.platform %></span>
+                  <div class="text-secondary small">
+                    id <%= g.externalId %>
+                    <% if (g.tokenMask) { %>
+                      <%
+                         /* Маска, а не токен: показывать секрет на странице,
+                            которую видит любой вошедший, незачем — узнать
+                            его заново всё равно неоткуда, а утечь он может. */
+                      %>
+                      · токен <%= g.tokenMask %>
+                    <% } %>
+                  </div>
+                </td>
+                <td>
+                  <span class="badge bg-<%= groupColor(g.status) %>"><%= groupLabel(g.status) %></span>
+                </td>
+                <td>
+                  <% if (can('groups_tags_edit')) { %>
+                    <form method="post" action="/panel/groups/<%= g.id %>/tags" class="m-0 d-flex gap-1">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <input class="form-control form-control-sm" name="tags"
+                             value="<%= g.tags.join(', ') %>" placeholder="через запятую" />
+                      <%
+                         /* Теги ходят одной строкой через запятую, поэтому
+                            тег с запятой внутри (такой может прийти только
+                            через API) при сохранении отсюда разделится на
+                            два. Панель сама такие не создаёт. */
+                      %>
+                      <button class="btn btn-sm" type="submit">Сохранить</button>
+                    </form>
+                  <% } else { %>
+                    <%= g.tags.join(', ') || '—' %>
+                  <% } %>
+                </td>
+                <td>
+                  <%
+                     /* Не только для активных: группа с неработающим
+                        токеном или с удалённым ботом тоже должна убираться
+                        из списка, иначе она висит там навсегда. */
+                  %>
+                  <% if (can('groups_manage') && g.status !== 'removed') { %>
+                    <form method="post" action="/panel/groups/<%= g.id %>/deactivate" class="m-0">
+                      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+                      <button class="btn btn-sm" type="submit">Отключить</button>
+                    </form>
+                  <% } %>
+                </td>
+              </tr>
+            <% }); %>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <% if (can('groups_manage')) { %>
+    <div class="col-lg-4">
+      <form method="post" action="/panel/groups/vk" class="card">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <div class="card-header"><h3 class="card-title">Добавить VK-сообщество</h3></div>
+        <div class="card-body">
+          <div class="mb-3">
+            <label class="form-label" for="token">Токен сообщества</label>
+            <input class="form-control" id="token" type="password" name="token" required
+                   autocomplete="off" />
+            <small class="form-hint">
+              Название и id подтянутся из VK по токену — вводить их не нужно.
+            </small>
+          </div>
+          <div class="mb-2">
+            <label class="form-label" for="tags">Теги</label>
+            <input class="form-control" id="tags" name="tags" placeholder="через запятую" />
+          </div>
+        </div>
+        <div class="card-footer">
+          <button class="btn btn-primary w-100" type="submit">Добавить</button>
+        </div>
+      </form>
+
+      <div class="card mt-3">
+        <div class="card-body text-secondary small">
+          MAX-группы добавляются сами: пригласите бота в чат или канал, и он
+          появится в списке ожидающих подтверждения.
+        </div>
+      </div>
+    </div>
+  <% } %>
+</div>

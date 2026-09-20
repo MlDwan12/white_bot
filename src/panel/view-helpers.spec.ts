@@ -1,8 +1,10 @@
 import { PostStatus } from '../generated/prisma/enums';
-import { PostDeliveryStatus } from '../generated/prisma/enums';
+import { GroupStatus, PostDeliveryStatus } from '../generated/prisma/enums';
 import {
   deliveryColor,
   deliveryLabel,
+  groupColor,
+  groupLabel,
   formatDate,
   statusColor,
   statusLabel,
@@ -51,5 +53,19 @@ describe('view-helpers', () => {
     expect(deliveryColor(delivery)).not.toBe(
       deliveryColor({ ...delivery, deletedAt: null }),
     );
+  });
+
+  it('has a label and a colour for every group status', () => {
+    for (const status of Object.values(GroupStatus)) {
+      expect(groupLabel(status)).not.toBe(status);
+      expect(groupColor(status)).not.toBe('');
+    }
+  });
+
+  it('does not paint a working group like a broken one', () => {
+    // Иначе «токен не работает» потерялся бы среди активных, а это как раз
+    // то, ради чего на страницу и заходят.
+    expect(groupColor('active')).not.toBe(groupColor('token_invalid'));
+    expect(groupColor('active')).not.toBe(groupColor('bot_removed'));
   });
 });

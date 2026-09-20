@@ -13,6 +13,7 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PinoLogger } from 'nestjs-pino';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import { Throttle } from '@nestjs/throttler';
@@ -26,6 +27,7 @@ import { CsrfGuard } from '../auth/csrf.guard';
 import { CsrfInterceptor } from '../auth/csrf.interceptor';
 import { CurrentAdmin } from '../auth/current-admin.decorator';
 import { RequirePermissions } from '../auth/require-permissions.decorator';
+import { effectivePermissions } from '../auth/permissions';
 import {
   CSRF_COOKIE,
   REFRESH_COOKIE,
@@ -38,11 +40,13 @@ import { PostModerationService } from '../posts/post-moderation.service';
 import { GroupsService } from '../groups/groups.service';
 import { MediaService, MAX_FILE_BYTES } from '../media/media.service';
 import { PrismaService } from '../prisma/prisma.service';
-import type { AdminUser } from '../generated/prisma/client';
+import type { AdminUser, Permission } from '../generated/prisma/client';
 import {
   deliveryColor,
   deliveryLabel,
   formatDate,
+  groupColor,
+  groupLabel,
   statusColor,
   statusLabel,
 } from './view-helpers';
@@ -64,7 +68,10 @@ export class PanelController {
     private readonly media: MediaService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
-  ) {}
+    private readonly logger: PinoLogger,
+  ) {
+    this.logger.setContext(PanelController.name);
+  }
 
   @Get()
   index(@Res() res: Response): void {
@@ -274,6 +281,111 @@ export class PanelController {
     res.redirect(`${PANEL_PREFIX}/campaigns?flash=resumed`);
   }
 
+  // ----- группы -----------------------------------------------------------
+
+  @Get('groups')
+  @Render('layout')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('groups_view')
+  async groupsPage(
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Query('flash') flash?: string,
+    @Query('reason') reason?: string,
+  ) {
+    const all = await this.groups.listGroups();
+    return {
+      ...this.shell(req, 'Группы', admin, 'groups', flash, reason),
+      page: 'groups',
+      // Отключённые не прячем: без них непонятно, куда делась группа, в
+      // которую раньше уходили посты.
+      groups: all,
+      pending: all.filter((g) => g.status === 'pending_confirmation'),
+      groupColor,
+      groupLabel,
+    };
+  }
+
+  @Post('groups/vk')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('groups_manage')
+  async addVkGroup(
+    @Body() body: { token?: string; tags?: string },
+    @Res() res: Response,
+  ): Promise<void> {
+    try {
+      await this.groups.createVkGroup({
+        token: body.token ?? '',
+        // Пустое поле — «не трогать теги», а не «стереть». Эта же форма
+        // обновляет токен у существующего сообщества, и обновление ради
+        // токена не должно попутно обнулять его теги.
+        tags: body.tags?.trim() ? parseTags(body.tags) : undefined,
+      });
+      res.redirect(`${PANEL_PREFIX}/groups?flash=group-added`);
+    } catch (err: unknown) {
+      // Причина отказа — единственное, что объясняет админу, что не так с
+      // токеном, поэтому она доходит и до экрана, и до логов. Молчаливый
+      // редирект оставлял бы запрос вообще без следа.
+      this.logger.warn({ err }, 'Не удалось подключить VK-сообщество');
+      const reason =
+        err instanceof AppException
+          ? err.message
+          : 'Не удалось подключить сообщество';
+      // Токен в форму не возвращаем — вводить заново. Он секрет, и его
+      // место не в перерисованной странице, которая осядет в истории
+      // браузера и в кэше.
+      res.redirect(
+        `${PANEL_PREFIX}/groups?flash=group-failed&reason=${encodeURIComponent(reason)}`,
+      );
+    }
+  }
+
+  @Post('groups/:id/confirm')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('groups_pendingMax_review')
+  async confirmGroup(
+    @Param('id') id: string,
+    @Body() body: { tags?: string },
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.groups.confirmMaxGroup(id, parseTags(body.tags));
+    res.redirect(`${PANEL_PREFIX}/groups?flash=group-confirmed`);
+  }
+
+  @Post('groups/:id/reject')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('groups_pendingMax_review')
+  async rejectGroup(
+    @Param('id') id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.groups.rejectMaxGroup(id);
+    res.redirect(`${PANEL_PREFIX}/groups?flash=group-rejected-ok`);
+  }
+
+  @Post('groups/:id/tags')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('groups_tags_edit')
+  async updateTags(
+    @Param('id') id: string,
+    @Body() body: { tags?: string },
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.groups.updateTags(id, parseTags(body.tags));
+    res.redirect(`${PANEL_PREFIX}/groups?flash=tags-saved`);
+  }
+
+  @Post('groups/:id/deactivate')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('groups_manage')
+  async deactivateGroup(
+    @Param('id') id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.groups.deactivate(id);
+    res.redirect(`${PANEL_PREFIX}/groups?flash=group-off`);
+  }
+
   // ----- создание поста ---------------------------------------------------
 
   @Get('posts/new')
@@ -431,10 +543,23 @@ export class PanelController {
     admin: AdminUser | null,
     active = '',
     flash?: string,
+    reason?: string,
   ) {
+    // Права уезжают в шаблон, чтобы он не рисовал того, чего человеку
+    // нельзя: кнопка, которая всегда возвращает «недостаточно прав», — это
+    // приглашение на ошибку, а не защита.
+    const permissions = admin
+      ? effectivePermissions({
+          id: admin.id,
+          role: admin.role,
+          extraPermissions: admin.extraPermissions,
+        })
+      : new Set<Permission>();
+
     return {
       title,
       admin: admin ? { email: admin.email } : null,
+      can: (permission: Permission) => permissions.has(permission),
       active,
       // Значение берётся из куки: шаблон обязан положить его в скрытое поле,
       // а сторонний сайт прочитать чужую куку не может — в этом и смысл
@@ -444,6 +569,10 @@ export class PanelController {
       // унаследованное значение, и в шапке нарисовался бы пустой серый
       // баннер — ровно то, что список должен был исключить.
       flash: Object.hasOwn(FLASHES, flash ?? '') ? FLASHES[flash!] : null,
+      // Причина отказа приходит текстом в адресе, поэтому выводится
+      // отдельно и **только** экранированной: это единственное место, где
+      // в шаблон попадает строка из запроса.
+      flashReason: typeof reason === 'string' ? reason.slice(0, 300) : null,
     };
   }
 
@@ -489,7 +618,30 @@ function parseMinutes(raw: string | undefined): number | null {
 }
 
 /** Сообщения после редиректа: держим списком, чтобы не пускать текст из URL. */
-const FLASHES: Record<string, { kind: string; message: string }> = {
+export const FLASHES: Record<string, { kind: string; message: string }> = {
+  // Каждое действие обязано иметь свою запись: без неё `shell` отфильтрует
+  // ключ и страница перерисуется молча — отказ станет неотличим от успеха.
+  'nothing-selected': {
+    kind: 'warning',
+    message: 'Ни одна группа не отмечена — ничего не удалено',
+  },
+  'nothing-done': {
+    kind: 'info',
+    message: 'Нечего было обновлять: пост нигде не опубликован',
+  },
+  'bad-minutes': {
+    kind: 'danger',
+    message: 'Срок автоудаления — целое число минут от 1 до года',
+  },
+  'group-added': { kind: 'success', message: 'Сообщество подключено' },
+  'group-failed': {
+    kind: 'danger',
+    message: 'Не удалось подключить сообщество',
+  },
+  'group-confirmed': { kind: 'success', message: 'Группа подтверждена' },
+  'group-rejected-ok': { kind: 'info', message: 'Группа отклонена' },
+  'tags-saved': { kind: 'success', message: 'Теги сохранены' },
+  'group-off': { kind: 'warning', message: 'Группа отключена' },
   sent: { kind: 'success', message: 'Пост поставлен в отправку' },
   draft: { kind: 'info', message: 'Черновик сохранён' },
   stopped: { kind: 'warning', message: 'Рассылка остановлена' },
@@ -508,6 +660,26 @@ const FLASHES: Record<string, { kind: string; message: string }> = {
       'Не получилось ни в одной группе — смотрите ошибки в списке доставок',
   },
 };
+
+/**
+ * Теги из одного поля: «новости, акции» → `['новости', 'акции']`.
+ *
+ * Отдельным полем на тег было бы честнее по структуре, но на странице с
+ * десятком групп это десяток форм с динамическим добавлением строк — то
+ * есть JS, без которого панель по замыслу работает.
+ */
+export function parseTags(value: string | undefined): string[] {
+  // Повторы убираются: API их отвергает как `@ArrayUnique`, и панель не
+  // должна складывать в базу то, что тот же запрос через REST не принял бы.
+  return [
+    ...new Set(
+      (value ?? '')
+        .split(',')
+        .map((tag) => tag.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
 
 function asArray(value: string | string[] | undefined): string[] {
   if (value === undefined) return [];

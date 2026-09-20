@@ -1,4 +1,5 @@
 import type {
+  GroupStatus,
   PostDeliveryStatus,
   PostStatus,
 } from '../generated/prisma/client';
@@ -87,4 +88,28 @@ export function deliveryColor(delivery: DeliveryView): string {
     return 'dark';
   }
   return DELIVERY_COLORS[delivery.status] ?? 'secondary';
+}
+
+const GROUP_LABELS: Record<GroupStatus, string> = {
+  pending_confirmation: 'ждёт подтверждения',
+  active: 'активна',
+  token_invalid: 'токен не работает',
+  bot_removed: 'бот удалён',
+  removed: 'отключена',
+};
+
+const GROUP_COLORS: Record<GroupStatus, string> = {
+  pending_confirmation: 'yellow',
+  active: 'green',
+  token_invalid: 'red',
+  bot_removed: 'red',
+  removed: 'secondary',
+};
+
+export function groupLabel(status: GroupStatus): string {
+  return GROUP_LABELS[status] ?? status;
+}
+
+export function groupColor(status: GroupStatus): string {
+  return GROUP_COLORS[status] ?? 'secondary';
 }

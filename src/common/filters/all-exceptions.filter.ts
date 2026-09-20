@@ -56,6 +56,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
         active: '',
         csrfToken: '',
         flash: null,
+        flashReason: null,
         status,
         message: body.error.message,
       });
