@@ -34,11 +34,18 @@ import {
 } from '../auth/auth.cookies';
 import { readCookie } from '../auth/read-cookie';
 import { PostsService } from '../posts/posts.service';
+import { PostModerationService } from '../posts/post-moderation.service';
 import { GroupsService } from '../groups/groups.service';
 import { MediaService, MAX_FILE_BYTES } from '../media/media.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { AdminUser } from '../generated/prisma/client';
-import { statusColor, statusLabel, formatDate } from './view-helpers';
+import {
+  deliveryColor,
+  deliveryLabel,
+  formatDate,
+  statusColor,
+  statusLabel,
+} from './view-helpers';
 import { zonedToUtc } from './zoned-time';
 
 /**
@@ -52,6 +59,7 @@ export class PanelController {
   constructor(
     private readonly auth: AuthService,
     private readonly posts: PostsService,
+    private readonly moderation: PostModerationService,
     private readonly groups: GroupsService,
     private readonly media: MediaService,
     private readonly prisma: PrismaService,
@@ -139,6 +147,107 @@ export class PanelController {
       statusLabel,
       formatDate,
     };
+  }
+
+  @Get('campaigns/:id')
+  @Render('layout')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  async campaign(
+    @Param('id') id: string,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Query('flash') flash?: string,
+  ) {
+    const post = await this.posts.getPostWithDeliveries(id);
+    return {
+      ...this.shell(req, 'Кампания', admin, 'campaigns', flash),
+      page: 'campaign',
+      post,
+      // Править и удалять можно только там, где пост действительно вышел и
+      // ещё не удалён: предлагать это для остальных групп — приглашать на
+      // кнопку, которая вернёт ошибку.
+      publishedGroups: post.deliveries
+        // Условия те же, что в `publishedDeliveries`: доставка без id
+        // сообщения сервису не подходит, и предложить её галочкой значило
+        // бы привести человека на ошибку вместо действия.
+        .filter(
+          (d) => d.status === 'sent' && !d.deletedAt && d.externalMessageId,
+        )
+        .map((d) => d.group),
+      formatDate,
+      statusColor,
+      statusLabel,
+      deliveryColor,
+      deliveryLabel,
+    };
+  }
+
+  @Post('campaigns/:id/edit-published')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async editPublished(
+    @Param('id') id: string,
+    @Body()
+    body: {
+      text?: string;
+      vkTextOverride?: string;
+      maxTextOverride?: string;
+      autoDeleteAfterMinutes?: string;
+    },
+    @Res() res: Response,
+  ): Promise<void> {
+    let autoDeleteAfterMinutes: number | null;
+    try {
+      autoDeleteAfterMinutes = parseMinutes(body.autoDeleteAfterMinutes);
+    } catch {
+      // Проверяем **до** обращения к сервису: тот сначала останавливает
+      // идущую рассылку, и падение после этого оставило бы кампанию
+      // остановленной с неизменённым текстом.
+      res.redirect(`${PANEL_PREFIX}/campaigns/${id}?flash=bad-minutes`);
+      return;
+    }
+
+    const outcome = await this.moderation.editPublished(id, {
+      text: body.text,
+      // Поля формы — полная правда о тексте. Не передай их — и правка
+      // отрапортовала бы об успехе, пока VK показывает старое
+      // переопределение, которого в панели даже не видно.
+      vkTextOverride: body.vkTextOverride?.trim() || null,
+      maxTextOverride: body.maxTextOverride?.trim() || null,
+      // Пустое поле означает «не удалять автоматически». Абсолютный срок
+      // снимается тоже: он приоритетнее относительного, и без этого
+      // очищенное поле не отменяло бы удаление, назначенное через API.
+      autoDeleteAfterMinutes,
+      autoDeleteAt: null,
+    });
+    res.redirect(
+      `${PANEL_PREFIX}/campaigns/${id}?flash=${outcomeFlash(outcome, 'edited')}`,
+    );
+  }
+
+  @Post('campaigns/:id/delete-published')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async deletePublished(
+    @Param('id') id: string,
+    @Body() body: { groupIds?: string | string[] },
+    @Res() res: Response,
+  ): Promise<void> {
+    const groupIds = asArray(body.groupIds);
+    if (groupIds.length === 0) {
+      // Браузер не присылает снятые галочки вовсе, а для сервиса пустой
+      // список значит «во всех группах». Без этой проверки снятие всех
+      // галочек удаляло бы пост отовсюду — ровно наоборот задуманному,
+      // необратимо, да ещё и с рапортом «удалено из выбранных».
+      res.redirect(`${PANEL_PREFIX}/campaigns/${id}?flash=nothing-selected`);
+      return;
+    }
+
+    const outcome = await this.moderation.deletePublished(id, groupIds);
+    res.redirect(
+      `${PANEL_PREFIX}/campaigns/${id}?flash=${outcomeFlash(outcome, 'deleted')}`,
+    );
   }
 
   @Post('campaigns/:id/send')
@@ -343,6 +452,42 @@ export class PanelController {
   }
 }
 
+/**
+ * Какое сообщение показать после действия над опубликованным.
+ *
+ * Частичный отказ — обычное дело: в одной группе сообщение слишком старое,
+ * в другой VK не выдал прав. Показать «готово» в таком случае значило бы
+ * соврать, а показать «ошибка» — скрыть, что в остальных всё получилось.
+ */
+export function outcomeFlash(
+  outcome: { succeeded: number; failed: unknown[] },
+  ok: string,
+): string {
+  if (outcome.failed.length === 0) {
+    // Ноль успехов и ноль ошибок — это «делать было нечего», а не «готово».
+    // Случается, когда последнюю доставку удалили между отрисовкой страницы
+    // и отправкой формы.
+    return outcome.succeeded > 0 ? ok : 'nothing-done';
+  }
+  return outcome.succeeded > 0 ? 'partial' : 'failed';
+}
+
+/** Минуты автоудаления из формы. Бросает, если значение не годится. */
+function parseMinutes(raw: string | undefined): number | null {
+  const value = raw?.trim();
+  if (!value) {
+    return null;
+  }
+  const parsed = Number(value);
+  // `type="number"` и `min="1"` проверяют только браузер; подделанный или
+  // повторённый запрос дошёл бы до Prisma как NaN или дробь и вернулся
+  // пятисоткой вместо внятного отказа.
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 60 * 24 * 365) {
+    throw new Error('bad minutes');
+  }
+  return parsed;
+}
+
 /** Сообщения после редиректа: держим списком, чтобы не пускать текст из URL. */
 const FLASHES: Record<string, { kind: string; message: string }> = {
   sent: { kind: 'success', message: 'Пост поставлен в отправку' },
@@ -351,6 +496,17 @@ const FLASHES: Record<string, { kind: string; message: string }> = {
   resumed: { kind: 'success', message: 'Отправляем оставшимся' },
   uploaded: { kind: 'success', message: 'Вложение загружено' },
   'no-file': { kind: 'danger', message: 'Файл не выбран' },
+  edited: { kind: 'success', message: 'Текст обновлён во всех группах' },
+  deleted: { kind: 'success', message: 'Удалено из выбранных групп' },
+  partial: {
+    kind: 'warning',
+    message: 'Получилось не везде — смотрите ошибки в списке доставок',
+  },
+  failed: {
+    kind: 'danger',
+    message:
+      'Не получилось ни в одной группе — смотрите ошибки в списке доставок',
+  },
 };
 
 function asArray(value: string | string[] | undefined): string[] {

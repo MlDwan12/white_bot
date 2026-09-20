@@ -1,5 +1,12 @@
 import { PostStatus } from '../generated/prisma/enums';
-import { formatDate, statusColor, statusLabel } from './view-helpers';
+import { PostDeliveryStatus } from '../generated/prisma/enums';
+import {
+  deliveryColor,
+  deliveryLabel,
+  formatDate,
+  statusColor,
+  statusLabel,
+} from './view-helpers';
 
 describe('view-helpers', () => {
   it('has a label and a colour for every post status', () => {
@@ -20,6 +27,29 @@ describe('view-helpers', () => {
   it('formats a date the way a Russian reader expects', () => {
     expect(formatDate(new Date('2026-09-20T08:05:00Z'))).toMatch(
       /^20\.09\.2026/,
+    );
+  });
+
+  it('has a label and a colour for every delivery status', () => {
+    for (const status of Object.values(PostDeliveryStatus)) {
+      const delivery = { status, deletedAt: null, autoDeleteDueAt: null };
+      expect(deliveryLabel(delivery)).not.toBe(status);
+      expect(deliveryColor(delivery)).not.toBe('');
+    }
+  });
+
+  it('shows a deleted message as deleted, whatever its status was', () => {
+    // Удаление — не статус, а то, что случилось с сообщением после отправки.
+    // Факт отправки при этом остаётся историей, и статус его хранит.
+    const delivery = {
+      status: 'sent' as const,
+      deletedAt: new Date(),
+      autoDeleteDueAt: null,
+    };
+
+    expect(deliveryLabel(delivery)).toBe('удалено');
+    expect(deliveryColor(delivery)).not.toBe(
+      deliveryColor({ ...delivery, deletedAt: null }),
     );
   });
 });

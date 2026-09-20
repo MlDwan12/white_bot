@@ -39,6 +39,6 @@ import { AuthModule } from '../auth/auth.module';
     PostReconcilerService,
     PostModerationService,
   ],
-  exports: [PostsService, PostTemplatesService],
+  exports: [PostsService, PostTemplatesService, PostModerationService],
 })
 export class PostsModule {}

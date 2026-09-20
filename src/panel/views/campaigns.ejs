@@ -25,7 +25,9 @@
           <% campaigns.forEach(function (c) { %>
             <tr>
               <td>
-                <div class="text-truncate" style="max-width: 32rem"><%= c.text %></div>
+                <a class="text-reset text-decoration-none" href="/panel/campaigns/<%= c.id %>">
+                  <div class="text-truncate" style="max-width: 32rem"><%= c.text %></div>
+                </a>
                 <div class="text-secondary small"><%= formatDate(c.createdAt) %></div>
               </td>
               <td><span class="badge bg-<%= statusColor(c.status) %>"><%= statusLabel(c.status) %></span></td>

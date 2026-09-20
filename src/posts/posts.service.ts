@@ -513,6 +513,7 @@ export class PostsService {
       where: { id },
       include: {
         deliveries: {
+          orderBy: { group: { title: 'asc' } },
           select: {
             id: true,
             status: true,
@@ -520,8 +521,16 @@ export class PostsService {
             error: true,
             sentAt: true,
             attemptsMade: true,
+            // Панели нужно показать, что с опубликованным сообщением стало
+            // дальше: удалено руками, удалится само или висит как есть.
+            deletedAt: true,
+            autoDeleteDueAt: true,
             group: { select: { id: true, title: true, platform: true } },
           },
+        },
+        attachments: {
+          orderBy: { position: 'asc' },
+          include: { mediaAsset: { select: { id: true, filename: true } } },
         },
       },
     });
