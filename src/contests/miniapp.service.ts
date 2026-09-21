@@ -3,10 +3,8 @@ import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { PrismaService } from '../prisma/prisma.service';
 import { PostSender } from '../posts/post-sender';
-import {
-  ContestParticipationService,
-  type PlatformUserProfile,
-} from './contest-participation.service';
+import { type PlatformUserProfile } from '../platform-users/platform-users.service';
+import { ContestParticipationService } from './contest-participation.service';
 import { ContestView, ContestWinnerView, shortenName } from './contest-view';
 
 export interface MiniAppViewer {
@@ -89,6 +87,15 @@ export class MiniAppService {
         throw new AppException(
           ErrorCode.CONTEST_ALREADY_DRAWN,
           'Розыгрыш уже проведён — участвовать поздно',
+        );
+      case 'consent_required':
+        // Мини-приложение сейчас не запускается без диалога с ботом
+        // (заблокировано доступом к настройкам партнёра), но проверка
+        // здесь на случай, когда это изменится: без неё участие записалось
+        // бы в обход экрана согласия, который показывает только бот.
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Нужно сначала открыть диалог с ботом и подтвердить согласие на обработку персональных данных',
         );
       default:
         // `joined` и `already_joined`: человек в конкурсе, и правильный

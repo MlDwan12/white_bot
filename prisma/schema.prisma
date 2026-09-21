@@ -343,6 +343,11 @@ model PlatformUser {
   profile        Json?
   firstSeenAt    DateTime @default(now())
   lastSeenAt     DateTime @default(now())
+  /// Когда человек нажал «Продолжить» на экране согласия на обработку
+  /// персональных данных (152-ФЗ, требование MAX). `null` — согласия ещё
+  /// нет, и любое действие бота в личном диалоге сначала показывает этот
+  /// экран вместо того, ради чего человек пришёл.
+  consentedAt    DateTime?
 
   contestEntries ContestParticipant[]
 

@@ -1,6 +1,7 @@
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client';
+import { PlatformUsersService } from '../platform-users/platform-users.service';
 import { ContestParticipationService } from './contest-participation.service';
 
 const CONTEST_ID = '11111111-1111-4111-8111-111111111111';
@@ -36,9 +37,6 @@ function setup(contest: ReturnType<typeof contestRow> | null = contestRow()) {
   const prisma = {
     contest: { findUnique: jest.fn().mockResolvedValue(contest) },
     group: { findUnique: jest.fn().mockResolvedValue({ id: 'group-1' }) },
-    platformUser: {
-      upsert: jest.fn().mockResolvedValue({ id: 'pu-1' }),
-    },
     contestParticipant: {
       create: jest.fn().mockResolvedValue({ id: 'participant-1' }),
       count: jest.fn().mockResolvedValue(3),
@@ -46,12 +44,19 @@ function setup(contest: ReturnType<typeof contestRow> | null = contestRow()) {
     contestPrize: { findMany: jest.fn().mockResolvedValue([]) },
     postDelivery: { findMany: jest.fn().mockResolvedValue([]) },
   };
+  const platformUsers = {
+    upsert: jest.fn().mockResolvedValue({ id: 'pu-1' }),
+    // По умолчанию — уже согласившийся человек: сам шлюз согласия
+    // проверяется отдельными тестами ниже.
+    hasConsented: jest.fn().mockResolvedValue(true),
+  };
   const logger = { setContext: jest.fn(), info: jest.fn(), warn: jest.fn() };
   const service = new ContestParticipationService(
     prisma as unknown as PrismaService,
+    platformUsers as unknown as PlatformUsersService,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma };
+  return { service, prisma, platformUsers };
 }
 
 const request = () => ({
@@ -71,18 +76,34 @@ const request = () => ({
 
 describe('ContestParticipationService.join', () => {
   it('registers a participant and links them to a stored profile', async () => {
-    const { service, prisma } = setup();
+    const { service, prisma, platformUsers } = setup();
 
     const outcome = await service.join(request());
 
     expect(outcome.status).toBe('joined');
-    expect(prisma.platformUser.upsert).toHaveBeenCalled();
+    expect(platformUsers.upsert).toHaveBeenCalled();
     const { data } = callArg<{
       data: { platformUserId: string; groupId: string; source: string };
     }>(prisma.contestParticipant.create);
     expect(data.platformUserId).toBe('pu-1');
     expect(data.groupId).toBe('group-1');
     expect(data.source).toBe('button');
+  });
+
+  it('без согласия отказывает и не пишет ни профиль, ни участие', async () => {
+    // Единственная точка входа, которая реально сохраняет профиль и
+    // записывает участие: обязана отказать до записи, а не только когда её
+    // зовут из обработчика, явно показывающего экран согласия. Иначе кнопка
+    // прямо под постом в канале (без диалога с ботом) записывала бы участие
+    // в обход согласия целиком.
+    const { service, prisma, platformUsers } = setup();
+    platformUsers.hasConsented.mockResolvedValue(false);
+
+    const outcome = await service.join(request());
+
+    expect(outcome.status).toBe('consent_required');
+    expect(platformUsers.upsert).not.toHaveBeenCalled();
+    expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
   });
 
   it('treats a repeat press as "already joined" rather than an error', async () => {

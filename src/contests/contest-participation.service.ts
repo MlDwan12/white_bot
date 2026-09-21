@@ -4,6 +4,10 @@ import { PrismaService } from '../prisma/prisma.service';
 import { Contest, Platform, Post, Prisma } from '../generated/prisma/client';
 import { PostSender } from '../posts/post-sender';
 import {
+  PlatformUsersService,
+  type PlatformUserProfile,
+} from '../platform-users/platform-users.service';
+import {
   announcementText,
   contestJoinPayload,
   joinButtonText,
@@ -12,7 +16,12 @@ import {
 import { buildDedupKey } from './contest-participants';
 
 export type JoinStatus =
-  'joined' | 'already_joined' | 'not_open' | 'drawn' | 'unknown_contest';
+  | 'joined'
+  | 'already_joined'
+  | 'not_open'
+  | 'drawn'
+  | 'unknown_contest'
+  | 'consent_required';
 
 /**
  * Чем перерисовать анонс после нажатия. Ответ на колбэк в MAX всегда
@@ -43,18 +52,6 @@ export interface StartedFromLink {
   joined: boolean;
 }
 
-/** Профиль, как его отдала платформа в момент нажатия. */
-export interface PlatformUserProfile {
-  externalUserId: string;
-  displayName: string;
-  firstName?: string | null;
-  lastName?: string | null;
-  username?: string | null;
-  isBot?: boolean;
-  /** Полный ответ платформы — хранится как есть, про запас. */
-  raw?: unknown;
-}
-
 export interface JoinRequest {
   contestId: string;
   platform: Platform;
@@ -81,6 +78,7 @@ export interface JoinRequest {
 export class ContestParticipationService {
   constructor(
     private readonly prisma: PrismaService,
+    private readonly platformUsers: PlatformUsersService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(ContestParticipationService.name);
@@ -124,6 +122,26 @@ export class ContestParticipationService {
       };
     }
 
+    // Единая точка: `join` — единственное место, которое действительно
+    // сохраняет профиль и записывает участие, и все три пути к нему (старт
+    // бота по ссылке, кнопка прямо под постом в канале, мини-приложение)
+    // обязаны пройти эту проверку — а не только тот, что явно показывает
+    // экран согласия. Без неё кнопка в канале записывала бы участие и
+    // профиль, минуя согласие целиком. Проверяется до похода за группой:
+    // без согласия эта группа всё равно не понадобится.
+    if (
+      !(await this.platformUsers.hasConsented(
+        request.platform,
+        request.user.externalUserId,
+      ))
+    ) {
+      return {
+        status: 'consent_required',
+        message:
+          'Чтобы участвовать, сначала откройте диалог с ботом («Начать») и подтвердите согласие на обработку персональных данных.',
+      };
+    }
+
     const group = request.groupExternalId
       ? await this.prisma.group.findUnique({
           where: {
@@ -145,7 +163,7 @@ export class ContestParticipationService {
 
     // Профиль заводится до записи в конкурс и обновляется при каждом
     // нажатии: человек мог сменить имя или username с прошлого раза.
-    const platformUser = await this.upsertPlatformUser(
+    const platformUser = await this.platformUsers.upsert(
       request.platform,
       request.user,
     );
@@ -182,43 +200,6 @@ export class ContestParticipationService {
       message,
       refresh: await this.buildRefresh(contest, contest.joinButtonLabel, true),
     };
-  }
-
-  /**
-   * Профиль человека, участвовавшего хотя бы раз. Живёт отдельно от записи в
-   * конкурсе: конкурс можно удалить, а знание о человеке остаётся.
-   */
-  private async upsertPlatformUser(
-    platform: Platform,
-    user: PlatformUserProfile,
-  ): Promise<{ id: string }> {
-    const profile = {
-      displayName: user.displayName,
-      firstName: user.firstName ?? null,
-      lastName: user.lastName ?? null,
-      username: user.username ?? null,
-      isBot: user.isBot ?? false,
-      // Prisma не принимает голый `null` в Json-колонку — для «ничего нет»
-      // у неё отдельное значение. Без этого любой вызов без сырого профиля
-      // падал бы уже в рантайме.
-      profile: (user.raw ?? Prisma.DbNull) as Prisma.InputJsonValue,
-    };
-
-    return this.prisma.platformUser.upsert({
-      where: {
-        platform_externalUserId: {
-          platform,
-          externalUserId: user.externalUserId,
-        },
-      },
-      create: {
-        platform,
-        externalUserId: user.externalUserId,
-        ...profile,
-      },
-      update: { ...profile, lastSeenAt: new Date() },
-      select: { id: true },
-    });
   }
 
   /**

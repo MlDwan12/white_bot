@@ -3,6 +3,7 @@ import { PinoLogger } from 'nestjs-pino';
 import { GroupsService, PublicGroup } from '../groups/groups.service';
 import { MaxAdminResolver } from './max-admin.resolver';
 import { ContestParticipationService } from '../contests/contest-participation.service';
+import { PlatformUsersService } from '../platform-users/platform-users.service';
 import { MaxApiClient } from './max-api.client';
 import { MaxBotHandlers, groupReviewPayload } from './max-bot.handlers';
 
@@ -125,16 +126,34 @@ function setup() {
     markWinnersNotified: jest.fn().mockResolvedValue(undefined),
   };
 
+  // По умолчанию — уже согласившийся человек: так тесты, написанные до
+  // экрана согласия, проверяют то же самое поведение без лишней возни с
+  // ним, а сам шлюз проверяется отдельными тестами ниже.
+  const platformUsers = {
+    hasConsented: jest.fn().mockResolvedValue(true),
+    recordConsent: jest.fn().mockResolvedValue(undefined),
+  };
+
   const handlers = new MaxBotHandlers(
     harness.bot,
     groups as unknown as GroupsService,
     admins as unknown as MaxAdminResolver,
     contests as unknown as ContestParticipationService,
+    platformUsers as unknown as PlatformUsersService,
     api as unknown as MaxApiClient,
     logger as unknown as PinoLogger,
   );
   handlers.register();
-  return { harness, groups, admins, contests, api, logger, handlers };
+  return {
+    harness,
+    groups,
+    admins,
+    contests,
+    platformUsers,
+    api,
+    logger,
+    handlers,
+  };
 }
 
 describe('MaxBotHandlers', () => {
@@ -145,6 +164,7 @@ describe('MaxBotHandlers', () => {
       {} as GroupsService,
       {} as MaxAdminResolver,
       {} as ContestParticipationService,
+      {} as PlatformUsersService,
       {} as MaxApiClient,
       logger,
     );
@@ -600,6 +620,146 @@ describe('MaxBotHandlers', () => {
     });
   });
 
+  describe('экран согласия перед стартом', () => {
+    const CONTEST = '11111111-1111-4111-8111-111111111111';
+    const started = (payload: string | null | undefined) => ({
+      update: {
+        payload,
+        user: { user_id: 42, first_name: 'Иван', last_name: 'Иванов' },
+        chat_id: 900,
+      },
+    });
+
+    it('без согласия — экран вместо участия, даже по ссылке конкурса', async () => {
+      const { harness, api, contests, platformUsers } = setup();
+      platformUsers.hasConsented.mockResolvedValue(false);
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(contests.startedFromLink).not.toHaveBeenCalled();
+      expect(api.sendMessageToChat).toHaveBeenCalledTimes(1);
+      const [chatId, text, options] = api.sendMessageToChat.mock.calls[0] as [
+        number,
+        string,
+        { buttons: { type: string; payload?: string }[][] },
+      ];
+      expect(chatId).toBe(900);
+      expect(text).toContain('согласие');
+      // Исходное намерение (метка конкурса) едет внутри кнопки — иначе после
+      // согласия участие было бы негде продолжить.
+      expect(options.buttons.at(-1)?.[0]).toMatchObject({
+        type: 'callback',
+        payload: `consent:c_${CONTEST}`,
+      });
+    });
+
+    it('без согласия и без метки — тот же экран, не молчание', async () => {
+      const { harness, api, contests, platformUsers } = setup();
+      platformUsers.hasConsented.mockResolvedValue(false);
+
+      await harness.fire('bot_started', started(null));
+
+      expect(contests.startedFromLink).not.toHaveBeenCalled();
+      expect(api.sendMessageToChat).toHaveBeenCalledTimes(1);
+    });
+
+    it('нажатие «Продолжить» отмечает согласие и продолжает участие в конкурсе', async () => {
+      const { harness, api, contests, platformUsers } = setup();
+
+      await harness.fireAction(`consent:c_${CONTEST}`, {
+        user: { user_id: 42, first_name: 'Иван' },
+        callback: { callback_id: 'cb-consent' },
+        chatId: 900,
+      });
+
+      expect(platformUsers.recordConsent).toHaveBeenCalledWith(
+        'max',
+        expect.objectContaining({ externalUserId: '42' }),
+      );
+      // Ответ на колбэк заменяет экран согласия — без него клиент ждал бы
+      // ответа вечно.
+      expect(api.answerCallback).toHaveBeenCalledWith(
+        'cb-consent',
+        expect.any(String),
+      );
+      // И тут же — то самое участие, ради которого человек пришёл.
+      expect(contests.startedFromLink).toHaveBeenCalledWith(
+        CONTEST,
+        expect.objectContaining({ externalUserId: '42' }),
+      );
+    });
+
+    it('нажатие «Продолжить» без исходной метки просто подтверждает согласие', async () => {
+      const { harness, api, contests, platformUsers } = setup();
+
+      await harness.fireAction('consent:', {
+        user: { user_id: 42, first_name: 'Иван' },
+        callback: { callback_id: 'cb-consent' },
+        chatId: 900,
+      });
+
+      expect(platformUsers.recordConsent).toHaveBeenCalled();
+      expect(api.answerCallback).toHaveBeenCalled();
+      expect(contests.startedFromLink).not.toHaveBeenCalled();
+    });
+
+    it('пустой chatId у колбэка согласия — не роняет обработчик и оставляет след в логе', async () => {
+      // Не должно случаться (колбэк приходит из уже открытого диалога), но
+      // если всё же произошло — согласие уже отмечено, и молчание было бы
+      // хуже: исходное действие потерялось бы без единой строчки в логе.
+      const { harness, api, contests, platformUsers, logger } = setup();
+
+      await expect(
+        harness.fireAction(`consent:c_${CONTEST}`, {
+          user: { user_id: 42, first_name: 'Иван' },
+          callback: { callback_id: 'cb-consent' },
+          chatId: null,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(platformUsers.recordConsent).toHaveBeenCalled();
+      expect(api.answerCallback).toHaveBeenCalled();
+      expect(contests.startedFromLink).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalled();
+    });
+
+    it('сбой проверки согласия не роняет обработчик, а отвечает в диалоге', async () => {
+      // Без этого сбой БД ронял бы старт целиком: ни экрана согласия, ни
+      // участия, ни единого слова человеку.
+      const { harness, api, platformUsers, logger } = setup();
+      platformUsers.hasConsented.mockRejectedValue(new Error('db down'));
+
+      await expect(
+        harness.fire('bot_started', started(`c_${CONTEST}`)),
+      ).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalled();
+      expect(api.sendMessageToChat).toHaveBeenCalledWith(
+        900,
+        expect.stringContaining('ещё раз'),
+      );
+    });
+
+    it('сбой записи согласия не роняет обработчик, а подтверждает клик', async () => {
+      // Клик всё равно надо подтвердить — иначе клиент ждёт вечно, тот же
+      // принцип, что и у остальных обработчиков колбэков в этом файле.
+      const { harness, api, contests, platformUsers, logger } = setup();
+      platformUsers.recordConsent.mockRejectedValue(new Error('db down'));
+
+      await expect(
+        harness.fireAction(`consent:c_${CONTEST}`, {
+          user: { user_id: 42, first_name: 'Иван' },
+          callback: { callback_id: 'cb-consent' },
+          chatId: 900,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalled();
+      expect(api.answerCallback).toHaveBeenCalledWith('cb-consent', undefined);
+      expect(contests.startedFromLink).not.toHaveBeenCalled();
+    });
+  });
+
   describe('ответ на нажатие «Участвовать» в старом посте', () => {
     const CONTEST = '11111111-1111-4111-8111-111111111111';
 
@@ -635,6 +795,30 @@ describe('MaxBotHandlers', () => {
           },
         ],
       ]);
+    });
+
+    it('без согласия не переписывает анонс, а объясняет в личке — если получится', async () => {
+      // Кнопка прямо под постом (без диалога с ботом) — единственный путь,
+      // где показать экран согласия негде: ответ на колбэк заменяет общий
+      // для всех пост, а не личное сообщение. Счётчик остаётся как был.
+      const { harness, api, contests } = setup();
+      contests.join.mockResolvedValue({
+        status: 'consent_required',
+        message: 'Чтобы участвовать, сначала откройте диалог с ботом.',
+      });
+
+      await harness.fireAction(`contest:join:${CONTEST}`, {
+        user: { user_id: 42, first_name: 'Иван' },
+        callback: { callback_id: 'cb-1' },
+        chatId: 900,
+        update: { message: { body: { attachments: [] } } },
+      });
+
+      expect(api.answerCallback).toHaveBeenCalledWith('cb-1', undefined);
+      expect(api.sendMessageToUser).toHaveBeenCalledWith(
+        42,
+        'Чтобы участвовать, сначала откройте диалог с ботом.',
+      );
     });
   });
 });

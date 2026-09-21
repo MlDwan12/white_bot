@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { PrismaModule } from '../prisma/prisma.module';
 import { GroupsModule } from '../groups/groups.module';
 import { ContestParticipationModule } from '../contests/contest-participation.module';
+import { PlatformUsersModule } from '../platform-users/platform-users.module';
 import { MaxAdminResolver } from './max-admin.resolver';
 import { MaxApiClient } from './max-api.client';
 import { maxBotProvider } from './max-bot.provider';
@@ -10,7 +11,12 @@ import { MaxPollingWorker } from './max-polling.worker';
 import { MaxWebAppGuard } from './max-webapp.guard';
 
 @Module({
-  imports: [PrismaModule, GroupsModule, ContestParticipationModule],
+  imports: [
+    PrismaModule,
+    GroupsModule,
+    ContestParticipationModule,
+    PlatformUsersModule,
+  ],
   providers: [
     maxBotProvider,
     MaxApiClient,

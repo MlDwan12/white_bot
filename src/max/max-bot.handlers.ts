@@ -8,15 +8,23 @@ import { MaxApiClient } from './max-api.client';
 import {
   ContestParticipationService,
   type JoinOutcome,
-  type PlatformUserProfile,
   type StartedFromLink,
 } from '../contests/contest-participation.service';
+import {
+  PlatformUsersService,
+  type PlatformUserProfile,
+} from '../platform-users/platform-users.service';
 import {
   CONTEST_JOIN_PAYLOAD,
   CONTEST_START_PAYLOAD,
   contestDmUrl,
   contestKeyboard,
 } from '../contests/contest-button';
+import {
+  CONSENT_ACCEPT_PAYLOAD,
+  CONSENT_TEXT,
+  consentKeyboard,
+} from './consent-gate';
 import {
   toRequestAttachments,
   unsupportedAttachmentTypes,
@@ -79,6 +87,7 @@ export class MaxBotHandlers {
     private readonly groups: GroupsService,
     private readonly admins: MaxAdminResolver,
     private readonly contests: ContestParticipationService,
+    private readonly platformUsers: PlatformUsersService,
     private readonly api: MaxApiClient,
     private readonly logger: PinoLogger,
   ) {
@@ -132,6 +141,16 @@ export class MaxBotHandlers {
 
     bot.on('bot_removed', async (ctx) => {
       await this.handleBotRemoved(ctx.chatId);
+    });
+
+    bot.action(CONSENT_ACCEPT_PAYLOAD, async (ctx) => {
+      const resumePayload = ctx.match?.[1] ?? '';
+      await this.handleConsentAccepted(
+        resumePayload,
+        ctx.user,
+        ctx.chatId,
+        ctx.callback.callback_id,
+      );
     });
 
     bot.action(CONTEST_JOIN_PAYLOAD, async (ctx) => {
@@ -307,17 +326,111 @@ export class MaxBotHandlers {
   }
 
   /**
-   * Человек перешёл по ссылке с кнопки конкурса. Метку разбираем только у
-   * нашей ссылки; любой другой старт (без метки или с чужой) остаётся как
-   * был — молчим, а не отвечаем незнакомцу про конкурс, которого он не
-   * выбирал.
+   * Человек попал в диалог с ботом — по ссылке конкурса (`payload` несёт
+   * метку `c_<uuid>`) или обычным «Начать» через поиск (`payload` пуст).
+   * Оба пути обязаны сначала пройти экран согласия на обработку
+   * персональных данных (152-ФЗ, требование MAX) — без него дальше не
+   * идём, а `payload` едет в кнопке «Продолжить», чтобы после согласия
+   * сразу выполнить то, ради чего человек пришёл.
    */
   private async handleBotStarted(
     payload: string | null | undefined,
     user: MaxUserLike,
     chatId: number,
   ): Promise<void> {
-    const contestId = CONTEST_START_PAYLOAD.exec(payload ?? '')?.[1];
+    const resumePayload = payload ?? '';
+    let consented: boolean;
+    try {
+      consented = await this.platformUsers.hasConsented(
+        'max',
+        String(user.user_id),
+      );
+    } catch (err: unknown) {
+      // Без этого сбой БД молча ронял бы весь старт: ни экрана согласия, ни
+      // участия, ни единого слова человеку — тот же класс отказа, что и в
+      // handleContestJoin, только раньше по конвейеру.
+      this.logger.error(
+        { err, userId: user.user_id },
+        'Не удалось проверить согласие при старте бота',
+      );
+      await this.replyBestEffort(
+        chatId,
+        'Не получилось обработать запуск. Нажмите «Начать» ещё раз.',
+        resumePayload,
+        user.user_id,
+      );
+      return;
+    }
+    if (!consented) {
+      await this.sendConsentGate(chatId, resumePayload);
+      return;
+    }
+    await this.proceedAfterStart(resumePayload, user, chatId);
+  }
+
+  /** Экран согласия — сообщение с двумя ссылками на документы и кнопкой «Продолжить». */
+  private async sendConsentGate(
+    chatId: number,
+    resumePayload: string,
+  ): Promise<void> {
+    await this.api.sendMessageToChat(chatId, CONSENT_TEXT, {
+      buttons: consentKeyboard(resumePayload),
+    });
+  }
+
+  /**
+   * Нажатие «Продолжить». Ответ на колбэк заменяет сообщение целиком (в
+   * MAX нет всплывающих уведомлений), поэтому экран согласия сменяется
+   * коротким подтверждением, а исходное действие уходит отдельным
+   * сообщением через `proceedAfterStart` — тем же путём, что и без
+   * экрана согласия.
+   */
+  private async handleConsentAccepted(
+    resumePayload: string,
+    user: MaxUserLike,
+    chatId: number | null | undefined,
+    callbackId: string,
+  ): Promise<void> {
+    try {
+      await this.platformUsers.recordConsent('max', toProfile(user));
+    } catch (err: unknown) {
+      // Клик всё равно надо подтвердить — иначе клиент будет ждать вечно,
+      // тот же принцип, что и у handleContestJoin/handleGroupReview. Пустой
+      // ответ безопаснее замены: экран согласия остаётся как есть, и кнопку
+      // можно нажать ещё раз.
+      this.logger.error(
+        { err, userId: user.user_id },
+        'Не удалось записать согласие на обработку персональных данных',
+      );
+      await this.safeAnswer(callbackId);
+      return;
+    }
+    await this.safeAnswer(callbackId, 'Спасибо! Согласие принято.');
+    if (chatId == null) {
+      // Не должно случаться — колбэк пришёл из уже открытого диалога, и
+      // MAX сам его туда адресовал. Если всё же происходит, молчать нельзя:
+      // согласие отмечено, а то, ради чего человек пришёл (например,
+      // участие в конкурсе), без лога терялось бы без единого следа.
+      this.logger.warn(
+        { userId: user.user_id, resumePayload },
+        'У колбэка согласия пуст chatId — исходное действие не выполнено',
+      );
+      return;
+    }
+    await this.proceedAfterStart(resumePayload, user, chatId);
+  }
+
+  /**
+   * Метку разбираем только у нашей ссылки; любой другой старт (без метки
+   * или с чужой) остаётся как был — молчим, а не отвечаем незнакомцу про
+   * конкурс, которого он не выбирал.
+   */
+  private async proceedAfterStart(
+    payload: string,
+    user: MaxUserLike,
+    chatId: number,
+  ): Promise<void> {
+    const contestId = CONTEST_START_PAYLOAD.exec(payload)?.[1];
     if (!contestId) {
       return;
     }

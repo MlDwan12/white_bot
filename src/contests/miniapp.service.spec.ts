@@ -206,6 +206,18 @@ describe('MiniAppService.join', () => {
     });
   });
 
+  it('refuses to report success without consent to processing personal data', async () => {
+    const { service, participation } = setup();
+    participation.join.mockResolvedValue({
+      status: 'consent_required',
+      message: 'нужно согласие',
+    });
+
+    await expect(service.join(CONTEST_ID, viewer())).rejects.toMatchObject({
+      code: ErrorCode.VALIDATION_ERROR,
+    });
+  });
+
   it('reports a vanished contest as not found', async () => {
     const { service, participation } = setup();
     participation.join.mockResolvedValue({

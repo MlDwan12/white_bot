@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from '../prisma/prisma.module';
+import { PlatformUsersModule } from '../platform-users/platform-users.module';
 import { ContestParticipationService } from './contest-participation.service';
 
 /**
@@ -9,7 +10,7 @@ import { ContestParticipationService } from './contest-participation.service';
  * образом — так граф модулей остаётся ацикличным.
  */
 @Module({
-  imports: [PrismaModule],
+  imports: [PrismaModule, PlatformUsersModule],
   providers: [ContestParticipationService],
   exports: [ContestParticipationService],
 })
