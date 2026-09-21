@@ -3,7 +3,11 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { BullModule } from '@nestjs/bullmq';
 import Redis from 'ioredis';
 import { GroupRateLimiter } from './group-rate-limiter';
-import { POST_DELIVERY_QUEUE, REDIS_CLIENT } from './queue.constants';
+import {
+  DIRECT_MESSAGE_QUEUE,
+  POST_DELIVERY_QUEUE,
+  REDIS_CLIENT,
+} from './queue.constants';
 
 /**
  * Queue infrastructure: the BullMQ connection, the delivery queue itself, and
@@ -30,6 +34,7 @@ import { POST_DELIVERY_QUEUE, REDIS_CLIENT } from './queue.constants';
       }),
     }),
     BullModule.registerQueue({ name: POST_DELIVERY_QUEUE }),
+    BullModule.registerQueue({ name: DIRECT_MESSAGE_QUEUE }),
   ],
   providers: [
     {

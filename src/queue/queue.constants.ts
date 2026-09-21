@@ -43,3 +43,15 @@ export function dispatchJobId(postId: string): string {
 export function deliverJobId(deliveryId: string): string {
   return `deliver-${deliveryId}`;
 }
+
+export const DIRECT_MESSAGE_QUEUE = 'direct-message-delivery';
+
+export const JOB_DELIVER_DIRECT_MESSAGE = 'deliver-direct-message';
+
+export interface DeliverDirectMessageJob {
+  deliveryId: string;
+}
+
+export function deliverDirectMessageJobId(deliveryId: string): string {
+  return `deliver-dm-${deliveryId}`;
+}

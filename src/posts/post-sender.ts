@@ -138,7 +138,10 @@ export class PostSender {
    * one post serve both "same text everywhere" and "tailored per platform"
    * without being two entities.
    */
-  static resolveText(post: Post, platform: Group['platform']): string {
+  static resolveText(
+    post: Pick<Post, 'text' | 'vkTextOverride' | 'maxTextOverride'>,
+    platform: Group['platform'],
+  ): string {
     const override =
       platform === 'vk' ? post.vkTextOverride : post.maxTextOverride;
     return override ?? post.text;

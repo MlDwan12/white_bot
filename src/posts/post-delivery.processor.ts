@@ -17,6 +17,7 @@ import { joinButtonText } from '../contests/contest-button';
 import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 import { classifyDeliveryError } from './delivery-outcome';
 import { autoDeleteDueAt } from './post-moderation.service';
+import { sleep } from '../common/sleep';
 
 /**
  * How many times a rate-limited delivery is re-attempted. Only rate limits get
@@ -382,8 +383,4 @@ export class PostDeliveryProcessor extends WorkerHost {
       'Доставка не выполнена',
     );
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

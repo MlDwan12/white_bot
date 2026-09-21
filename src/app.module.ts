@@ -14,6 +14,7 @@ import { QueueModule } from './queue/queue.module';
 import { PostsModule } from './posts/posts.module';
 import { MediaModule } from './media/media.module';
 import { ContestsModule } from './contests/contests.module';
+import { DirectMessagesModule } from './direct-messages/direct-messages.module';
 import { AuthModule } from './auth/auth.module';
 import { PanelModule } from './panel/panel.module';
 import { HealthController } from './health/health.controller';
@@ -39,6 +40,7 @@ import { buildPinoConfig } from './logger/pino-logger.config';
     MediaModule,
     PostsModule,
     ContestsModule,
+    DirectMessagesModule,
     AuthModule,
     PanelModule,
     // Ограничитель нужен прежде всего форме входа: argon2 намеренно
