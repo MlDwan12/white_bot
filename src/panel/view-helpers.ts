@@ -235,6 +235,7 @@ export function groupKindLabel(kind: string): string {
 const MEDIA_KIND_LABELS: Record<string, string> = {
   image: 'картинка',
   document: 'документ',
+  video: 'видео',
 };
 
 export function mediaKindLabel(kind: string): string {

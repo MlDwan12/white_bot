@@ -5,12 +5,13 @@ import { PrismaService } from '../prisma/prisma.service';
 import {
   Group,
   MediaAsset,
+  MediaKind,
   Platform,
   Prisma,
 } from '../generated/prisma/client';
 import { MediaService } from '../media/media.service';
 import { VkApiClient } from '../vk/vk-api.client';
-import { MaxApiClient } from '../max/max-api.client';
+import { MaxApiClient, MaxAttachmentInput } from '../max/max-api.client';
 import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 
 /**
@@ -99,7 +100,7 @@ export class AttachmentUploader {
         // document that name is what the recipient sees.
         this.media.withUploadPath(asset, async (source) => {
           const attachment = await this.max.uploadAttachment({
-            kind: asset.kind === 'image' ? 'image' : 'file',
+            kind: AttachmentUploader.maxUploadKind(asset.kind),
             source,
           });
           return JSON.stringify(attachment);
@@ -181,5 +182,22 @@ export class AttachmentUploader {
     return (
       platform === 'vk' || Date.now() - createdAt.getTime() < MAX_CACHE_TTL_MS
     );
+  }
+
+  /**
+   * MAX-вид вложения для конкретного метода загрузки (`uploadImage` /
+   * `uploadVideo` / `uploadFile`) — без него видео уходило бы файлом, не
+   * проигрывателем. `audio` наш конвейер не производит ни при каком
+   * `MediaKind`, поэтому недостижим и здесь.
+   */
+  private static maxUploadKind(kind: MediaKind): MaxAttachmentInput['kind'] {
+    switch (kind) {
+      case 'image':
+        return 'image';
+      case 'video':
+        return 'video';
+      case 'document':
+        return 'file';
+    }
   }
 }

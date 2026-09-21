@@ -20,6 +20,18 @@ const THUMBNAIL_MAX_SIZE = 200;
  */
 const ACCEPTED_IMAGE_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
 
+/**
+ * Video containers we accept — the common web-playable ones. Anything else
+ * (obscure containers, audio-only files with a video-ish signature) is left
+ * as a document rather than guessed at.
+ */
+const ACCEPTED_VIDEO_MIME = new Set([
+  'video/mp4',
+  'video/webm',
+  'video/quicktime',
+  'video/x-msvideo',
+]);
+
 const IMAGE_MIME: Record<string, string> = {
   jpeg: 'image/jpeg',
   png: 'image/png',
@@ -78,17 +90,37 @@ export class MediaService {
       orderBy: { createdAt: 'asc' },
     });
     if (existing) {
+      // Файл мог быть загружен как документ до появления вида `video`
+      // (или из-за более раннего бага в определении) — без этой проверки
+      // такая запись осталась бы документом навсегда: дедуп больше никогда
+      // не доходит до `probeVideo` для тех же самых байт.
+      if (existing.kind === 'document') {
+        const video = await MediaService.probeVideo(input.buffer);
+        if (video) {
+          return this.prisma.mediaAsset.update({
+            where: { id: existing.id },
+            data: { kind: 'video', mimeType: video.mimeType },
+          });
+        }
+      }
       return existing;
     }
 
     const image = await MediaService.probeImage(input.buffer);
-    const kind: MediaKind = image ? 'image' : 'document';
+    // Видео проверяется, только если это не картинка — оба пробника читают
+    // одни и те же байты, и гонять их оба на каждой картинке незачем.
+    const video = image ? null : await MediaService.probeVideo(input.buffer);
+    const kind: MediaKind = image ? 'image' : video ? 'video' : 'document';
     const mimeType = image
       ? IMAGE_MIME[image.format]
-      : (input.declaredMimeType ?? 'application/octet-stream');
+      : video
+        ? video.mimeType
+        : (input.declaredMimeType ?? 'application/octet-stream');
     const extension = image
       ? IMAGE_EXTENSION[image.format]
-      : MediaService.extensionOf(input.filename);
+      : video
+        ? video.extension
+        : MediaService.extensionOf(input.filename);
 
     const stored = await this.storage.write(input.buffer, extension);
     const optimized = image
@@ -206,6 +238,30 @@ export class MediaService {
       return format && ACCEPTED_IMAGE_FORMATS.has(format) ? { format } : null;
     } catch {
       // Not an image sharp can read — treated as a document, bytes untouched.
+      return null;
+    }
+  }
+
+  /**
+   * Identifies a video by its actual content (magic bytes), the same
+   * distrust-the-label principle as `probeImage`. `file-type` is ESM-only —
+   * imported dynamically rather than statically so Jest's CJS transform
+   * never has to touch it or its own ESM dependency chain (`strtok3` and
+   * friends); a real `node dist/main.js` process resolves a dynamic
+   * `import()` of an ESM package natively either way.
+   */
+  private static async probeVideo(
+    buffer: Buffer,
+  ): Promise<{ mimeType: string; extension: string } | null> {
+    try {
+      const { fileTypeFromBuffer } = await import('file-type');
+      const detected = await fileTypeFromBuffer(buffer);
+      return detected && ACCEPTED_VIDEO_MIME.has(detected.mime)
+        ? { mimeType: detected.mime, extension: detected.ext }
+        : null;
+    } catch {
+      // Не разобрал — тот же принцип, что и у probeImage: остаётся
+      // документом, а не роняет всю загрузку.
       return null;
     }
   }

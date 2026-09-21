@@ -21,6 +21,46 @@ async function makeImage(
   return image.gif().toBuffer();
 }
 
+/**
+ * A minimal, genuinely valid MP4 `ftyp` box — enough for `file-type` to
+ * identify it by content, the same distrust-the-label principle `makeImage`
+ * serves for images. Not a playable video, just a correct signature.
+ */
+function makeVideo(): Buffer {
+  return Buffer.concat([
+    Buffer.from([0, 0, 0, 0x18]),
+    Buffer.from('ftyp', 'ascii'),
+    Buffer.from('isom', 'ascii'),
+    Buffer.from([0, 0, 0, 0]),
+    Buffer.from('isomiso2', 'ascii'),
+  ]);
+}
+
+/**
+ * A minimal, genuinely valid EBML/webm header — enough for `file-type`'s
+ * `DocType` scan to identify it as `video/webm` by content. mp4 and webm are
+ * detected by two entirely different signatures (`ftyp` box vs. EBML), and
+ * the reported bug ("a real .webm still uploads as a document") was specific
+ * to webm, so this exercises that path directly rather than trusting the mp4
+ * case above to stand in for it.
+ */
+function makeWebm(): Buffer {
+  return Buffer.from([
+    0x1a,
+    0x45,
+    0xdf,
+    0xa3, // EBML root element id
+    0x87, // root length (var-int, value 7)
+    0x42,
+    0x82, // DocType element id
+    0x84, // DocType length (var-int, value 4)
+    0x77,
+    0x65,
+    0x62,
+    0x6d, // "webm"
+  ]);
+}
+
 function setup() {
   const written: { buffer: Buffer; extension: string }[] = [];
   const storage = {
@@ -40,6 +80,7 @@ function setup() {
       // По умолчанию такого файла ещё нет — обычная новая загрузка.
       findFirst: jest.fn().mockResolvedValue(null),
       findUnique: jest.fn(),
+      update: jest.fn(({ data }: { data: object }) => Promise.resolve(data)),
     },
   };
   const logger = { setContext: jest.fn(), warn: jest.fn() };
@@ -78,6 +119,50 @@ describe('MediaService', () => {
       expect(result).toBe(existing);
       expect(prisma.mediaAsset.create).not.toHaveBeenCalled();
       expect(storage.write).not.toHaveBeenCalled();
+    });
+
+    it('переопределяет вид на video, если старая запись застряла на document', async () => {
+      // До появления вида `video` (или из-за более раннего бага) тот же
+      // файл мог осесть в базе как документ; без реклассификации дедуп
+      // отдавал бы эту запись безусловно, и она никогда не стала бы видео,
+      // сколько раз её ни перезагружай — именно так выглядел баг,
+      // обнаруженный пользователем на реальном `.webm`.
+      const { service, prisma } = setup();
+      const existing = {
+        id: 'asset-1',
+        filename: 'ролик.bin',
+        kind: 'document',
+      };
+      prisma.mediaAsset.findFirst.mockResolvedValue(existing);
+
+      const result = await service.upload({
+        filename: 'ролик.bin',
+        buffer: makeVideo(),
+      });
+
+      expect(prisma.mediaAsset.update).toHaveBeenCalledWith({
+        where: { id: 'asset-1' },
+        data: { kind: 'video', mimeType: 'video/mp4' },
+      });
+      expect(result).toMatchObject({ kind: 'video', mimeType: 'video/mp4' });
+    });
+
+    it('оставляет старую запись document как есть, если содержимое и правда не видео', async () => {
+      const { service, prisma } = setup();
+      const existing = {
+        id: 'asset-1',
+        filename: 'отчёт.pdf',
+        kind: 'document',
+      };
+      prisma.mediaAsset.findFirst.mockResolvedValue(existing);
+
+      const result = await service.upload({
+        filename: 'отчёт.pdf',
+        buffer: Buffer.from('%PDF-1.4 не настоящий pdf'),
+      });
+
+      expect(prisma.mediaAsset.update).not.toHaveBeenCalled();
+      expect(result).toBe(existing);
     });
 
     it('ищет по содержимому и имени вместе, а не только по содержимому', async () => {
@@ -132,6 +217,52 @@ describe('MediaService', () => {
         mimeType: 'application/pdf',
         filename: 'отчёт.pdf',
       });
+    });
+
+    it('identifies a video by its bytes, ignoring the declared type', async () => {
+      // Раньше видео не отличалось от документа и уходило в MAX файлом на
+      // скачивание, не проигрывателем, — то, что заметил пользователь.
+      const { service, prisma } = setup();
+
+      await service.upload({
+        filename: 'ролик.bin',
+        buffer: makeVideo(),
+        declaredMimeType: 'application/octet-stream',
+      });
+
+      expect(createdAsset(prisma)).toMatchObject({
+        kind: 'video',
+        mimeType: 'video/mp4',
+      });
+    });
+
+    it('identifies webm specifically, not just mp4 — a different signature entirely', async () => {
+      const { service, prisma } = setup();
+
+      await service.upload({
+        filename: 'запись.bin',
+        buffer: makeWebm(),
+        declaredMimeType: 'application/octet-stream',
+      });
+
+      expect(createdAsset(prisma)).toMatchObject({
+        kind: 'video',
+        mimeType: 'video/webm',
+      });
+    });
+
+    it('treats an unrecognised video-ish container as a document, not a guess', async () => {
+      const { service, prisma } = setup();
+
+      // Похоже на видео по имени, но реальный пробник по содержимому
+      // ничего не находит — тот же принцип, что и у изображений.
+      await service.upload({
+        filename: 'ролик.mp4',
+        buffer: Buffer.from('не настоящее видео'),
+        declaredMimeType: 'video/mp4',
+      });
+
+      expect(createdAsset(prisma)).toMatchObject({ kind: 'document' });
     });
 
     it('falls back to a neutral type when none was declared', async () => {

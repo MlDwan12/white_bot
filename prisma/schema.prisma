@@ -47,6 +47,7 @@ enum PostDeliveryStatus {
 enum MediaKind {
   image
   document
+  video
 }
 
 enum ContestStatus {

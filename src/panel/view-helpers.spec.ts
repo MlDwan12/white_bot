@@ -98,6 +98,7 @@ describe('платформа и виды в интерфейсе', () => {
     expect(groupKindLabel('что-то')).toBe('что-то');
     expect(mediaKindLabel('image')).toBe('картинка');
     expect(mediaKindLabel('document')).toBe('документ');
-    expect(mediaKindLabel('video')).toBe('video');
+    expect(mediaKindLabel('video')).toBe('видео');
+    expect(mediaKindLabel('что-то')).toBe('что-то');
   });
 });

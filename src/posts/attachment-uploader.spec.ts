@@ -239,6 +239,20 @@ describe('AttachmentUploader', () => {
       });
     });
 
+    it('шлёт видео через uploadVideo, а не файлом', async () => {
+      // Без этого видео уходило бы в MAX документом на скачивание, а не
+      // проигрывателем — ровно то, что заметил и указал пользователь.
+      const { uploader, max } = setup();
+
+      await uploader.maxAttachments([
+        asset({ kind: 'video', filename: 'ролик.webm' }),
+      ]);
+
+      expect(max.uploadAttachment).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'video' }),
+      );
+    });
+
     it('re-uploads once a cached MAX reference has aged out', async () => {
       const { uploader, prisma, max } = setup();
       const twoWeeks = 14 * 24 * 60 * 60 * 1000;
