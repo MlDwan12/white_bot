@@ -1554,6 +1554,36 @@ export class PanelController {
     return parsed;
   }
 
+  /**
+   * Картинка вместо имени файла в карточке поста и в списках вложений: имя
+   * ничего не говорит о том, что на снимке, и пользователь путал файлы между
+   * собой. `size=thumb` (по умолчанию) — для сеток и списков, `size=full` —
+   * открыть как есть. Документы сюда не пускаются — `readPreview` сам
+   * проверяет `kind` и отвечает `NOT_FOUND`, не открывая произвольный файл
+   * под видом картинки.
+   */
+  @Get('media/:id/preview')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  async mediaPreview(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('size') size: string | undefined,
+    @Res() res: Response,
+  ): Promise<void> {
+    const { buffer, mimeType } = await this.media.readPreview(
+      id,
+      size === 'full' ? 'full' : 'thumb',
+    );
+    res.set({
+      'Content-Type': mimeType,
+      // За гвардом входа и так, но кэшировать эти байты в общем/прокси-кэше
+      // всё равно не место — только в браузере вошедшего админа.
+      'Cache-Control': 'private, max-age=86400',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.send(buffer);
+  }
+
   @Post('media')
   @UseGuards(AdminAuthGuard)
   @RequirePermissions('posts_manage')

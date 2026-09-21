@@ -57,11 +57,14 @@
           <div class="mb-3">
             <label class="form-label">Вложения</label>
             <% media.forEach(function (m) { %>
-              <label class="form-check">
+              <label class="form-check d-flex align-items-center">
                 <input class="form-check-input" type="checkbox" name="attachmentIds"
                        value="<%= m.id %>"
                        <%= draft.attachmentIds.includes(m.id) ? 'checked' : '' %> />
-                <span class="form-check-label"><%= m.filename %> <span class="text-secondary small"><%= mediaKindLabel(m.kind) %></span></span>
+                <span class="form-check-label d-flex align-items-center">
+                  <%- include('media-thumb', { m: m }) %>
+                  <%= m.filename %> <span class="text-secondary small ms-1"><%= mediaKindLabel(m.kind) %></span>
+                </span>
               </label>
             <% }); %>
           </div>

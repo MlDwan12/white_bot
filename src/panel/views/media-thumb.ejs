@@ -1,0 +1,10 @@
+<%
+   /* Миниатюра вложения: только у картинок — для документа показать нечего,
+      имя файла и так говорит о содержимом лучше пустой иконки. Раздутый
+      `size=thumb` не отдаёт оригинал: сервер режет его sharp'ом. */
+%>
+<% if (m.kind === 'image') { %>
+  <img src="/panel/media/<%= m.id %>/preview?size=thumb" alt=""
+       class="rounded me-2" loading="lazy"
+       style="width: 32px; height: 32px; object-fit: cover; flex: none;" />
+<% } %>

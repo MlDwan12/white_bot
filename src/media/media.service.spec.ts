@@ -6,9 +6,11 @@ import { MediaService } from './media.service';
 import { MediaStorageService } from './media-storage.service';
 
 /** A noisy image, so compression gains aren't an artefact of flat colour. */
-async function makeImage(format: 'png' | 'jpeg' | 'gif'): Promise<Buffer> {
-  const width = 120;
-  const height = 90;
+async function makeImage(
+  format: 'png' | 'jpeg' | 'gif',
+  width = 120,
+  height = 90,
+): Promise<Buffer> {
   const raw = Buffer.alloc(width * height * 3);
   for (let i = 0; i < raw.length; i++) {
     raw[i] = (Math.sin(i * 0.37) * 127 + 128) | 0;
@@ -37,6 +39,7 @@ function setup() {
       create: jest.fn(({ data }: { data: object }) => Promise.resolve(data)),
       // По умолчанию такого файла ещё нет — обычная новая загрузка.
       findFirst: jest.fn().mockResolvedValue(null),
+      findUnique: jest.fn(),
     },
   };
   const logger = { setContext: jest.fn(), warn: jest.fn() };
@@ -248,5 +251,80 @@ describe('MediaService', () => {
       optimizedPath: null,
     } as never);
     expect(storage.read).toHaveBeenLastCalledWith('orig');
+  });
+
+  describe('readPreview', () => {
+    it('throws NOT_FOUND when the asset does not exist', async () => {
+      const { service, prisma } = setup();
+      prisma.mediaAsset.findUnique.mockResolvedValue(null);
+
+      await expect(service.readPreview('missing', 'full')).rejects.toThrow(
+        AppException,
+      );
+    });
+
+    it('throws NOT_FOUND for a document — nothing to render as a picture', async () => {
+      const { service, prisma } = setup();
+      prisma.mediaAsset.findUnique.mockResolvedValue({
+        kind: 'document',
+        storagePath: 'p',
+        optimizedPath: null,
+      });
+
+      await expect(service.readPreview('doc-id', 'thumb')).rejects.toThrow(
+        AppException,
+      );
+    });
+
+    it('size=full returns the published bytes untouched', async () => {
+      const { service, prisma, storage } = setup();
+      const original = await makeImage('png', 400, 300);
+      prisma.mediaAsset.findUnique.mockResolvedValue({
+        kind: 'image',
+        mimeType: 'image/png',
+        storagePath: 'p',
+        optimizedPath: null,
+      });
+      storage.read.mockResolvedValue(original);
+
+      const { buffer, mimeType } = await service.readPreview('id', 'full');
+
+      expect(buffer).toBe(original);
+      expect(mimeType).toBe('image/png');
+    });
+
+    it('size=thumb shrinks a large image to fit the thumbnail box', async () => {
+      const { service, prisma, storage } = setup();
+      prisma.mediaAsset.findUnique.mockResolvedValue({
+        kind: 'image',
+        mimeType: 'image/png',
+        storagePath: 'p',
+        optimizedPath: null,
+      });
+      storage.read.mockResolvedValue(await makeImage('png', 400, 300));
+
+      const { buffer } = await service.readPreview('id', 'thumb');
+      const metadata = await sharp(buffer).metadata();
+
+      expect(metadata.width).toBeLessThanOrEqual(200);
+      expect(metadata.height).toBeLessThanOrEqual(200);
+    });
+
+    it('size=thumb does not enlarge an image already smaller than the box', async () => {
+      const { service, prisma, storage } = setup();
+      prisma.mediaAsset.findUnique.mockResolvedValue({
+        kind: 'image',
+        mimeType: 'image/png',
+        storagePath: 'p',
+        optimizedPath: null,
+      });
+      storage.read.mockResolvedValue(await makeImage('png', 120, 90));
+
+      const { buffer } = await service.readPreview('id', 'thumb');
+      const metadata = await sharp(buffer).metadata();
+
+      expect(metadata.width).toBe(120);
+      expect(metadata.height).toBe(90);
+    });
   });
 });

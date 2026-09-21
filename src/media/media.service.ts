@@ -10,6 +10,9 @@ import { MediaStorageService } from './media-storage.service';
 /** Ceiling for a single upload. VK's own document limit is the binding one. */
 export const MAX_FILE_BYTES = 50 * 1024 * 1024;
 
+/** Longer side of a panel thumbnail, in pixels. */
+const THUMBNAIL_MAX_SIZE = 200;
+
 /**
  * Image formats we accept. Deliberately narrow: sharp reads far more (svg,
  * tiff, avif…), but SVG is a script-carrying format and the rest aren't
@@ -136,6 +139,34 @@ export class MediaService {
    */
   async readForUpload(asset: MediaAsset): Promise<Buffer> {
     return this.storage.read(this.relativePathForUpload(asset));
+  }
+
+  /**
+   * Bytes for showing an image in the panel — full size or a small preview.
+   * Only images: a document has nothing to render as a picture, and serving
+   * its bytes here would let the panel embed an arbitrary file as `<img>`.
+   */
+  async readPreview(
+    id: string,
+    size: 'thumb' | 'full',
+  ): Promise<{ buffer: Buffer; mimeType: string }> {
+    const asset = await this.prisma.mediaAsset.findUnique({ where: { id } });
+    if (!asset || asset.kind !== 'image') {
+      throw new AppException(ErrorCode.NOT_FOUND, 'Изображение не найдено');
+    }
+    const buffer = await this.readForUpload(asset);
+    if (size === 'full') {
+      return { buffer, mimeType: asset.mimeType };
+    }
+    // Размер под сетку миниатюр: узнаваемо, но не тяжело. `fit: 'inside'` не
+    // обрезает кадр, `withoutEnlargement` не растягивает то, что и так меньше.
+    const thumbnail = await sharp(buffer)
+      .resize(THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE, {
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .toBuffer();
+    return { buffer: thumbnail, mimeType: asset.mimeType };
   }
 
   /**

@@ -530,7 +530,9 @@ export class PostsService {
         },
         attachments: {
           orderBy: { position: 'asc' },
-          include: { mediaAsset: { select: { id: true, filename: true } } },
+          include: {
+            mediaAsset: { select: { id: true, filename: true, kind: true } },
+          },
         },
       },
     });
