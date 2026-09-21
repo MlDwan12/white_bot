@@ -20,6 +20,8 @@ export interface EditPublishedInput {
   maxTextOverride?: string | null;
   autoDeleteAt?: Date | null;
   autoDeleteAfterMinutes?: number | null;
+  /** `undefined` — вложения не трогать; список (в т.ч. пустой) — заменить целиком. */
+  attachmentIds?: string[];
 }
 
 /** Сколько доставок сверщик берёт за один проход. */
@@ -124,6 +126,12 @@ export class PostModerationService {
         'Это повторяющийся шаблон — им управляют через /post-templates',
       );
     }
+    // Проверяется до остановки рассылки: невалидный список вложений не
+    // должен оставлять кампанию остановленной с текстом, который никуда не
+    // ушёл.
+    if (input.attachmentIds !== undefined) {
+      await this.posts.assertAttachmentsUsable(input.attachmentIds);
+    }
 
     if (post.status === 'sending') {
       await this.posts.stopPost(postId);
@@ -149,6 +157,16 @@ export class PostModerationService {
           : {}),
         ...(input.autoDeleteAfterMinutes !== undefined
           ? { autoDeleteAfterMinutes: input.autoDeleteAfterMinutes }
+          : {}),
+        // Замена целиком, а не диф: положение файлов — часть смысла поста,
+        // и вычислять минимальный набор add/remove ради него незачем.
+        ...(input.attachmentIds !== undefined
+          ? {
+              attachments: {
+                deleteMany: {},
+                create: PostsService.attachmentCreateData(input.attachmentIds),
+              },
+            }
           : {}),
       },
       include: {

@@ -69,6 +69,16 @@
   </div>
 
   <div class="col-lg-5">
+    <%
+       /* Вне карточки и вне ветки `publishedGroups.length > 0`: отказ
+          правки/загрузки перерисовывает эту же страницу, и если к тому
+          моменту список доставок вдруг опустел (например, пост успели
+          удалить из всех групп в другой вкладке), баннер внутри скрытой
+          формы никто бы не увидел — а набранное уже потеряно. */
+    %>
+    <% if (editError) { %>
+      <div class="alert alert-danger mb-3" role="alert"><%= editError %></div>
+    <% } %>
     <% if (publishedGroups.length > 0) { %>
       <div class="card mb-3">
         <div class="card-header"><h3 class="card-title">Правка опубликованного</h3></div>
@@ -82,7 +92,7 @@
             %>
             <div class="mb-3">
               <label class="form-label" for="edit-text">Новый текст</label>
-              <textarea class="form-control" id="edit-text" name="text" rows="5" required><%= post.text %></textarea>
+              <textarea class="form-control" id="edit-text" name="text" rows="5" required><%= editDraft.text %></textarea>
             </div>
             <%
                /* Переопределения показываются всегда, а не только когда
@@ -93,19 +103,19 @@
             <div class="mb-3">
               <label class="form-label" for="vk-text">Текст для VK</label>
               <textarea class="form-control" id="vk-text" name="vkTextOverride" rows="2"
-                        placeholder="пусто — общий текст"><%= post.vkTextOverride || '' %></textarea>
+                        placeholder="пусто — общий текст"><%= editDraft.vkTextOverride %></textarea>
             </div>
             <div class="mb-3">
               <label class="form-label" for="max-text">Текст для MAX</label>
               <textarea class="form-control" id="max-text" name="maxTextOverride" rows="2"
-                        placeholder="пусто — общий текст"><%= post.maxTextOverride || '' %></textarea>
+                        placeholder="пусто — общий текст"><%= editDraft.maxTextOverride %></textarea>
             </div>
 
-            <div class="mb-2">
+            <div class="mb-3">
               <label class="form-label" for="autoDeleteAfterMinutes">Удалить через (минут)</label>
               <input class="form-control" id="autoDeleteAfterMinutes" type="number" min="1"
                      name="autoDeleteAfterMinutes"
-                     value="<%= post.autoDeleteAfterMinutes || '' %>" />
+                     value="<%= editDraft.autoDeleteAfterMinutes %>" />
               <small class="form-hint">
                 Пусто — не удалять автоматически.
                 <% if (post.autoDeleteAt) { %>
@@ -114,9 +124,48 @@
                 <% } %>
               </small>
             </div>
+
+            <%
+               /* Снятые галочки — не «поле не прислали», а осознанное «убрать
+                  картинку»: форма правки несёт полный список вложений всегда,
+                  и сервис заменяет их им целиком (см. `editPublished`). */
+            %>
+            <% if (media.length > 0) { %>
+              <div class="mb-3">
+                <label class="form-label">Вложения</label>
+                <% media.forEach(function (m) { %>
+                  <label class="form-check d-flex align-items-center">
+                    <input class="form-check-input" type="checkbox" name="attachmentIds"
+                           value="<%= m.id %>"
+                           <%= editDraft.attachmentIds.includes(m.id) ? 'checked' : '' %> />
+                    <span class="form-check-label d-flex align-items-center">
+                      <%- include('media-thumb', { m: m }) %>
+                      <%= m.filename %> <span class="text-secondary small ms-1"><%= mediaKindLabel(m.kind) %></span>
+                    </span>
+                  </label>
+                <% }); %>
+              </div>
+            <% } %>
+            <div class="mb-1">
+              <label class="form-label" for="edit-file">Загрузить новый файл</label>
+              <input class="form-control" id="edit-file" type="file" name="file" />
+              <small class="form-hint">
+                До 50 МБ. Загрузится и отметится сам, набранное в форме
+                сохранится. К посту файл прикрепляется только кнопкой
+                «Загрузить» — «Сохранить» его не берёт.
+              </small>
+            </div>
           </div>
-          <div class="card-footer">
-            <button class="btn btn-primary w-100" type="submit">Сохранить и обновить везде</button>
+          <div class="card-footer d-flex gap-2">
+            <button class="btn btn-primary" type="submit">Сохранить и обновить везде</button>
+            <%
+               /* `formnovalidate`: у текста стоит `required`, и без этого
+                  загрузить файл до правки текста было бы нельзя. Кнопка
+                  стоит второй в документе — Enter в текстовом поле должен
+                  сохранять правку, а не запускать загрузку. */
+            %>
+            <button class="btn" type="submit" formaction="/panel/campaigns/<%= post.id %>/media"
+                    formenctype="multipart/form-data" formnovalidate>Загрузить</button>
           </div>
         </form>
       </div>

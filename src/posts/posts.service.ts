@@ -100,15 +100,27 @@ export class PostsService {
           create: groupIds.map((groupId) => ({ groupId })),
         },
         attachments: {
-          // Position is stored explicitly: the order attachments appear in is
-          // part of the post, not an accident of row ordering.
-          create: attachmentIds.map((mediaAssetId, position) => ({
-            mediaAssetId,
-            position,
-          })),
+          create: PostsService.attachmentCreateData(attachmentIds),
         },
       },
     });
+  }
+
+  /**
+   * Ряды `PostAttachment.create`, готовые для вложенной записи Prisma —
+   * общее место для всех, кто пишет вложения поста (создание и правка
+   * опубликованного), чтобы формат ряда не разошёлся между ними.
+   *
+   * Позиция хранится явно: порядок вложений — часть смысла поста, а не
+   * случайность порядка строк.
+   */
+  static attachmentCreateData(
+    attachmentIds: string[],
+  ): { mediaAssetId: string; position: number }[] {
+    return attachmentIds.map((mediaAssetId, position) => ({
+      mediaAssetId,
+      position,
+    }));
   }
 
   /**

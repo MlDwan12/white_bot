@@ -109,7 +109,7 @@ export class MaxApiClient {
   ): Promise<void> {
     const api = this.requireBot().api;
     await this.call(() =>
-      api.editMessage(messageId, { text, ...this.buildSendExtra(options) }),
+      api.editMessage(messageId, { text, ...this.buildEditExtra(options) }),
     );
   }
 
@@ -229,6 +229,26 @@ export class MaxApiClient {
   }
 
   private buildSendExtra(options: MaxSendOptions) {
+    const attachments = this.composeAttachments(options);
+    return attachments.length > 0 ? { attachments } : {};
+  }
+
+  /**
+   * То же, но для правки уже отправленного сообщения: `attachments`
+   * присутствует в теле запроса **всегда**, даже пустым массивом.
+   *
+   * Подтверждено живьём (канал «Test», 21.09.2026): `PUT /messages` без поля
+   * `attachments` оставляет прежние вложения как есть, а с `attachments: []`
+   * убирает их. `buildSendExtra` для нового сообщения опускает пустой массив
+   * намеренно (нечего сохранять), но для правки это же самое опущение молча
+   * не даёт снять картинку — панель отрапортует об успехе, а вложение
+   * останется висеть.
+   */
+  private buildEditExtra(options: MaxSendOptions) {
+    return { attachments: this.composeAttachments(options) };
+  }
+
+  private composeAttachments(options: MaxSendOptions): AttachmentRequest[] {
     const attachments = [...(options.attachments ?? [])];
     if (options.buttons?.length) {
       attachments.push({
@@ -236,7 +256,7 @@ export class MaxApiClient {
         payload: { buttons: options.buttons },
       });
     }
-    return attachments.length > 0 ? { attachments } : {};
+    return attachments;
   }
 
   private requireBot(): Bot {

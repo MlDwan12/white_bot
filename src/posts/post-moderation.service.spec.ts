@@ -63,7 +63,10 @@ function setup(
     delete: jest.fn().mockResolvedValue(undefined),
     edit: jest.fn().mockResolvedValue(undefined),
   };
-  const posts = { stopPost: jest.fn().mockResolvedValue(undefined) };
+  const posts = {
+    stopPost: jest.fn().mockResolvedValue(undefined),
+    assertAttachmentsUsable: jest.fn().mockResolvedValue(undefined),
+  };
   const logger = {
     setContext: jest.fn(),
     info: jest.fn(),
@@ -83,6 +86,12 @@ function setup(
 /** Читает `data` последнего обновления доставки. */
 const lastUpdate = (prisma: ReturnType<typeof setup>['prisma']) => {
   const calls = prisma.postDelivery.update.mock.calls as unknown[][];
+  return (calls[calls.length - 1][0] as { data: Record<string, unknown> }).data;
+};
+
+/** Читает `data` последнего вызова `prisma.post.update`. */
+const lastPostUpdate = (prisma: ReturnType<typeof setup>['prisma']) => {
+  const calls = prisma.post.update.mock.calls as unknown[][];
   return (calls[calls.length - 1][0] as { data: Record<string, unknown> }).data;
 };
 
@@ -232,6 +241,66 @@ describe('PostModerationService.editPublished', () => {
     // «Участвовать» во всех группах, и записаться стало бы негде.
     const [, , , , button] = sender.edit.mock.calls[0] as unknown[];
     expect(button).toEqual({ contestId: 'c1', label: 'Участвовать (12)' });
+  });
+
+  it('leaves attachments untouched when attachmentIds is not given', async () => {
+    const { service, prisma } = setup();
+
+    await service.editPublished(POST_ID, { text: 'новый' });
+
+    expect(lastPostUpdate(prisma)).not.toHaveProperty('attachments');
+  });
+
+  it('replaces attachments wholesale when attachmentIds is given', async () => {
+    const { service, prisma, posts } = setup();
+
+    await service.editPublished(POST_ID, {
+      text: 'новый',
+      attachmentIds: ['m1', 'm2'],
+    });
+
+    expect(posts.assertAttachmentsUsable).toHaveBeenCalledWith(['m1', 'm2']);
+    expect(lastPostUpdate(prisma).attachments).toEqual({
+      deleteMany: {},
+      create: [
+        { mediaAssetId: 'm1', position: 0 },
+        { mediaAssetId: 'm2', position: 1 },
+      ],
+    });
+  });
+
+  it('clears attachments when attachmentIds is an empty list', async () => {
+    const { service, prisma } = setup();
+
+    await service.editPublished(POST_ID, { text: 'новый', attachmentIds: [] });
+
+    expect(lastPostUpdate(prisma).attachments).toEqual({
+      deleteMany: {},
+      create: [],
+    });
+  });
+
+  it('validates attachments before stopping an in-flight campaign', async () => {
+    const { service, posts, prisma } = setup({
+      post: {
+        id: POST_ID,
+        status: 'sending',
+        autoDeleteAt: null,
+        autoDeleteAfterMinutes: null,
+      },
+    });
+    posts.assertAttachmentsUsable.mockRejectedValue(
+      new Error('Часть файлов не найдена'),
+    );
+
+    await expect(
+      service.editPublished(POST_ID, { text: 'x', attachmentIds: ['gone'] }),
+    ).rejects.toThrow('Часть файлов не найдена');
+
+    // Невалидный список не должен оставлять кампанию остановленной с
+    // текстом, который никуда не ушёл.
+    expect(posts.stopPost).not.toHaveBeenCalled();
+    expect(prisma.post.update).not.toHaveBeenCalled();
   });
 
   it('waits for in-flight deliveries before taking its snapshot', async () => {

@@ -139,6 +139,16 @@ export class VkApiClient {
    * devsupport@corp.vk.com — not something a token/app-type change fixes.
    * Left implemented (request shape is correct, proven via curl) since it
    * should start working the moment that grant exists, with no code change.
+   *
+   * `attachments` — присылается всегда, даже пустой строкой, а не только
+   * когда есть что прикрепить. Причина та же, что и у MAX (`buildEditExtra`
+   * в `max-api.client.ts`, подтверждено там живьём): при правке уже
+   * опубликованного отсутствие параметра, скорее всего, не то же самое, что
+   * пустой список — иначе снять все вложения с поста через панель было бы
+   * нечем. **Само предположение для VK живьём не проверено** — wall.edit
+   * сейчас отклоняется для любого значения параметра (см. выше), поэтому
+   * правка тут ничем не рискует: заменить нечего, пока не будут одобрены
+   * права. Перепроверить, когда придёт одобрение.
    */
   async wallEdit(
     token: string,
@@ -151,9 +161,7 @@ export class VkApiClient {
       owner_id: this.wallOwnerId(externalId),
       post_id: String(postId),
       message,
-      ...(attachmentRefs.length > 0
-        ? { attachments: attachmentRefs.join(',') }
-        : {}),
+      attachments: attachmentRefs.join(','),
     });
   }
 

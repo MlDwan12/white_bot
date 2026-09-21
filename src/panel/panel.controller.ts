@@ -41,7 +41,10 @@ import { VkApiError } from '../vk/vk-api.error';
 import { VK_OAUTH_STATE_COOKIE } from '../vk/vk-oauth-state';
 import { parseVkAuthInput } from '../vk/vk-auth-input';
 import { PostsService } from '../posts/posts.service';
-import { PostModerationService } from '../posts/post-moderation.service';
+import {
+  PostModerationService,
+  ModerationOutcome,
+} from '../posts/post-moderation.service';
 import { GroupsService } from '../groups/groups.service';
 import { ContestsService } from '../contests/contests.service';
 import {
@@ -139,6 +142,23 @@ interface PostDraft {
   groupIds: string[];
   attachmentIds: string[];
   scheduledAt: string;
+}
+
+/** Поля формы «Правка опубликованного» — как их присылает браузер. */
+interface EditPublishedFormBody {
+  text?: string;
+  vkTextOverride?: string;
+  maxTextOverride?: string;
+  autoDeleteAfterMinutes?: string;
+  attachmentIds?: string | string[];
+}
+
+interface EditDraft {
+  text: string;
+  vkTextOverride: string;
+  maxTextOverride: string;
+  autoDeleteAfterMinutes: string;
+  attachmentIds: string[];
 }
 
 /** Сколько строк показывают списки конкурсов и постов-кандидатов. */
@@ -255,37 +275,19 @@ export class PanelController {
   }
 
   @Get('campaigns/:id')
-  @Render('layout')
   @UseGuards(AdminAuthGuard)
   @RequirePermissions('posts_manage')
   async campaign(
     @Param('id') id: string,
     @Req() req: Request,
     @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
     @Query('flash') flash?: string,
-  ) {
-    const post = await this.posts.getPostWithDeliveries(id);
-    return {
-      ...this.shell(req, 'Пост', admin, 'campaigns', flash),
-      page: 'campaign',
-      post,
-      // Править и удалять можно только там, где пост действительно вышел и
-      // ещё не удалён: предлагать это для остальных групп — приглашать на
-      // кнопку, которая вернёт ошибку.
-      publishedGroups: post.deliveries
-        // Условия те же, что в `publishedDeliveries`: доставка без id
-        // сообщения сервису не подходит, и предложить её галочкой значило
-        // бы привести человека на ошибку вместо действия.
-        .filter(
-          (d) => d.status === 'sent' && !d.deletedAt && d.externalMessageId,
-        )
-        .map((d) => d.group),
-      formatDate,
-      statusColor,
-      statusLabel,
-      deliveryColor,
-      deliveryLabel,
-    };
+  ): Promise<void> {
+    // Через тот же `renderCampaign`, что и повтороный показ после загрузки
+    // файла посреди правки: разошедшиеся копии полей — на первом же
+    // добавленном.
+    await this.renderCampaign(res, req, admin, id, { flash });
   }
 
   @Post('campaigns/:id/edit-published')
@@ -293,42 +295,159 @@ export class PanelController {
   @RequirePermissions('posts_manage')
   async editPublished(
     @Param('id') id: string,
-    @Body()
-    body: {
-      text?: string;
-      vkTextOverride?: string;
-      maxTextOverride?: string;
-      autoDeleteAfterMinutes?: string;
-    },
+    @Body() body: EditPublishedFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
     @Res() res: Response,
   ): Promise<void> {
+    const draft = this.editDraftFrom(body);
+
     let autoDeleteAfterMinutes: number | null;
     try {
       autoDeleteAfterMinutes = parseMinutes(body.autoDeleteAfterMinutes);
     } catch {
       // Проверяем **до** обращения к сервису: тот сначала останавливает
       // идущую рассылку, и падение после этого оставило бы кампанию
-      // остановленной с неизменённым текстом.
-      res.redirect(`${PANEL_PREFIX}/campaigns/${id}?flash=bad-minutes`);
+      // остановленной с неизменённым текстом. Перерисовываем форму, а не
+      // редиректим голым флэшем — тот же принцип, что и у отказа валидации
+      // вложений ниже: без него правка текста и вложений терялась бы
+      // из-за одной опечатки в поле срока.
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        editDraft: draft,
+        editError: 'Срок автоудаления — целое число минут от 1 до года',
+      });
       return;
     }
 
-    const outcome = await this.moderation.editPublished(id, {
-      text: body.text,
-      // Поля формы — полная правда о тексте. Не передай их — и правка
-      // отрапортовала бы об успехе, пока VK показывает старое
-      // переопределение, которого в панели даже не видно.
-      vkTextOverride: body.vkTextOverride?.trim() || null,
-      maxTextOverride: body.maxTextOverride?.trim() || null,
-      // Пустое поле означает «не удалять автоматически». Абсолютный срок
-      // снимается тоже: он приоритетнее относительного, и без этого
-      // очищенное поле не отменяло бы удаление, назначенное через API.
-      autoDeleteAfterMinutes,
-      autoDeleteAt: null,
-    });
+    let outcome: ModerationOutcome;
+    try {
+      outcome = await this.moderation.editPublished(id, {
+        text: body.text,
+        // Поля формы — полная правда о тексте. Не передай их — и правка
+        // отрапортовала бы об успехе, пока VK показывает старое
+        // переопределение, которого в панели даже не видно.
+        vkTextOverride: body.vkTextOverride?.trim() || null,
+        maxTextOverride: body.maxTextOverride?.trim() || null,
+        // Пустое поле означает «не удалять автоматически». Абсолютный срок
+        // снимается тоже: он приоритетнее относительного, и без этого
+        // очищенное поле не отменяло бы удаление, назначенное через API.
+        autoDeleteAfterMinutes,
+        autoDeleteAt: null,
+        // Форма правки всегда несёт полный список вложений (даже пустой):
+        // снятые галочки — осознанное «убрать картинку», а не «поле не
+        // прислали». Именно этот путь и снимает вложения с уже
+        // опубликованного — в MAX теперь тоже (см. `buildEditExtra`).
+        attachmentIds: asArray(body.attachmentIds),
+      });
+    } catch (err: unknown) {
+      // Отказ валидации (например, часть вложений уже удалена кем-то ещё)
+      // перерисовывает форму с набранным, а не роняет в общий экран ошибки:
+      // тот стёр бы текст, переопределения и срок автоудаления, которые
+      // человек только что набрал.
+      if (!(err instanceof AppException)) {
+        throw err;
+      }
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        editDraft: draft,
+        editError: err.message,
+      });
+      return;
+    }
     res.redirect(
       `${PANEL_PREFIX}/campaigns/${id}?flash=${outcomeFlash(outcome, 'edited')}`,
     );
+  }
+
+  /**
+   * Загрузка файла посреди правки опубликованного — тот же приём, что и у
+   * «Нового поста»: вся форма уходит на другой адрес вместе с файлом, а
+   * сервер перерисовывает страницу с набранным и сам отмечает новое
+   * вложение. Пост при этом не меняется — правка применяется только по
+   * «Сохранить и обновить везде».
+   */
+  @Post('campaigns/:id/media')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  // Тот же порядок и то же обоснование, что у `/panel/media`: CsrfInterceptor
+  // вместо CsrfGuard, и строго после FileInterceptor — скрытое поле `_csrf`
+  // лежит в multipart-теле, которое разбирает именно FileInterceptor.
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_FILE_BYTES },
+    }),
+    CsrfInterceptor,
+  )
+  async uploadCampaignMedia(
+    // Без `ParseUUIDPipe` — как и у остальных маршрутов `campaigns/:id/…`:
+    // `Post.id` обычная `String`-колонка, невалидный id просто не найдётся
+    // и даст доменное «Пост не найден» через `getPostWithDeliveries`,
+    // вместо отдельной генерик-ошибки Nest только на этом одном маршруте.
+    @Param('id') id: string,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Body() body: EditPublishedFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const draft = this.editDraftFrom(body);
+
+    if (!file) {
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        editDraft: draft,
+        editError: 'Файл не выбран',
+      });
+      return;
+    }
+
+    let asset: MediaAsset;
+    try {
+      asset = await this.uploadFormFile(file);
+    } catch (err: unknown) {
+      if (!(err instanceof AppException)) {
+        this.logger.error({ err }, 'Не удалось загрузить вложение');
+      }
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        editDraft: draft,
+        editError:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось загрузить файл',
+      });
+      return;
+    }
+
+    const attachmentIds = [...new Set([...draft.attachmentIds, asset.id])];
+    try {
+      // Проверяется здесь же, а не только при «Сохранить»: иначе человек
+      // отмечал бы лишние файлы одним за другим, ничего не подозревая, и
+      // узнал бы о лимите VK лишь на сохранении, потеряв весь набранный к
+      // тому моменту список отметок.
+      await this.posts.assertAttachmentsUsable(attachmentIds);
+    } catch (err: unknown) {
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        editDraft: { ...draft, attachmentIds },
+        editError:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось загрузить файл',
+      });
+      return;
+    }
+
+    await this.renderCampaign(res, req, admin, id, {
+      flash: 'uploaded',
+      editDraft: {
+        ...draft,
+        // Новый файл отмечается сам — тот же приём, что и в «Новом посте».
+        attachmentIds,
+      },
+    });
   }
 
   @Post('campaigns/:id/delete-published')
@@ -1367,6 +1486,20 @@ export class PanelController {
     });
   }
 
+  /**
+   * Загрузка файла из multipart-формы — общее место для «Нового поста» и
+   * правки опубликованного, обе грузят файл посреди себя же тем же приёмом.
+   */
+  private async uploadFormFile(file: Express.Multer.File): Promise<MediaAsset> {
+    return this.media.upload({
+      buffer: file.buffer,
+      // Multer отдаёт имя в latin1; без перекодировки кириллица приезжает
+      // кракозябрами — а это имя видит получатель документа.
+      filename: Buffer.from(file.originalname, 'latin1').toString('utf8'),
+      declaredMimeType: file.mimetype,
+    });
+  }
+
   private async activeGroups() {
     return (await this.groups.listGroups()).filter(
       (group) => group.status === 'active',
@@ -1506,15 +1639,103 @@ export class PanelController {
   }
 
   /**
-   * Страница «Новый пост» с набранным. Одна отрисовка для трёх путей: отказ
-   * при создании, загрузка файла и ошибка загрузки — иначе три копии набора
-   * полей разошлись бы на первом добавленном.
-   *
-   * Вложения из черновика всегда попадают в список, даже если они старше
-   * последних загрузок: после загрузки нового файла отмеченный раньше мог бы
-   * выпасть из «свежих 20», его галочка исчезла бы, и он молча не попал бы
-   * в пост.
+   * Карточка поста — общая для обычного показа и для повторного показа
+   * после загрузки файла посреди правки опубликованного. Без общего метода
+   * два места неизбежно разошлись бы в наборе полей, как уже было с формой
+   * «Новый пост».
    */
+  private async renderCampaign(
+    res: Response,
+    req: Request,
+    admin: AdminUser,
+    id: string,
+    options: {
+      status?: number;
+      flash?: string;
+      editDraft?: EditDraft;
+      editError?: string | null;
+    } = {},
+  ): Promise<void> {
+    // По умолчанию — то, что сейчас на посте; после загрузки файла или
+    // отказа валидации вызывающий передаёт набранное в форме, чтобы не
+    // потерять правки. Явный черновик не зависит от поста, и тогда пост и
+    // список вложений поднимаются одним проходом, а не один за другим.
+    const [post, editDraft, media] = options.editDraft
+      ? await this.loadCampaignWith(id, options.editDraft)
+      : await this.loadCampaignDefault(id);
+    res.status(options.status ?? 200).render('layout', {
+      ...this.shell(req, 'Пост', admin, 'campaigns', options.flash),
+      page: 'campaign',
+      post,
+      // Править и удалять можно только там, где пост действительно вышел и
+      // ещё не удалён: предлагать это для остальных групп — приглашать на
+      // кнопку, которая вернёт ошибку.
+      publishedGroups: post.deliveries
+        // Условия те же, что в `publishedDeliveries`: доставка без id
+        // сообщения сервису не подходит, и предложить её галочкой значило
+        // бы привести человека на ошибку вместо действия.
+        .filter(
+          (d) => d.status === 'sent' && !d.deletedAt && d.externalMessageId,
+        )
+        .map((d) => d.group),
+      editDraft,
+      editError: options.editError ?? null,
+      media,
+      formatDate,
+      statusColor,
+      statusLabel,
+      deliveryColor,
+      deliveryLabel,
+      mediaKindLabel,
+    });
+  }
+
+  /** Черновик уже есть — пост и список вложений не зависят друг от друга. */
+  private async loadCampaignWith(id: string, editDraft: EditDraft) {
+    const [post, media] = await Promise.all([
+      this.posts.getPostWithDeliveries(id),
+      this.mediaWithPinned(editDraft.attachmentIds),
+    ]);
+    return [post, editDraft, media] as const;
+  }
+
+  /** Черновика нет — он строится из полей поста, и без поста его не собрать. */
+  private async loadCampaignDefault(id: string) {
+    const post = await this.posts.getPostWithDeliveries(id);
+    const editDraft = this.editDraftFromPost(post);
+    const media = await this.mediaWithPinned(editDraft.attachmentIds);
+    return [post, editDraft, media] as const;
+  }
+
+  private editDraftFromPost(post: {
+    text: string;
+    vkTextOverride: string | null;
+    maxTextOverride: string | null;
+    autoDeleteAfterMinutes: number | null;
+    attachments: { mediaAssetId: string }[];
+  }): EditDraft {
+    return {
+      text: post.text,
+      vkTextOverride: post.vkTextOverride ?? '',
+      maxTextOverride: post.maxTextOverride ?? '',
+      autoDeleteAfterMinutes:
+        post.autoDeleteAfterMinutes != null
+          ? String(post.autoDeleteAfterMinutes)
+          : '',
+      attachmentIds: post.attachments.map((a) => a.mediaAssetId),
+    };
+  }
+
+  private editDraftFrom(body: EditPublishedFormBody): EditDraft {
+    return {
+      text: body.text ?? '',
+      vkTextOverride: body.vkTextOverride ?? '',
+      maxTextOverride: body.maxTextOverride ?? '',
+      autoDeleteAfterMinutes: body.autoDeleteAfterMinutes ?? '',
+      attachmentIds: asArray(body.attachmentIds),
+    };
+  }
+
   private async renderNewPost(
     res: Response,
     req: Request,
@@ -1620,13 +1841,7 @@ export class PanelController {
 
     let asset: MediaAsset;
     try {
-      asset = await this.media.upload({
-        buffer: file.buffer,
-        // Multer отдаёт имя в latin1; без перекодировки кириллица приезжает
-        // кракозябрами — а это имя видит получатель документа.
-        filename: Buffer.from(file.originalname, 'latin1').toString('utf8'),
-        declaredMimeType: file.mimetype,
-      });
+      asset = await this.uploadFormFile(file);
     } catch (err: unknown) {
       if (!(err instanceof AppException)) {
         this.logger.error({ err }, 'Не удалось загрузить вложение');
@@ -1804,10 +2019,6 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
   'nothing-done': {
     kind: 'info',
     message: 'Нечего было обновлять: пост нигде не опубликован',
-  },
-  'bad-minutes': {
-    kind: 'danger',
-    message: 'Срок автоудаления — целое число минут от 1 до года',
   },
   'group-added': { kind: 'success', message: 'Сообщество подключено' },
   'group-failed': {

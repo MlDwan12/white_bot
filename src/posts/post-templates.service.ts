@@ -160,10 +160,7 @@ export class PostTemplatesService {
           create: groupIds.map((groupId) => ({ groupId })),
         },
         attachments: {
-          create: attachmentIds.map((mediaAssetId, position) => ({
-            mediaAssetId,
-            position,
-          })),
+          create: PostsService.attachmentCreateData(attachmentIds),
         },
       },
     });
@@ -267,11 +264,9 @@ export class PostTemplatesService {
         ? [
             this.prisma.postAttachment.deleteMany({ where: { postId: id } }),
             this.prisma.postAttachment.createMany({
-              data: attachmentIds.map((mediaAssetId, position) => ({
-                postId: id,
-                mediaAssetId,
-                position,
-              })),
+              data: PostsService.attachmentCreateData(attachmentIds).map(
+                (row) => ({ postId: id, ...row }),
+              ),
             }),
           ]
         : []),
@@ -607,10 +602,9 @@ export class PostTemplatesService {
           create: recipients.map((t) => ({ groupId: t.groupId })),
         },
         attachments: {
-          create: attachments.map((a, position) => ({
-            mediaAssetId: a.mediaAssetId,
-            position,
-          })),
+          create: PostsService.attachmentCreateData(
+            attachments.map((a) => a.mediaAssetId),
+          ),
         },
       },
     });

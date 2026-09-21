@@ -88,7 +88,12 @@ describe('VkApiClient', () => {
       expect(init.body.get('attachments')).toBe('photo-123_1,doc-123_2');
     });
 
-    it('edits without an attachments param when none are given', async () => {
+    it('edits with an explicit empty attachments param when none are given', async () => {
+      // В отличие от wallPost (новый пост — нечего сохранять), правка обязана
+      // прислать параметр всегда: отсутствие поля у VK, по всей видимости,
+      // означает «не трогать вложения», а не «убрать их» — тот же живой факт,
+      // что и у MAX (см. комментарий у wallEdit). Не проверено на самом VK:
+      // wall.edit пока отклоняется для любого значения параметра.
       mockFetchOnce(jsonResponse({ response: 1 }));
       const client = new VkApiClient();
 
@@ -98,8 +103,24 @@ describe('VkApiClient', () => {
         string,
         { body: URLSearchParams },
       ];
-      expect(init.body.has('attachments')).toBe(false);
+      expect(init.body.get('attachments')).toBe('');
       expect(init.body.get('post_id')).toBe('777');
+    });
+
+    it('edits with the given attachments joined by comma', async () => {
+      mockFetchOnce(jsonResponse({ response: 1 }));
+      const client = new VkApiClient();
+
+      await client.wallEdit('token', '123', 777, 'updated text', [
+        'photo-123_1',
+        'doc-123_2',
+      ]);
+
+      const [, init] = (global.fetch as jest.Mock).mock.calls[0] as [
+        string,
+        { body: URLSearchParams },
+      ];
+      expect(init.body.get('attachments')).toBe('photo-123_1,doc-123_2');
     });
 
     it('deletes by post_id with a negative owner_id', async () => {

@@ -75,6 +75,45 @@ describe('MaxApiClient', () => {
     expect(extra.attachments[0]).toBe(photo);
   });
 
+  it('omits attachments entirely when sending a fresh message without any', async () => {
+    const sendMessageToChat = jest.fn().mockResolvedValue(message('mid-1'));
+    const client = new MaxApiClient(fakeBot({ sendMessageToChat }));
+
+    await client.sendMessageToChat(1, 'текст');
+
+    expect(sendMessageToChat).toHaveBeenCalledWith(1, 'текст', {});
+  });
+
+  it('always sends an explicit attachments field when editing, even empty', async () => {
+    // Живой факт про MAX: PUT /messages без поля `attachments` оставляет
+    // прежние вложения как есть, а не опускает их. Опустить поле здесь —
+    // значит не суметь снять картинку с уже опубликованного поста.
+    const editMessage = jest.fn().mockResolvedValue({});
+    const client = new MaxApiClient(fakeBot({ editMessage }));
+
+    await client.editMessage('mid-1', 'новый текст');
+
+    expect(editMessage).toHaveBeenCalledWith('mid-1', {
+      text: 'новый текст',
+      attachments: [],
+    });
+  });
+
+  it('edits with the given attachments and keyboard together', async () => {
+    const editMessage = jest.fn().mockResolvedValue({});
+    const client = new MaxApiClient(fakeBot({ editMessage }));
+    const photo = { type: 'image', payload: { token: 'tok' } } as never;
+
+    await client.editMessage('mid-1', 'текст', {
+      attachments: [photo],
+      buttons: [[{ type: 'callback', text: 'Да', payload: 'yes' }]],
+    });
+
+    const extra = callArg<{ attachments: unknown[] }>(editMessage, 0, 1);
+    expect(extra.attachments).toHaveLength(2);
+    expect(extra.attachments[0]).toBe(photo);
+  });
+
   it('falls back to an identifiable title when MAX returns none', async () => {
     const getChat = jest
       .fn()
