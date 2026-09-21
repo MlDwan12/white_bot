@@ -12,6 +12,7 @@ function setup() {
     platformUser: {
       upsert: jest.fn().mockResolvedValue({ id: 'pu-1' }),
       findUnique: jest.fn().mockResolvedValue(null),
+      findMany: jest.fn().mockResolvedValue([]),
     },
   };
   const service = new PlatformUsersService(prisma as unknown as PrismaService);
@@ -89,5 +90,34 @@ describe('PlatformUsersService.recordConsent', () => {
     }>(prisma.platformUser.upsert);
     expect(call.create.consentedAt).toBeInstanceOf(Date);
     expect(call.update.consentedAt).toBeInstanceOf(Date);
+  });
+});
+
+describe('PlatformUsersService.search', () => {
+  it('ищет по имени и username без учёта регистра, только среди согласившихся', async () => {
+    const { service, prisma } = setup();
+
+    await service.search('max', 'Иван');
+
+    const call = callArg<{
+      where: {
+        platform: string;
+        consentedAt: { not: null };
+        OR: unknown[];
+      };
+    }>(prisma.platformUser.findMany);
+    expect(call.where.platform).toBe('max');
+    expect(call.where.consentedAt).toEqual({ not: null });
+    expect(call.where.OR).toEqual([
+      { displayName: { contains: 'Иван', mode: 'insensitive' } },
+      { username: { contains: 'Иван', mode: 'insensitive' } },
+    ]);
+  });
+
+  it('пустой запрос не идёт в базу и отвечает пустым списком', async () => {
+    const { service, prisma } = setup();
+
+    expect(await service.search('max', '   ')).toEqual([]);
+    expect(prisma.platformUser.findMany).not.toHaveBeenCalled();
   });
 });

@@ -14,6 +14,17 @@ export interface PlatformUserProfile {
   raw?: unknown;
 }
 
+/** То, что панель показывает в результатах поиска получателя. */
+export interface PlatformUserSummary {
+  id: string;
+  externalUserId: string;
+  displayName: string;
+  username: string | null;
+}
+
+/** Строк в ответе на поиск — не список на всю базу, а подсказка для выбора. */
+const SEARCH_LIMIT = 20;
+
 /**
  * Профиль человека с платформы: единое место записи для всех, кто впервые
  * видит платформенного пользователя (участие в конкурсе, старт бота) или
@@ -61,6 +72,41 @@ export class PlatformUsersService {
     user: PlatformUserProfile,
   ): Promise<void> {
     await this.upsertRow(platform, user, { consentedAt: new Date() });
+  }
+
+  /**
+   * Поиск получателя личного сообщения — по имени или username, без учёта
+   * регистра. Только те, кто дал согласие: не показывать в выборе того, кому
+   * сообщение всё равно не отправить легально (сейчас это и так гарантия
+   * конструкции — профиль не заводится без согласия, — но фильтр дешёвый и
+   * не завязан на то, что это всегда будет так).
+   */
+  async search(
+    platform: Platform,
+    query: string,
+  ): Promise<PlatformUserSummary[]> {
+    const q = query.trim();
+    if (!q) {
+      return [];
+    }
+    return this.prisma.platformUser.findMany({
+      where: {
+        platform,
+        consentedAt: { not: null },
+        OR: [
+          { displayName: { contains: q, mode: 'insensitive' } },
+          { username: { contains: q, mode: 'insensitive' } },
+        ],
+      },
+      select: {
+        id: true,
+        externalUserId: true,
+        displayName: true,
+        username: true,
+      },
+      orderBy: { lastSeenAt: 'desc' },
+      take: SEARCH_LIMIT,
+    });
   }
 
   /** Общий upsert для `upsert`/`recordConsent` — отличаются только полем согласия. */

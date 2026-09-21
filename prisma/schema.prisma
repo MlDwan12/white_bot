@@ -156,6 +156,7 @@ model Post {
   attachments       PostAttachment[]
   contest           Contest?
   templateTargets   PostTemplateTarget[]
+  directMessages    DirectMessageDelivery[]
 
   @@index([clonedFromPostId])
   @@index([recurringTemplateId])
@@ -221,6 +222,41 @@ model PostDelivery {
   @@index([status, updatedAt])
   /// Выборка доставок, которым пора автоудаляться.
   @@index([autoDeleteDueAt])
+}
+
+enum DirectMessageStatus {
+  pending
+  sending
+  sent
+  failed
+}
+
+/// Личное сообщение с текстом поста конкретному платформенному пользователю.
+/// Отдельно от `PostDelivery` намеренно: та привязана к `Group` (каналу) —
+/// личка адресуется человеку, а не каналу, и получателей может быть на
+/// порядки больше, чем групп у поста.
+model DirectMessageDelivery {
+  id                String              @id @default(uuid())
+  postId            String
+  platformUserId    String
+  status            DirectMessageStatus @default(pending)
+  externalMessageId String?
+  error             String?
+  sentAt            DateTime?
+  attemptsMade      Int                 @default(0)
+  createdAt         DateTime            @default(now())
+  // Тот же смысл, что и у PostDelivery.updatedAt: отличить недавно начатую
+  // отправку от зависшей — воркер для этой таблицы появится отдельным шагом.
+  updatedAt         DateTime            @updatedAt
+
+  post         Post         @relation(fields: [postId], references: [id])
+  platformUser PlatformUser @relation(fields: [platformUserId], references: [id])
+
+  // Повторный запуск рассылки по тем же получателям не должен задваивать
+  // сообщения — тот же смысл, что unique(postId, groupId) у PostDelivery.
+  @@unique([postId, platformUserId])
+  @@index([platformUserId])
+  @@index([status, updatedAt])
 }
 
 /// Загруженный файл. Хранится на диске (путь относительно MEDIA_STORAGE_PATH),
@@ -350,6 +386,7 @@ model PlatformUser {
   consentedAt    DateTime?
 
   contestEntries ContestParticipant[]
+  directMessages DirectMessageDelivery[]
 
   @@unique([platform, externalUserId])
 }
