@@ -36,6 +36,10 @@ import {
   setAuthCookies,
 } from '../auth/auth.cookies';
 import { readCookie } from '../auth/read-cookie';
+import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
+import { VkApiError } from '../vk/vk-api.error';
+import { VK_OAUTH_STATE_COOKIE } from '../vk/vk-oauth-state';
+import { parseVkAuthInput } from '../vk/vk-auth-input';
 import { PostsService } from '../posts/posts.service';
 import { PostModerationService } from '../posts/post-moderation.service';
 import { GroupsService } from '../groups/groups.service';
@@ -155,6 +159,7 @@ export class PanelController {
     private readonly groups: GroupsService,
     private readonly contests: ContestsService,
     private readonly templates: PostTemplatesService,
+    private readonly vkToken: VkUploaderTokenService,
     private readonly media: MediaService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
@@ -235,9 +240,12 @@ export class PanelController {
     @Req() req: Request,
     @CurrentAdmin() admin: AdminUser,
     @Query('flash') flash?: string,
+    // Причина отказа отправки приходит сюда же: без неё баннер говорил бы
+    // «пост не отправлен», не объясняя почему.
+    @Query('reason') reason?: string,
   ) {
     return {
-      ...this.shell(req, 'Посты', admin, 'campaigns', flash),
+      ...this.shell(req, 'Посты', admin, 'campaigns', flash, reason),
       page: 'campaigns',
       campaigns: await this.posts.listCampaigns(),
       statusColor,
@@ -351,7 +359,12 @@ export class PanelController {
   @UseGuards(AdminAuthGuard, CsrfGuard)
   @RequirePermissions('posts_manage')
   async send(@Param('id') id: string, @Res() res: Response): Promise<void> {
-    await this.posts.schedulePost(id);
+    try {
+      await this.posts.schedulePost(id);
+    } catch (err: unknown) {
+      this.redirectSendFailure(res, err);
+      return;
+    }
     res.redirect(`${PANEL_PREFIX}/campaigns?flash=sent`);
   }
 
@@ -367,7 +380,12 @@ export class PanelController {
   @UseGuards(AdminAuthGuard, CsrfGuard)
   @RequirePermissions('posts_manage')
   async resume(@Param('id') id: string, @Res() res: Response): Promise<void> {
-    await this.posts.resumePost(id);
+    try {
+      await this.posts.resumePost(id);
+    } catch (err: unknown) {
+      this.redirectSendFailure(res, err);
+      return;
+    }
     res.redirect(`${PANEL_PREFIX}/campaigns?flash=resumed`);
   }
 
@@ -383,16 +401,27 @@ export class PanelController {
     @Query('flash') flash?: string,
     @Query('reason') reason?: string,
   ) {
-    const all = await this.groups.listGroups();
+    const [all, vkToken] = await Promise.all([
+      this.groups.listGroups(),
+      this.vkToken.getStatus(),
+    ]);
     return {
       ...this.shell(req, 'Группы', admin, 'groups', flash, reason),
       page: 'groups',
+      vkToken,
+      // Без ключей приложения VK кнопка вела бы в ошибку 500: ссылка на
+      // авторизацию собирается из `VK_APP_ID`.
+      vkAppConfigured: Boolean(
+        this.config.get<string>('VK_APP_ID') &&
+        this.config.get<string>('VK_APP_CLIENT_SECRET'),
+      ),
       // Отключённые не прячем: без них непонятно, куда делась группа, в
       // которую раньше уходили посты.
       groups: all,
       pending: all.filter((g) => g.status === 'pending_confirmation'),
       groupColor,
       groupLabel,
+      formatDate,
     };
   }
 
@@ -424,9 +453,7 @@ export class PanelController {
       // Токен в форму не возвращаем — вводить заново. Он секрет, и его
       // место не в перерисованной странице, которая осядет в истории
       // браузера и в кэше.
-      res.redirect(
-        `${PANEL_PREFIX}/groups?flash=group-failed&reason=${encodeURIComponent(reason)}`,
-      );
+      this.redirectFlash(res, 'groups', 'group-failed', reason);
     }
   }
 
@@ -1233,6 +1260,92 @@ export class PanelController {
     );
   }
 
+  /**
+   * Второй шаг подключения личного токена VK: админ вставляет адрес страницы,
+   * на которой оказался после разрешения доступа. См. `parseVkAuthInput` о
+   * том, почему код приходится передавать руками.
+   *
+   * Защита та же, что у `/vk/oauth/callback`: код принимается, только если
+   * авторизация начата **в этом браузере** (кука со `state`, десять минут) и
+   * `state` из вставленного текста совпадает с кукой — обязательно, даже
+   * когда сам код распознан и без него. Иначе подсунутый чужой код молча
+   * заменил бы загрузочный токен всего развёртывания. Форма при этом закрыта
+   * CSRF-токеном, так что с чужого сайта её не отправить.
+   */
+  @Post('vk-token')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('groups_tokens_manage')
+  async connectVkToken(
+    @Body() body: { pasted?: string },
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
+    const back = (flash: string, reason: string) =>
+      this.redirectFlash(res, 'groups', flash, reason);
+
+    const parsed = parseVkAuthInput(body.pasted ?? '');
+    if (!parsed) {
+      back(
+        'vk-token-failed',
+        'Не нашёл в тексте код авторизации. Вставьте адрес страницы целиком — из адресной строки браузера после того, как разрешили доступ.',
+      );
+      return;
+    }
+    if (parsed.kind === 'denied') {
+      back('vk-token-failed', `VK не выдал доступ: ${parsed.description}`);
+      return;
+    }
+
+    const expectedState = readCookie(req, VK_OAUTH_STATE_COOKIE);
+    if (!expectedState) {
+      back(
+        'vk-token-failed',
+        'Авторизация не была начата в этом браузере или прошло больше 10 минут. Нажмите «1. Открыть авторизацию VK» и пройдите её заново.',
+      );
+      return;
+    }
+    // `state` обязателен, даже если сам код распознан без него (см.
+    // `parseVkAuthInput`): без него нечего сверять с кукой, а значит нечем
+    // доказать, что именно этот код получен именно в этом потоке
+    // авторизации, а не подсунут — та же защита, что и у
+    // `/vk/oauth/callback`, где отсутствие `state` тоже отказ.
+    if (parsed.state === null || parsed.state !== expectedState) {
+      back(
+        'vk-token-failed',
+        parsed.state === null
+          ? 'В скопированном тексте нет state — вставьте адрес страницы целиком, а не только код.'
+          : 'Этот адрес относится к другой авторизации. Пройдите её заново, начав с кнопки «1. Открыть авторизацию VK».',
+      );
+      return;
+    }
+
+    try {
+      const { expiresAt } = await this.vkToken.exchangeAuthorizationCode(
+        parsed.code,
+      );
+      // Одноразовая кука своё отработала — не оставляем её лежать.
+      res.clearCookie(VK_OAUTH_STATE_COOKIE);
+      back('vk-token-ok', `Действует до ${formatDate(expiresAt)}`);
+    } catch (err: unknown) {
+      // Чужие сбои (не от самого VK и не бизнес-отказ) не глотаются —
+      // тот же принцип, что и у `redirectSendFailure`: неисправность
+      // инфраструктуры должна дойти до общего обработчика ошибок, а не
+      // выглядеть как истёкший код.
+      if (!(err instanceof VkApiError) && !(err instanceof AppException)) {
+        throw err;
+      }
+      this.logger.warn({ err }, 'Не удалось подключить личный токен VK');
+      back(
+        'vk-token-failed',
+        err instanceof VkApiError
+          ? // Код одноразовый и недолговечный: типичная причина отказа —
+            // не сбой, а то, что он уже использован или устарел.
+            `${err.message}. Код одноразовый и живёт недолго: если ошибка повторяется, пройдите авторизацию заново с кнопки «1. Открыть авторизацию VK».`
+          : err.message,
+      );
+    }
+  }
+
   // ----- создание поста ---------------------------------------------------
 
   @Get('posts/new')
@@ -1292,9 +1405,10 @@ export class PanelController {
       return;
     }
 
+    let post: { id: string };
     try {
       const scheduledAt = this.parseSchedule(body.scheduledAt);
-      const post = await this.posts.createPost({
+      post = await this.posts.createPost({
         text: draft.text,
         // Браузер шлёт одно значение строкой, а несколько — массивом. Без
         // приведения кампания с одной группой ушла бы с `groupIds: 'uuid'`,
@@ -1303,23 +1417,83 @@ export class PanelController {
         attachmentIds: draft.attachmentIds,
         scheduledAt,
       });
-
-      if (body.action === 'send') {
-        await this.posts.schedulePost(post.id);
-        res.redirect(`${PANEL_PREFIX}/campaigns?flash=sent`);
-        return;
-      }
-      res.redirect(`${PANEL_PREFIX}/campaigns?flash=draft`);
     } catch (err: unknown) {
       // Форма перерисовывается с тем, что человек набрал. Уронить его в
       // общий экран ошибки — значит потерять текст, выбор групп и
-      // расписание из-за одной непоставленной галочки.
+      // расписание из-за одной непоставленной галочки. Ничего не сохранено:
+      // ошибка случилась до записи.
       await this.renderNewPost(res, req, admin, draft, {
         status: 400,
         error:
           err instanceof AppException ? err.message : 'Не удалось создать пост',
       });
+      return;
     }
+
+    if (body.action !== 'send') {
+      res.redirect(`${PANEL_PREFIX}/campaigns?flash=draft`);
+      return;
+    }
+
+    // Отправка — отдельным шагом, и отказ здесь **не** перерисовывает форму:
+    // пост уже сохранён черновиком, и форма с ошибкой соблазняла бы нажать
+    // «Отправить» ещё раз — то есть создать второй такой же. Человека ведут
+    // на список, где черновик виден и откуда его можно отправить, когда
+    // причина устранена (например, обновлён токен VK).
+    try {
+      await this.posts.schedulePost(post.id);
+    } catch (err: unknown) {
+      this.redirectSendFailure(
+        res,
+        err,
+        'Пост сохранён черновиком — отправьте его из списка, когда причина будет устранена.',
+      );
+      return;
+    }
+    res.redirect(`${PANEL_PREFIX}/campaigns?flash=sent`);
+  }
+
+  /**
+   * Отказ отправки как баннер на списке постов. Причина берётся из ошибки, а
+   * для просроченного токена VK баннер получает кнопку «Обновить токен» —
+   * раньше он говорил «обновите», не показывая, где и как.
+   *
+   * Чужие сбои (не `AppException`) не глотаются: это неисправность, а не
+   * отказ по правилам, и ей место на странице ошибки.
+   */
+  private redirectSendFailure(
+    res: Response,
+    err: unknown,
+    suffix?: string,
+  ): void {
+    if (!(err instanceof AppException)) {
+      throw err;
+    }
+    const reason = suffix ? `${err.message}. ${suffix}` : err.message;
+    const action =
+      err.code === ErrorCode.VK_UPLOADER_TOKEN_EXPIRED ? 'vk-token' : undefined;
+    this.redirectFlash(res, 'campaigns', 'send-failed', reason, action);
+  }
+
+  /**
+   * `<страница>?flash=<вид>&reason=<причина>&action=<кнопка>` — этот адрес
+   * складывали вручную в трёх местах, и он с лёгкостью может разойтись:
+   * `reason` обязан идти через `encodeURIComponent` (это единственное
+   * место, где в шаблон попадает строка из запроса), а `flash`/`action` —
+   * всегда литералы из белого списка (`FLASHES`/`FLASH_ACTIONS`), поэтому
+   * их не экранируют.
+   */
+  private redirectFlash(
+    res: Response,
+    page: string,
+    flash: string,
+    reason?: string,
+    action?: string,
+  ): void {
+    let url = `${PANEL_PREFIX}/${page}?flash=${flash}`;
+    if (reason) url += `&reason=${encodeURIComponent(reason)}`;
+    if (action) url += `&action=${action}`;
+    res.redirect(url);
   }
 
   private postDraftFrom(body: PostFormBody): PostDraft {
@@ -1496,11 +1670,40 @@ export class PanelController {
       // унаследованное значение, и в шапке нарисовался бы пустой серый
       // баннер — ровно то, что список должен был исключить.
       flash: Object.hasOwn(FLASHES, flash ?? '') ? FLASHES[flash!] : null,
+      ...this.flashAction(req, permissions),
       // Причина отказа приходит текстом в адресе, поэтому выводится
       // отдельно и **только** экранированной: это единственное место, где
       // в шаблон попадает строка из запроса.
       flashReason: typeof reason === 'string' ? reason.slice(0, 300) : null,
     };
+  }
+
+  /**
+   * Кнопка в баннере — только тому, у кого есть право на само действие:
+   * кнопка, ведущая в «недостаточно прав», хуже её отсутствия. Остальным
+   * вместо кнопки — подсказка, к кому обратиться.
+   */
+  private flashAction(
+    req: Request,
+    permissions: Set<Permission>,
+  ): {
+    flashAction: { label: string; href: string } | null;
+    flashHint: string | null;
+  } {
+    const key = typeof req.query.action === 'string' ? req.query.action : '';
+    if (!Object.hasOwn(FLASH_ACTIONS, key)) {
+      return { flashAction: null, flashHint: null };
+    }
+    const action = FLASH_ACTIONS[key];
+    return permissions.has(action.permission)
+      ? {
+          flashAction: { label: action.label, href: action.href },
+          flashHint: null,
+        }
+      : {
+          flashAction: null,
+          flashHint: 'Сделать это может только разработчик — попросите его.',
+        };
   }
 
   private secureCookies(): boolean {
@@ -1544,6 +1747,22 @@ function parseMinutes(raw: string | undefined): number | null {
   return parsed;
 }
 
+/**
+ * Кнопки, которые баннер может показать. Ключ приходит в адресе (`?action=`),
+ * поэтому, как и сами сообщения, берётся только из белого списка: подставить
+ * туда произвольную ссылку через адрес нельзя.
+ */
+export const FLASH_ACTIONS: Record<
+  string,
+  { label: string; href: string; permission: Permission }
+> = {
+  'vk-token': {
+    label: 'Обновить токен VK',
+    href: '/panel/groups#vk-token',
+    permission: 'groups_tokens_manage',
+  },
+};
+
 /** Сообщения после редиректа: держим списком, чтобы не пускать текст из URL. */
 export const FLASHES: Record<string, { kind: string; message: string }> = {
   // Каждое действие обязано иметь свою запись: без неё `shell` отфильтрует
@@ -1585,6 +1804,12 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
     kind: 'danger',
     message: 'Не удалось изменить повторяющийся пост',
   },
+  'vk-token-ok': { kind: 'success', message: 'Личный токен VK подключён' },
+  'vk-token-failed': {
+    kind: 'danger',
+    message: 'Не удалось подключить личный токен VK',
+  },
+  'send-failed': { kind: 'warning', message: 'Пост не отправлен' },
   'contest-created': { kind: 'success', message: 'Конкурс создан' },
   'contest-opened': { kind: 'success', message: 'Приём участников открыт' },
   'contest-drawn': { kind: 'success', message: 'Розыгрыш проведён' },

@@ -22,8 +22,19 @@ function fakeResponse() {
   return { cookie: jest.fn(), redirect: jest.fn() };
 }
 
+/**
+ * Контроллер читает куки через общий `readCookie` (см. `../auth/read-cookie`),
+ * который смотрит в `req.cookies` — туда их в реальном запросе кладёт
+ * `cookie-parser` (подключён глобально в `main.ts`). Здесь эта разборка
+ * сделана вручную, чтобы не тянуть само мидлварное в юнит-тест.
+ */
 function fakeRequest(cookieHeader?: string): Request {
-  return { headers: { cookie: cookieHeader } } as unknown as Request;
+  const cookies: Record<string, string> = {};
+  for (const part of (cookieHeader ?? '').split(';')) {
+    const [key, ...rest] = part.trim().split('=');
+    if (key) cookies[key] = rest.join('=');
+  }
+  return { cookies } as unknown as Request;
 }
 
 describe('VkOAuthController', () => {

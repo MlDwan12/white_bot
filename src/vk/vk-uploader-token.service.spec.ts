@@ -44,6 +44,50 @@ describe('VkUploaderTokenService', () => {
     jest.restoreAllMocks();
   });
 
+  describe('getStatus', () => {
+    const HOUR = 60 * 60 * 1000;
+
+    it('говорит «не подключён», пока токена нет', async () => {
+      const { service, prisma } = buildService();
+      prisma.vkUploaderToken.findUnique.mockResolvedValue(null);
+
+      expect(await service.getStatus()).toEqual({
+        state: 'missing',
+        expiresAt: null,
+      });
+    });
+
+    it('говорит «действует» и называет срок', async () => {
+      const { service, prisma } = buildService();
+      const expiresAt = new Date(Date.now() + 10 * HOUR);
+      prisma.vkUploaderToken.findUnique.mockResolvedValue({ expiresAt });
+
+      expect(await service.getStatus()).toEqual({ state: 'usable', expiresAt });
+    });
+
+    it('говорит «истёк», если срок вышел, и всё равно называет его', async () => {
+      const { service, prisma } = buildService();
+      const expiresAt = new Date(Date.now() - HOUR);
+      prisma.vkUploaderToken.findUnique.mockResolvedValue({ expiresAt });
+
+      expect(await service.getStatus()).toEqual({
+        state: 'expired',
+        expiresAt,
+      });
+    });
+
+    it('считает токен истёкшим за минуту до срока, как и isUsable', async () => {
+      // Панель не должна показывать зелёное там, где отправка уже откажет:
+      // статус и `isUsable` обязаны отвечать одинаково.
+      const { service, prisma } = buildService();
+      const expiresAt = new Date(Date.now() + 1000);
+      prisma.vkUploaderToken.findUnique.mockResolvedValue({ expiresAt });
+
+      expect((await service.getStatus()).state).toBe('expired');
+      expect(await service.isUsable()).toBe(false);
+    });
+  });
+
   describe('getValidAccessToken', () => {
     it('throws VK_UPLOADER_TOKEN_EXPIRED with a reauthorize link when no token was ever saved', async () => {
       const { service, prisma } = buildService();

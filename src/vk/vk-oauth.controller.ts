@@ -4,22 +4,13 @@ import type { Request, Response } from 'express';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { VkApiError } from './vk-api.error';
+import { VK_OAUTH_STATE_COOKIE } from './vk-oauth-state';
 import { VkUploaderTokenService } from './vk-uploader-token.service';
 import { AdminAuthGuard } from '../auth/admin-auth.guard';
 import { RequirePermissions } from '../auth/require-permissions.decorator';
+import { readCookie } from '../auth/read-cookie';
 
-const STATE_COOKIE = 'vk_oauth_state';
-const STATE_COOKIE_MAX_AGE_MS = 10 * 60 * 1000;
-
-function readCookie(req: Request, name: string): string | undefined {
-  const header = req.headers.cookie;
-  if (!header) return undefined;
-  for (const part of header.split(';')) {
-    const [key, ...rest] = part.trim().split('=');
-    if (key === name) return decodeURIComponent(rest.join('='));
-  }
-  return undefined;
-}
+const VK_OAUTH_STATE_COOKIE_MAX_AGE_MS = 10 * 60 * 1000;
 
 /**
  * Re-authorization flow for the personal VK uploader token (see
@@ -53,10 +44,10 @@ export class VkOAuthController {
   @RequirePermissions('groups_tokens_manage')
   authorize(@Res() res: Response): void {
     const state = randomBytes(16).toString('hex');
-    res.cookie(STATE_COOKIE, state, {
+    res.cookie(VK_OAUTH_STATE_COOKIE, state, {
       httpOnly: true,
       sameSite: 'lax',
-      maxAge: STATE_COOKIE_MAX_AGE_MS,
+      maxAge: VK_OAUTH_STATE_COOKIE_MAX_AGE_MS,
     });
     res.redirect(this.uploaderToken.buildAuthorizeUrl(state));
   }
@@ -75,7 +66,7 @@ export class VkOAuthController {
       );
     }
 
-    const expectedState = readCookie(req, STATE_COOKIE);
+    const expectedState = readCookie(req, VK_OAUTH_STATE_COOKIE);
     if (!state || !expectedState || state !== expectedState) {
       throw new AppException(
         ErrorCode.VALIDATION_ERROR,

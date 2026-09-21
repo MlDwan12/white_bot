@@ -5,6 +5,7 @@ import { PostsModule } from '../posts/posts.module';
 import { GroupsModule } from '../groups/groups.module';
 import { MediaModule } from '../media/media.module';
 import { ContestsModule } from '../contests/contests.module';
+import { VkModule } from '../vk/vk.module';
 import { PanelController } from './panel.controller';
 import { SilentRefreshMiddleware } from './silent-refresh.middleware';
 
@@ -16,6 +17,7 @@ import { SilentRefreshMiddleware } from './silent-refresh.middleware';
     GroupsModule,
     MediaModule,
     ContestsModule,
+    VkModule,
   ],
   controllers: [PanelController],
   providers: [SilentRefreshMiddleware],

@@ -7,3 +7,6 @@ src/generated
 !.env.example
 coverage
 *.tsbuildinfo
+# Локальные медиа и заметки с доступами не должны попадать в контекст сборки.
+storage
+PROGRESS.md

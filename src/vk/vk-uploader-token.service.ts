@@ -159,13 +159,28 @@ export class VkUploaderTokenService {
    * refusing to start: by then some groups have the post and others don't.
    */
   async isUsable(): Promise<boolean> {
+    return (await this.getStatus()).state === 'usable';
+  }
+
+  /**
+   * Состояние токена для панели: подключён ли он вообще, действует ли ещё и
+   * до какого момента. «Действует» считается с тем же запасом, что и у
+   * `isUsable`, — иначе панель показывала бы зелёное там, где отправка уже
+   * откажет.
+   */
+  async getStatus(): Promise<{
+    state: 'usable' | 'expired' | 'missing';
+    expiresAt: Date | null;
+  }> {
     const row = await this.prisma.vkUploaderToken.findUnique({
       where: { id: SINGLETON_ID },
     });
-    return (
-      row !== null &&
-      row.expiresAt.getTime() - EXPIRY_SAFETY_MARGIN_MS > Date.now()
-    );
+    if (!row) {
+      return { state: 'missing', expiresAt: null };
+    }
+    const usable =
+      row.expiresAt.getTime() - EXPIRY_SAFETY_MARGIN_MS > Date.now();
+    return { state: usable ? 'usable' : 'expired', expiresAt: row.expiresAt };
   }
 
   /** Throws AppException(VK_UPLOADER_TOKEN_EXPIRED, details.reauthorizeUrl) if missing/expired. */

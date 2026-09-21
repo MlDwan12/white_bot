@@ -53,6 +53,16 @@
       .tag-purple { background: #f4e4f7; color: #762a89; }
       .tag-teal { background: #ddf3ec; color: #075b42; }
       .tag-dark { background: #e0e3e8; color: #1f2937; }
+      /*
+        Баннеры. У Tabler жёлтый текст предупреждения на кремовом фоне
+        читается плохо, как и метки выше, — берём те же проверенные пары.
+        Селектор `.alert.alert-X` сильнее одиночного `.alert-X` у темы, так
+        что `!important` не нужен.
+      */
+      .alert.alert-success { background: #e2f4e5; color: #185b23; border-color: #b6dfbd; }
+      .alert.alert-warning { background: #fef2db; color: #714900; border-color: #f4d79b; }
+      .alert.alert-danger { background: #f9e3e3; color: #8d2626; border-color: #eab5b5; }
+      .alert.alert-info { background: #e5f1fb; color: #24537a; border-color: #b7d6ef; }
       /* Цветной текст без фона — те же затемнённые оттенки. */
       .tone-green { color: #185b23; }
       .tone-red { color: #8d2626; }
@@ -117,6 +127,15 @@
               <%= flash.message %>
               <% if (flashReason) { %>
                 <div class="small mt-1"><%= flashReason %></div>
+              <% } %>
+              <%
+                 /* Кнопка действия — из белого списка на сервере, только тому,
+                    у кого есть право; остальным — подсказка, к кому идти. */
+              %>
+              <% if (flashAction) { %>
+                <a class="btn btn-sm btn-primary mt-2" href="<%= flashAction.href %>"><%= flashAction.label %></a>
+              <% } else if (flashHint) { %>
+                <div class="small mt-1"><%= flashHint %></div>
               <% } %>
             </div>
           <% } %>

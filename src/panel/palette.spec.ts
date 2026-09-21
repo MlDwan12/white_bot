@@ -7,6 +7,7 @@ import {
   PostDeliveryStatus,
   PostStatus,
 } from '../generated/prisma/client';
+import { FLASHES } from './panel.controller';
 import {
   contestColor,
   deliveryColor,
@@ -34,6 +35,20 @@ function paletteOf(prefix: 'tag' | 'tone') {
     const bg = /background:\s*(#[0-9a-f]{6})/i.exec(m[2])?.[1];
     const text = /(?<![-\w])color:\s*(#[0-9a-f]{6})/i.exec(m[2])?.[1];
     if (text) {
+      pairs.set(m[1], { bg, text });
+    }
+  }
+  return pairs;
+}
+
+/** Пары фона и текста у баннеров: `.alert.alert-<вид> { … }`. */
+function alertPalette() {
+  const pairs = new Map<string, { bg: string; text: string }>();
+  const rule = /\.alert\.alert-([a-z]+)\s*\{([^}]*)\}/g;
+  for (const m of layout.matchAll(rule)) {
+    const bg = /background:\s*(#[0-9a-f]{6})/i.exec(m[2])?.[1];
+    const text = /(?<![-\w])color:\s*(#[0-9a-f]{6})/i.exec(m[2])?.[1];
+    if (bg && text) {
       pairs.set(m[1], { bg, text });
     }
   }
@@ -109,6 +124,23 @@ describe('палитра меток панели', () => {
 
     expect(missingTags).toEqual([]);
     expect(missingTones).toEqual([]);
+  });
+
+  it('баннеры читаемы: контраст не ниже 4,5:1, и у каждого вида из FLASHES есть пара', () => {
+    // Жёлтый текст предупреждения на кремовом фоне у темы почти не читался.
+    const alerts = alertPalette();
+    const kinds = new Set([
+      ...Object.values(FLASHES).map((flash) => flash.kind),
+      'info', // баннер-пояснение на странице нового конкурса, не из FLASHES
+    ]);
+
+    expect([...kinds].filter((kind) => !alerts.has(kind))).toEqual([]);
+    for (const [kind, { bg, text }] of alerts) {
+      expect({ kind, ok: contrast(bg, text) >= 4.5 }).toEqual({
+        kind,
+        ok: true,
+      });
+    }
   });
 
   it('шаблоны не возвращаются к бейджам без цвета текста', () => {
