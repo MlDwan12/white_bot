@@ -6,6 +6,8 @@ import { GroupsModule } from '../groups/groups.module';
 import { MediaModule } from '../media/media.module';
 import { ContestsModule } from '../contests/contests.module';
 import { VkModule } from '../vk/vk.module';
+import { PlatformUsersModule } from '../platform-users/platform-users.module';
+import { DirectMessagesModule } from '../direct-messages/direct-messages.module';
 import { PanelController } from './panel.controller';
 import { SilentRefreshMiddleware } from './silent-refresh.middleware';
 
@@ -18,6 +20,8 @@ import { SilentRefreshMiddleware } from './silent-refresh.middleware';
     MediaModule,
     ContestsModule,
     VkModule,
+    PlatformUsersModule,
+    DirectMessagesModule,
   ],
   controllers: [PanelController],
   providers: [SilentRefreshMiddleware],

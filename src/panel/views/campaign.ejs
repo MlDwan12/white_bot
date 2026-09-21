@@ -199,5 +199,92 @@
         </div>
       </div>
     <% } %>
+
+    <div class="card mt-3">
+      <div class="card-header"><h3 class="card-title">Разослать в личку</h3></div>
+      <div class="card-body">
+        <%
+           /* Текст поста — тот же, что выше, специальной формы под него
+              нет: рассылка отправляет существующий пост, не новое
+              сообщение. Только MAX — VK пока не умеет личку от сообщества. */
+        %>
+        <form method="get" action="/panel/campaigns/<%= post.id %>" class="input-group mb-3">
+          <input class="form-control" type="text" name="dmQuery"
+                 placeholder="Найти по имени или username"
+                 value="<%= dmQuery || '' %>" />
+          <button class="btn" type="submit">Найти</button>
+        </form>
+
+        <form method="post" action="/panel/campaigns/<%= post.id %>/direct-messages">
+          <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+
+          <%
+             /* Ничего не отмечено по умолчанию — ни здесь, ни в других
+                режимах ниже: поиск, сделанный «просто посмотреть», не должен
+                молча стать выбранным получателем, если админ передумает и
+                отправит форму в другом режиме. Явный клик — единственный
+                способ что-то выбрать. */
+          %>
+          <div class="mb-3">
+            <label class="form-check">
+              <input class="form-check-input" type="radio" name="mode" value="user" />
+              <span class="form-check-label">Конкретному человеку</span>
+            </label>
+            <div class="ms-4 mt-1">
+              <% if (dmResults && dmResults.length > 0) { %>
+                <% dmResults.forEach(function (u) { %>
+                  <label class="form-check d-flex align-items-center">
+                    <input class="form-check-input" type="radio" name="platformUserId"
+                           value="<%= u.id %>" />
+                    <span class="form-check-label">
+                      <%= u.displayName %>
+                      <% if (u.username) { %><span class="text-secondary">@<%= u.username %></span><% } %>
+                    </span>
+                  </label>
+                <% }); %>
+              <% } else if (dmQuery) { %>
+                <div class="text-secondary small">Никого не нашлось по «<%= dmQuery %>»</div>
+              <% } %>
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-check">
+              <input class="form-check-input" type="radio" name="mode" value="group" />
+              <span class="form-check-label">Участникам группы</span>
+            </label>
+            <div class="ms-4 mt-1">
+              <% if (dmGroups.length > 0) { %>
+                <%
+                   /* Без `selected` браузер по умолчанию выбрал бы первую
+                      группу из списка — незаметно для админа, который не
+                      трогал список вовсе. Пустой плейсхолдер первым пунктом
+                      делает это явным пустым значением: `dmSelectorFrom`
+                      уже отбрасывает пустой `groupId` как «ничего не
+                      выбрано», а не как первую группу в списке. */
+                %>
+                <select class="form-select" name="groupId">
+                  <option value="">— выберите группу —</option>
+                  <% dmGroups.forEach(function (g) { %>
+                    <option value="<%= g.id %>"><%= g.title %></option>
+                  <% }); %>
+                </select>
+              <% } else { %>
+                <span class="text-secondary small">Нет активных MAX-групп</span>
+              <% } %>
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-check">
+              <input class="form-check-input" type="radio" name="mode" value="all" />
+              <span class="form-check-label">Всем в базе</span>
+            </label>
+          </div>
+
+          <button class="btn btn-primary" type="submit">Разослать</button>
+        </form>
+      </div>
+    </div>
   </div>
 </div>

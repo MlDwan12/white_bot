@@ -52,6 +52,9 @@ import {
   PostTemplatesService,
 } from '../posts/post-templates.service';
 import { MediaService, MAX_FILE_BYTES } from '../media/media.service';
+import { PlatformUsersService } from '../platform-users/platform-users.service';
+import { DirectMessageDispatchService } from '../direct-messages/direct-message-dispatch.service';
+import { DirectMessageRecipientSelector } from '../direct-messages/direct-message-recipients.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type {
   AdminUser,
@@ -161,6 +164,13 @@ interface EditDraft {
   attachmentIds: string[];
 }
 
+/** Поля формы «Разослать в личку» — как их присылает браузер. */
+interface DirectMessageFormBody {
+  mode?: string;
+  platformUserId?: string;
+  groupId?: string;
+}
+
 /** Сколько строк показывают списки конкурсов и постов-кандидатов. */
 const LIST_LIMIT = 50;
 
@@ -181,6 +191,8 @@ export class PanelController {
     private readonly templates: PostTemplatesService,
     private readonly vkToken: VkUploaderTokenService,
     private readonly media: MediaService,
+    private readonly platformUsers: PlatformUsersService,
+    private readonly directMessages: DirectMessageDispatchService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly logger: PinoLogger,
@@ -283,11 +295,16 @@ export class PanelController {
     @CurrentAdmin() admin: AdminUser,
     @Res() res: Response,
     @Query('flash') flash?: string,
+    // Причина отказа, как и у списка кампаний: без неё баннер об отказе
+    // рассылки в личку не сказал бы, почему — реальный кейс с появлением
+    // этого маршрута, до него отказы сюда не редиректили.
+    @Query('reason') reason?: string,
+    @Query('dmQuery') dmQuery?: string,
   ): Promise<void> {
     // Через тот же `renderCampaign`, что и повтороный показ после загрузки
     // файла посреди правки: разошедшиеся копии полей — на первом же
     // добавленном.
-    await this.renderCampaign(res, req, admin, id, { flash });
+    await this.renderCampaign(res, req, admin, id, { flash, reason, dmQuery });
   }
 
   @Post('campaigns/:id/edit-published')
@@ -506,6 +523,55 @@ export class PanelController {
       return;
     }
     res.redirect(`${PANEL_PREFIX}/campaigns?flash=resumed`);
+  }
+
+  /**
+   * Режим решает форма (`mode`), не то, какие поля заполнены: три радио на
+   * одной странице, без JS, отправляют все свои поля разом, и только
+   * отмеченный режим говорит, какое из них имеет значение.
+   */
+  @Post('campaigns/:id/direct-messages')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async sendDirectMessages(
+    @Param('id') id: string,
+    @Body() body: DirectMessageFormBody,
+    @Res() res: Response,
+  ): Promise<void> {
+    const selector = this.dmSelectorFrom(body);
+    if (!selector) {
+      this.redirectFlash(res, `campaigns/${id}`, 'dm-no-selection');
+      return;
+    }
+    try {
+      const { queued } = await this.directMessages.sendNow(id, selector);
+      this.redirectFlash(
+        res,
+        `campaigns/${id}`,
+        'dm-sent',
+        `Поставлено в очередь: ${queued}`,
+      );
+    } catch (err: unknown) {
+      if (!(err instanceof AppException)) {
+        throw err;
+      }
+      this.redirectFlash(res, `campaigns/${id}`, 'dm-failed', err.message);
+    }
+  }
+
+  private dmSelectorFrom(
+    body: DirectMessageFormBody,
+  ): DirectMessageRecipientSelector | null {
+    if (body.mode === 'user' && body.platformUserId) {
+      return { mode: 'user', platformUserId: body.platformUserId };
+    }
+    if (body.mode === 'group' && body.groupId) {
+      return { mode: 'group', groupId: body.groupId };
+    }
+    if (body.mode === 'all') {
+      return { mode: 'all' };
+    }
+    return null;
   }
 
   // ----- группы -----------------------------------------------------------
@@ -1652,8 +1718,10 @@ export class PanelController {
     options: {
       status?: number;
       flash?: string;
+      reason?: string;
       editDraft?: EditDraft;
       editError?: string | null;
+      dmQuery?: string;
     } = {},
   ): Promise<void> {
     // По умолчанию — то, что сейчас на посте; после загрузки файла или
@@ -1663,8 +1731,27 @@ export class PanelController {
     const [post, editDraft, media] = options.editDraft
       ? await this.loadCampaignWith(id, options.editDraft)
       : await this.loadCampaignDefault(id);
+    // Пусто — поиск ещё не запускали, отличать от «запустили и никого не
+    // нашли» (пустой массив): первое молчит, второе показывает «не нашлось».
+    const dmQuery = options.dmQuery?.trim() || null;
+    const [dmResults, activeGroups] = await Promise.all([
+      // Только MAX: личные сообщения сейчас реально уходят только туда.
+      dmQuery ? this.platformUsers.search('max', dmQuery) : null,
+      this.activeGroups(),
+    ]);
+    // Тот же фильтр: группа VK в этом списке выглядела бы рабочим выбором,
+    // а её участники молча осели бы в manual_required — воркер не может
+    // слать личные сообщения через VK, только через MAX.
+    const dmGroups = activeGroups.filter((group) => group.platform === 'max');
     res.status(options.status ?? 200).render('layout', {
-      ...this.shell(req, 'Пост', admin, 'campaigns', options.flash),
+      ...this.shell(
+        req,
+        'Пост',
+        admin,
+        'campaigns',
+        options.flash,
+        options.reason,
+      ),
       page: 'campaign',
       post,
       // Править и удалять можно только там, где пост действительно вышел и
@@ -1681,6 +1768,9 @@ export class PanelController {
       editDraft,
       editError: options.editError ?? null,
       media,
+      dmQuery,
+      dmResults,
+      dmGroups,
       formatDate,
       statusColor,
       statusLabel,
@@ -2051,6 +2141,12 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
     message: 'Не удалось подключить личный токен VK',
   },
   'send-failed': { kind: 'warning', message: 'Пост не отправлен' },
+  'dm-sent': { kind: 'success', message: 'Рассылка в личку запущена' },
+  'dm-failed': { kind: 'danger', message: 'Рассылка в личку не запущена' },
+  'dm-no-selection': {
+    kind: 'warning',
+    message: 'Выберите получателя, группу или «всех в базе»',
+  },
   'contest-created': { kind: 'success', message: 'Конкурс создан' },
   'contest-opened': { kind: 'success', message: 'Приём участников открыт' },
   'contest-drawn': { kind: 'success', message: 'Розыгрыш проведён' },
