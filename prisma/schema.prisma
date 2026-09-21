@@ -230,6 +230,10 @@ enum DirectMessageStatus {
   sending
   sent
   failed
+  /// Недоставимо по конструкции (не MAX, нечисловой id) — не спутать с
+  /// настоящим провалом отправки: тот же смысл, что и у
+  /// ContestNotifyStatus.manual_required.
+  manual_required
 }
 
 /// Личное сообщение с текстом поста конкретному платформенному пользователю.
