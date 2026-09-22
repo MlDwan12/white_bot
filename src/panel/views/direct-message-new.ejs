@@ -1,0 +1,177 @@
+<h1 class="page-title mb-3">Написать в личку</h1>
+
+<%
+   /* Один пост под капотом (нужен `DirectMessageDispatchService.sendNow`),
+      но без единой группы и без расписания — отправка в личку и
+      публикация на стену здесь никак не связаны, поэтому в форме нет ни
+      выбора групп, ни поля «когда». Текст, вложение и получатель уходят
+      одним сабмитом: пост создаётся и рассылается в одном запросе. */
+%>
+<form method="post" action="/panel/direct-messages">
+<input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+<div class="row g-3">
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-body">
+        <% if (error) { %>
+          <div class="alert alert-danger" role="alert"><%= error %></div>
+        <% } %>
+        <div class="mb-3">
+          <label class="form-label" for="text">Текст</label>
+          <textarea class="form-control" id="text" name="text" rows="6"
+                    required><%= draft.text %></textarea>
+        </div>
+
+        <% if (media.length > 0) { %>
+          <div class="mb-3">
+            <label class="form-label">Вложения</label>
+            <% media.forEach(function (m) { %>
+              <label class="form-check d-flex align-items-center">
+                <input class="form-check-input" type="checkbox" name="attachmentIds"
+                       value="<%= m.id %>"
+                       <%= draft.attachmentIds.includes(m.id) ? 'checked' : '' %> />
+                <span class="form-check-label d-flex align-items-center">
+                  <%- include('media-thumb', { m: m }) %>
+                  <%= m.filename %> <span class="text-secondary small ms-1"><%= mediaKindLabel(m.kind) %></span>
+                </span>
+              </label>
+            <% }); %>
+          </div>
+        <% } %>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header"><h3 class="card-title">Кому</h3></div>
+      <div class="card-body">
+        <%
+           /* Тот же приём, что у «Разослать в личку» на карточке поста:
+              ничего не отмечено по умолчанию — режим решает радио `mode`,
+              не то, какие поля заполнены. */
+        %>
+        <div class="mb-3">
+          <label class="form-check">
+            <%
+               /* Отмечается сама, если поиск только что выполнялся
+                  (`dmQuery` не пуст) — иначе полная перезагрузка страницы
+                  после «Найти» (без JS страница не умеет по-другому) сбрасывала
+                  бы этот радио, а вместе с ним CSS ниже схлопывал бы и саму
+                  карточку поиска, и уже найденный результат — то, ради чего
+                  и искали. Это не «умолчание по списку» (от него и
+                  оберегает «ничего не отмечено по умолчанию» по остальной
+                  форме) — это прямое следствие явного действия админа:
+                  клика «Найти». */
+            %>
+            <input class="form-check-input" id="dm-mode-user" type="radio" name="mode" value="user"
+                   <%= dmQuery ? 'checked' : '' %> />
+            <span class="form-check-label">Конкретному человеку</span>
+          </label>
+          <%
+             /* id, а не просто класс: нужен точный CSS-селектор ниже (в
+                layout.ejs), который прячет результат поиска, пока не выбран
+                именно этот режим — до правки список отображался всегда,
+                независимо от того, каким способом решили разослать. */
+          %>
+          <div id="dm-user-results" class="ms-4 mt-1">
+            <% if (dmResults && dmResults.length > 0) { %>
+              <% dmResults.forEach(function (u) { %>
+                <label class="form-check d-flex align-items-center">
+                  <input class="form-check-input" type="radio" name="platformUserId"
+                         value="<%= u.id %>" />
+                  <span class="form-check-label">
+                    <%= u.displayName %>
+                    <% if (u.username) { %><span class="text-secondary">@<%= u.username %></span><% } %>
+                  </span>
+                </label>
+              <% }); %>
+            <% } else if (dmQuery) { %>
+              <div class="text-secondary small">Никого не нашлось по «<%= dmQuery %>»</div>
+            <% } %>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-check">
+            <input class="form-check-input" type="radio" name="mode" value="group" />
+            <span class="form-check-label">Участникам группы</span>
+          </label>
+          <div class="ms-4 mt-1">
+            <% if (dmGroups.length > 0) { %>
+              <select class="form-select" name="groupId">
+                <option value="">— выберите группу —</option>
+                <% dmGroups.forEach(function (g) { %>
+                  <option value="<%= g.id %>"><%= g.title %></option>
+                <% }); %>
+              </select>
+              <small class="form-hint">
+                Все согласившиеся участники конкурсов, чей анонс уходил в
+                эту группу — не только те, кто пришёл именно из неё.
+              </small>
+            <% } else { %>
+              <span class="text-secondary small">Нет активных MAX-групп</span>
+            <% } %>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-check">
+            <input class="form-check-input" type="radio" name="mode" value="all" />
+            <span class="form-check-label">Всем в базе</span>
+          </label>
+        </div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary" type="submit">Разослать</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-4">
+    <%
+       /* id — тот же приём, что у #dm-user-results: карточка поиска видна
+          только в режиме «Конкретному человеку» (см. CSS в layout.ejs).
+          Чисто CSS, без перезагрузки — переключение радио ничего не
+          отправляет на сервер и не может сбросить набранный текст. */
+    %>
+    <div id="dm-search-card" class="card">
+      <div class="card-body">
+        <label class="form-label" for="dmQuery-inline">Найти человека по имени или username</label>
+        <div class="input-group">
+          <input class="form-control" id="dmQuery-inline" type="text" name="dmQuery"
+                 placeholder="Имя или username" value="<%= dmQuery || '' %>" />
+          <%
+             /* Тот же приём, что у кнопки «Загрузить» ниже: не отдельная
+                форма, а переопределение метода/адреса у кнопки той же
+                формы — поиск становится GET-перезагрузкой той же
+                страницы, но с теми же полями, так что набранный текст и
+                отмеченные вложения едут вместе с ним, а не теряются. */
+          %>
+          <button class="btn" type="submit" formmethod="get"
+                  formaction="/panel/direct-messages/new" formnovalidate>Найти</button>
+        </div>
+        <small class="form-hint">
+          Результат появится слева, в режиме «Конкретному человеку». Поиск
+          не трогает набранный текст.
+        </small>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-body">
+        <label class="form-label" for="file">Загрузить вложение</label>
+        <input class="form-control" id="file" type="file" name="file" />
+        <small class="form-hint">
+          Файл до 50 МБ. После загрузки он появится в списке слева и
+          отметится сам, а набранный текст сохранится. Выбранный файл
+          прикрепляется только кнопкой «Загрузить» — «Разослать» его не
+          берёт.
+        </small>
+      </div>
+      <div class="card-footer">
+        <button class="btn w-100" type="submit" formaction="/panel/direct-messages/media"
+                formenctype="multipart/form-data" formnovalidate>Загрузить</button>
+      </div>
+    </div>
+  </div>
+</div>
+</form>

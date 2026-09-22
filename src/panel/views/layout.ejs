@@ -74,6 +74,16 @@
       .tone-purple { color: #762a89; }
       .tone-teal { color: #075b42; }
       .tone-dark { color: #1f2937; }
+      /*
+        «Написать в личку» (direct-message-new.ejs): результат поиска
+        человека должен быть виден только в режиме «Конкретному человеку» —
+        без этого он торчал поверх формы независимо от выбранного способа
+        рассылки. Чистый CSS, а не JS: страница — обычная SSR-форма, и
+        показ/скрытие по состоянию `:checked` не требует скрипта.
+      */
+      #dm-user-results, #dm-search-card { display: none; }
+      form:has(#dm-mode-user:checked) #dm-user-results,
+      form:has(#dm-mode-user:checked) #dm-search-card { display: block; }
     </style>
   </head>
   <body class="layout-fluid">
@@ -96,6 +106,11 @@
               <% if (can('posts_manage')) { %>
                 <li class="nav-item<%= active === 'templates' ? ' active' : '' %>">
                   <a class="nav-link" href="/panel/templates">Повторяющиеся</a>
+                </li>
+              <% } %>
+              <% if (can('posts_manage')) { %>
+                <li class="nav-item<%= active === 'direct-message-new' ? ' active' : '' %>">
+                  <a class="nav-link" href="/panel/direct-messages/new">Написать в личку</a>
                 </li>
               <% } %>
               <% if (can('contests_manage')) { %>

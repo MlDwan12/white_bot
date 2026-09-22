@@ -11,6 +11,7 @@ import { REDIS_CLIENT } from '../queue/queue.constants';
 import { PostsService } from './posts.service';
 import { PostTemplatesService } from './post-templates.service';
 import { PostModerationService } from './post-moderation.service';
+import { ContestsService } from '../contests/contests.service';
 
 const SWEEP_INTERVAL_MS = 60_000;
 
@@ -48,6 +49,8 @@ const LOCK_TTL_MS = 30_000;
  * closes the gap between them: recurring templates whose time has come are
  * fired, campaigns whose job was lost (or whose time passed while the app was
  * down) get re-queued, and deliveries abandoned mid-flight are resolved.
+ * Contests due to open or be drawn (by `startsAt`/`endsAt`) ride the same
+ * sweep for the reason in the comment above `openDueContests`.
  *
  * Runs behind a Redis lock so that adding a second app instance later doesn't
  * produce two reconcilers racing over the same rows.
@@ -65,6 +68,7 @@ export class PostReconcilerService
     private readonly posts: PostsService,
     private readonly templates: PostTemplatesService,
     private readonly moderation: PostModerationService,
+    private readonly contests: ContestsService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly logger: PinoLogger,
   ) {
@@ -142,6 +146,33 @@ export class PostReconcilerService
         await this.templates.fireDueTemplates(now);
       } catch (err: unknown) {
         this.logger.error({ err }, 'Не удалось поднять повторяющиеся посты');
+      }
+      // Изолировано так же: конкурсы — отдельный домен, и сбой здесь не
+      // должен выглядеть сбоем всей сверки постов.
+      try {
+        await this.contests.openDueContests(now);
+        // Не только что открытые в этом проходе — любой открытый конкурс с
+        // анонсом, всё ещё лежащим черновиком. Так закрывается и сегодняшнее
+        // открытие (участие без публикации и публикация без участия здесь
+        // не расходятся молча), и повтор для того, чей `schedulePostIfDraft`
+        // упал в прошлом проходе — раньше такая связка не подхватывалась
+        // больше никогда, `openDueContests` смотрит только на `draft`-статус
+        // самого конкурса. Провал одной отправки не должен отменять попытку
+        // для остальных в этом же проходе.
+        const stuck = await this.contests.openContestsWithUnsentAnnouncement();
+        for (const contest of stuck) {
+          try {
+            await this.posts.schedulePostIfDraft(contest.postId, now);
+          } catch (err: unknown) {
+            this.logger.error(
+              { err, contestId: contest.id, postId: contest.postId },
+              'Приём открыт, но анонс-пост отправить не удалось',
+            );
+          }
+        }
+        await this.contests.drawDueContests(now);
+      } catch (err: unknown) {
+        this.logger.error({ err }, 'Не удалось обработать конкурсы по датам');
       }
     } catch (err: unknown) {
       // Never rethrow: this runs on a timer with nobody to catch it, and one

@@ -1,66 +1,128 @@
 <h1 class="page-title mb-3">Новый конкурс</h1>
 
+<%
+   /* Одна форма: конкурс и его анонс-пост создаются вместе, одним
+      сабмитом — раньше это были два разных экрана (создать пост, вернуться
+      сюда, выбрать его из списка), и найти нужный пост в списке было легко
+      перепутать. Группы не выбраны — поста не будет вовсе (конкурс без
+      анонса, участники только вручную — старое поведение, оно осталось).
+
+      Порядок в документе важен: неявную отправку по Enter выполняет первая
+      кнопка отправки, и это должна быть «Создать», а не «Загрузить» —
+      поэтому загрузка картинки стоит правее и ниже. */
+%>
+<form method="post" action="/panel/contests">
+<input type="hidden" name="_csrf" value="<%= csrfToken %>" />
 <div class="row g-3">
   <div class="col-lg-8">
-    <form method="post" action="/panel/contests" class="card">
-      <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+    <div class="card">
       <div class="card-body">
         <% if (error) { %>
           <div class="alert alert-danger" role="alert"><%= error %></div>
         <% } %>
 
         <div class="mb-3">
-          <label class="form-label" for="title">Название</label>
+          <label class="form-label" for="title">Заголовок</label>
           <input class="form-control" id="title" name="title" required
                  value="<%= draft.title %>" />
           <small class="form-hint">Видно только в панели.</small>
         </div>
 
         <div class="mb-3">
-          <label class="form-label" for="postId">Анонс-пост</label>
-          <select class="form-select" id="postId" name="postId">
-            <option value="">— без анонса, участники вносятся вручную —</option>
-            <% posts.forEach(function (p) { %>
-              <option value="<%= p.id %>" <%= draft.postId === p.id ? 'selected' : '' %>>
-                <%= p.text.slice(0, 80) %> — <%= statusLabel(p.status) %>,
-                <%= formatDate(p.createdAt) %>
-              </option>
-            <% }); %>
-          </select>
+          <label class="form-label" for="description">Описание</label>
+          <textarea class="form-control" id="description" name="description" rows="4"
+                    required><%= draft.description %></textarea>
           <%
-             /* У конкурса нет своих текста и картинок: то, что видят
-                подписчики, — это анонс-пост. Раньше страница об этом молчала,
-                и человек искал, куда вставить картинку. */
+             /* Раньше это было панельное поле, а текст анонса набирался
+                отдельно на карточке поста — два места для одного и того же
+                смысла. Теперь описание и есть текст анонса: подписчики
+                видят ровно то, что здесь набрано. */
           %>
-          <div class="alert alert-info mt-2" role="alert">
-            <strong>Картинка и текст конкурса — это анонс-пост.</strong>
-            Создайте его в разделе
-            <a href="/panel/posts/new">«Новый пост»</a>
-            (там же прикрепляется картинка), нажмите «Сохранить черновик» и
-            вернитесь сюда — пост появится в этом списке.
-          </div>
           <small class="form-hint">
-            В доставки этого поста добавится кнопка участия. Поэтому в списке
-            только ещё не отправленные посты без конкурса: у вышедшего кнопке
-            взяться уже неоткуда, а конкурс остался бы без входа для
-            участников.
-            <% if (posts.length >= listLimit) { %>
-              Показаны последние <%= listLimit %>.
-            <% } %>
+            Это и есть текст анонс-поста — то, что увидят подписчики (если
+            ниже отмечен хотя бы один канал).
           </small>
         </div>
 
+        <% if (media.length > 0) { %>
+          <div class="mb-3">
+            <label class="form-label">Картинка</label>
+            <% media.forEach(function (m) { %>
+              <label class="form-check d-flex align-items-center">
+                <input class="form-check-input" type="checkbox" name="attachmentIds"
+                       value="<%= m.id %>"
+                       <%= draft.attachmentIds.includes(m.id) ? 'checked' : '' %> />
+                <span class="form-check-label d-flex align-items-center">
+                  <%- include('media-thumb', { m: m }) %>
+                  <%= m.filename %> <span class="text-secondary small ms-1"><%= mediaKindLabel(m.kind) %></span>
+                </span>
+              </label>
+            <% }); %>
+          </div>
+        <% } %>
+
         <div class="mb-3">
-          <label class="form-label" for="joinButtonLabel">Подпись кнопки до розыгрыша</label>
+          <label class="form-label" for="joinButtonLabel">Текст кнопки до розыгрыша</label>
           <input class="form-control" id="joinButtonLabel" name="joinButtonLabel"
                  placeholder="Участвовать" value="<%= draft.joinButtonLabel %>" />
         </div>
-
         <div class="mb-3">
-          <label class="form-label" for="resultsButtonLabel">Подпись кнопки после розыгрыша</label>
+          <label class="form-label" for="resultsButtonLabel">Текст кнопки после розыгрыша</label>
           <input class="form-control" id="resultsButtonLabel" name="resultsButtonLabel"
                  placeholder="Узнать результаты" value="<%= draft.resultsButtonLabel %>" />
           <small class="form-hint">Кнопка та же — по итогам у неё меняется подпись.</small>
+        </div>
+
+        <div class="row g-3 mb-3">
+          <div class="col-sm-4">
+            <label class="form-label" for="placesCount">Кол. мест</label>
+            <input class="form-control" id="placesCount" type="number" min="0"
+                   name="placesCount" value="<%= draft.placesCount %>" />
+            <small class="form-hint">
+              Места 1..N с подписями по умолчанию — правятся потом на
+              карточке конкурса.
+            </small>
+          </div>
+          <div class="col-sm-4">
+            <label class="form-label" for="publishAt">Публикация в</label>
+            <input class="form-control" id="publishAt" type="datetime-local"
+                   name="publishAt" value="<%= draft.publishAt %>" />
+            <small class="form-hint">
+              Пусто — открыть приём и отправить анонс только вручную.
+            </small>
+          </div>
+          <div class="col-sm-4">
+            <label class="form-label" for="endsAt">Завершение в</label>
+            <input class="form-control" id="endsAt" type="datetime-local"
+                   name="endsAt" value="<%= draft.endsAt %>" />
+            <small class="form-hint">
+              Пусто — разыграть только вручную. Не в прошлом и требует хотя
+              бы одного места выше.
+            </small>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Каналы публикации</label>
+          <% if (groups.length === 0) { %>
+            <div class="text-secondary">Нет активных групп.</div>
+          <% } else { %>
+            <% groups.forEach(function (g) { %>
+              <label class="form-check">
+                <input class="form-check-input" type="checkbox" name="groupIds"
+                       value="<%= g.id %>"
+                       <%= draft.groupIds.includes(g.id) ? 'checked' : '' %> />
+                <span class="form-check-label">
+                  <%= g.title %>
+                  <span class="tag tag-<%= platformColor(g.platform) %> ms-1"><%= platformLabel(g.platform) %></span>
+                </span>
+              </label>
+            <% }); %>
+          <% } %>
+          <small class="form-hint">
+            Ничего не отмечено — конкурс без анонса, участники вносятся
+            только вручную.
+          </small>
         </div>
 
         <label class="form-check">
@@ -79,14 +141,38 @@
           <span class="form-check-label">Дописать победителей в текст анонса</span>
         </label>
         <div class="form-hint">
-          Единственный канал, который видят все подписчики. Без анонс-поста
-          ни на что не влияет.
+          Единственный канал, который видят все подписчики. Без выбранного
+          канала выше ни на что не влияет.
         </div>
       </div>
       <div class="card-footer d-flex gap-2">
         <button class="btn btn-primary" type="submit">Создать</button>
         <a class="btn" href="/panel/contests">Отмена</a>
       </div>
-    </form>
+    </div>
+  </div>
+
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-body">
+        <label class="form-label" for="file">Загрузить картинку</label>
+        <input class="form-control" id="file" type="file" name="file" />
+        <small class="form-hint">
+          Файл до 50 МБ. После загрузки он появится в списке слева и
+          отметится сам, а всё набранное сохранится. Выбранный файл
+          прикрепляется только кнопкой «Загрузить» — «Создать» его не
+          берёт.
+        </small>
+      </div>
+      <div class="card-footer">
+        <%
+           /* `formnovalidate`: у описания стоит `required`, и без этого
+              загрузить картинку до того, как оно набрано, было бы нельзя. */
+        %>
+        <button class="btn w-100" type="submit" formaction="/panel/contests/media"
+                formenctype="multipart/form-data" formnovalidate>Загрузить</button>
+      </div>
+    </div>
   </div>
 </div>
+</form>

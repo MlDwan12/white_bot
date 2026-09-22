@@ -91,7 +91,7 @@ import {
   sameSchedule,
 } from './cron-preset';
 import type { ScheduleForm, SchedulePreset } from './cron-preset';
-import { zonedToUtc } from './zoned-time';
+import { utcToZoned, zonedToUtc } from './zoned-time';
 
 interface TemplateFormBody {
   text?: string;
@@ -147,6 +147,36 @@ interface PostDraft {
   scheduledAt: string;
 }
 
+/** Поля формы «Новый конкурс» — как их присылает браузер. */
+interface NewContestFormBody {
+  title?: string;
+  description?: string;
+  groupIds?: string | string[];
+  attachmentIds?: string | string[];
+  file?: string;
+  joinButtonLabel?: string;
+  resultsButtonLabel?: string;
+  notifyWinners?: string;
+  publishResultsInPost?: string;
+  publishAt?: string;
+  endsAt?: string;
+  placesCount?: string;
+}
+
+interface NewContestDraft {
+  title: string;
+  description: string;
+  groupIds: string[];
+  attachmentIds: string[];
+  joinButtonLabel: string;
+  resultsButtonLabel: string;
+  notifyWinners: boolean;
+  publishResultsInPost: boolean;
+  publishAt: string;
+  endsAt: string;
+  placesCount: string;
+}
+
 /** Поля формы «Правка опубликованного» — как их присылает браузер. */
 interface EditPublishedFormBody {
   text?: string;
@@ -164,11 +194,48 @@ interface EditDraft {
   attachmentIds: string[];
 }
 
+/**
+ * Поля формы «Править черновик» — как их присылает браузер. Отдельный тип от
+ * `EditPublishedFormBody`: здесь есть группы и расписание, которых там нет и
+ * быть не может (черновик ещё нигде не доставлен).
+ */
+interface EditDraftPostFormBody {
+  text?: string;
+  vkTextOverride?: string;
+  maxTextOverride?: string;
+  groupIds?: string | string[];
+  attachmentIds?: string | string[];
+  scheduledAt?: string;
+  file?: string;
+}
+
+interface DraftEditState {
+  text: string;
+  vkTextOverride: string;
+  maxTextOverride: string;
+  groupIds: string[];
+  attachmentIds: string[];
+  scheduledAt: string;
+}
+
 /** Поля формы «Разослать в личку» — как их присылает браузер. */
 interface DirectMessageFormBody {
   mode?: string;
   platformUserId?: string;
   groupId?: string;
+}
+
+/** Поля формы «Написать в личку» — как их присылает браузер. */
+interface DirectMessageDraftFormBody extends DirectMessageFormBody {
+  text?: string;
+  attachmentIds?: string | string[];
+  /** Как у `PostFormBody.file` — имя выбранного, но не загруженного файла. */
+  file?: string;
+}
+
+interface DirectMessageDraft {
+  text: string;
+  attachmentIds: string[];
 }
 
 /** Сколько строк показывают списки конкурсов и постов-кандидатов. */
@@ -467,6 +534,127 @@ export class PanelController {
     });
   }
 
+  /**
+   * Правка черновика — текст, оба переопределения, группы, расписание и
+   * вложения. В отличие от «Правки опубликованного», подтверждения на
+   * проталкивание тоже нет: ничего ещё не доставлено, менять можно свободно.
+   */
+  @Post('campaigns/:id/edit-draft')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async editDraftPost(
+    @Param('id') id: string,
+    @Body() body: EditDraftPostFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const draft = this.draftEditFrom(body);
+
+    // Тот же приём, что у «Нового поста»: имя выбранного, но не
+    // загруженного файла присутствует, а тела файла в этой форме нет.
+    const pendingFile = body.file?.trim();
+    if (pendingFile) {
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        draftEdit: draft,
+        draftEditError: `Вы выбрали файл «${pendingFile}», но не загрузили его. Выберите файл заново, нажмите «Загрузить», а потом сохраняйте.`,
+      });
+      return;
+    }
+
+    try {
+      const scheduledAt = this.parseSchedule(draft.scheduledAt);
+      await this.posts.editDraft(id, {
+        text: draft.text,
+        vkTextOverride: draft.vkTextOverride,
+        maxTextOverride: draft.maxTextOverride,
+        groupIds: draft.groupIds,
+        attachmentIds: draft.attachmentIds,
+        scheduledAt,
+      });
+    } catch (err: unknown) {
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        draftEdit: draft,
+        draftEditError:
+          err instanceof AppException ? err.message : 'Не удалось сохранить',
+      });
+      return;
+    }
+
+    await this.renderCampaign(res, req, admin, id, { flash: 'draft-edited' });
+  }
+
+  /** Загрузка вложения для правки черновика — своя копия, тот же приём, что у `campaigns/:id/media`. */
+  @Post('campaigns/:id/media-draft')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_FILE_BYTES },
+    }),
+    CsrfInterceptor,
+  )
+  async uploadDraftMedia(
+    @Param('id') id: string,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Body() body: EditDraftPostFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const draft = this.draftEditFrom(body);
+
+    if (!file) {
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        draftEdit: draft,
+        draftEditError: 'Файл не выбран',
+      });
+      return;
+    }
+
+    let asset: MediaAsset;
+    try {
+      asset = await this.uploadFormFile(file);
+    } catch (err: unknown) {
+      if (!(err instanceof AppException)) {
+        this.logger.error({ err }, 'Не удалось загрузить вложение');
+      }
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        draftEdit: draft,
+        draftEditError:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось загрузить файл',
+      });
+      return;
+    }
+
+    const attachmentIds = [...new Set([...draft.attachmentIds, asset.id])];
+    try {
+      await this.posts.assertAttachmentsUsable(attachmentIds);
+    } catch (err: unknown) {
+      await this.renderCampaign(res, req, admin, id, {
+        status: 400,
+        draftEdit: { ...draft, attachmentIds },
+        draftEditError:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось загрузить файл',
+      });
+      return;
+    }
+
+    await this.renderCampaign(res, req, admin, id, {
+      flash: 'uploaded',
+      draftEdit: { ...draft, attachmentIds },
+    });
+  }
+
   @Post('campaigns/:id/delete-published')
   @UseGuards(AdminAuthGuard, CsrfGuard)
   @RequirePermissions('posts_manage')
@@ -572,6 +760,237 @@ export class PanelController {
       return { mode: 'all' };
     }
     return null;
+  }
+
+  /**
+   * «Написать в личку»: в отличие от «Разослать в личку» на карточке
+   * поста, здесь пост не существует заранее — форма сама пишет текст и
+   * вложения и в одном запросе создаёт DM-only пост да отправляет его,
+   * без промежуточного черновика на экране и без выбора групп.
+   *
+   * Поиск получателя перезагружает страницу той же формой, но с
+   * `formmethod="get"` на кнопке «Найти» (см. `direct-message-new.ejs`) —
+   * все поля формы, включая `text`/`attachmentIds`, едут вместе с этим
+   * запросом, а не только `dmQuery`, иначе перерисовка стирала бы то, что
+   * админ уже успел набрать.
+   */
+  @Get('direct-messages/new')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  async newDirectMessage(
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+    @Query()
+    query: DirectMessageDraftFormBody & {
+      flash?: string;
+      reason?: string;
+      dmQuery?: string;
+    },
+  ): Promise<void> {
+    await this.renderDirectMessageForm(
+      res,
+      req,
+      admin,
+      this.directMessageDraftFrom(query),
+      { flash: query.flash, reason: query.reason, dmQuery: query.dmQuery },
+    );
+  }
+
+  @Post('direct-messages')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('posts_manage')
+  async createDirectMessage(
+    @Body() body: DirectMessageDraftFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const draft = this.directMessageDraftFrom(body);
+
+    // Тот же приём, что у «Нового поста»: имя выбранного, но не
+    // загруженного файла присутствует, а тела файла в этой форме нет —
+    // молча отправить без картинки, которую человек выбрал, нельзя.
+    const pendingFile = body.file?.trim();
+    if (pendingFile) {
+      await this.renderDirectMessageForm(res, req, admin, draft, {
+        status: 400,
+        error: `Вы выбрали файл «${pendingFile}», но не загрузили его. Выберите файл заново, нажмите «Загрузить», а потом отправляйте.`,
+      });
+      return;
+    }
+
+    const selector = this.dmSelectorFrom(body);
+    if (!selector) {
+      await this.renderDirectMessageForm(res, req, admin, draft, {
+        status: 400,
+        error: 'Выберите получателя',
+      });
+      return;
+    }
+
+    let post: { id: string };
+    try {
+      post = await this.posts.createDirectMessageDraft({
+        text: draft.text,
+        attachmentIds: draft.attachmentIds,
+      });
+    } catch (err: unknown) {
+      await this.renderDirectMessageForm(res, req, admin, draft, {
+        status: 400,
+        error:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось создать сообщение',
+      });
+      return;
+    }
+
+    // Сообщение уже создано на этом шаге — отказ рассылки ниже не теряет
+    // набранное (перерисовывать форму как при ошибке валидации незачем,
+    // текста и вложений это уже не касается) и не удваивает создание при
+    // повторной отправке той же формы.
+    try {
+      const { queued } = await this.directMessages.sendNow(post.id, selector);
+      this.redirectFlash(
+        res,
+        'direct-messages/new',
+        'dm-sent',
+        `Поставлено в очередь: ${queued}`,
+      );
+    } catch (err: unknown) {
+      if (!(err instanceof AppException)) {
+        throw err;
+      }
+      this.redirectFlash(res, 'direct-messages/new', 'dm-failed', err.message);
+    }
+  }
+
+  /** Загрузка вложения для «Написать в личку» — своя копия `uploadMedia` под свой рендер, тот же приём, что у `campaigns/:id/media`. */
+  @Post('direct-messages/media')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('posts_manage')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_FILE_BYTES },
+    }),
+    CsrfInterceptor,
+  )
+  async uploadDirectMessageMedia(
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Body() body: DirectMessageDraftFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const draft = this.directMessageDraftFrom(body);
+
+    if (!file) {
+      await this.renderDirectMessageForm(res, req, admin, draft, {
+        status: 400,
+        error: 'Файл не выбран',
+      });
+      return;
+    }
+
+    let asset: MediaAsset;
+    try {
+      asset = await this.uploadFormFile(file);
+    } catch (err: unknown) {
+      if (!(err instanceof AppException)) {
+        this.logger.error({ err }, 'Не удалось загрузить вложение');
+      }
+      await this.renderDirectMessageForm(res, req, admin, draft, {
+        status: 400,
+        error:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось загрузить файл',
+      });
+      return;
+    }
+
+    // Тот же приём, что у остальных загрузок вложений (campaigns/:id/media,
+    // media-draft, contests/media): дедуп через `Set` — повторный клик
+    // «Загрузить» на уже отмеченном файле не должен задваивать id в списке
+    // — и проверка лимита сразу, а не только на «Разослать».
+    const attachmentIds = [...new Set([asset.id, ...draft.attachmentIds])];
+    try {
+      await this.posts.assertAttachmentsUsable(attachmentIds);
+    } catch (err: unknown) {
+      await this.renderDirectMessageForm(
+        res,
+        req,
+        admin,
+        { ...draft, attachmentIds },
+        {
+          status: 400,
+          error:
+            err instanceof AppException
+              ? err.message
+              : 'Не удалось загрузить файл',
+        },
+      );
+      return;
+    }
+
+    await this.renderDirectMessageForm(res, req, admin, {
+      ...draft,
+      attachmentIds,
+    });
+  }
+
+  private directMessageDraftFrom(
+    body: DirectMessageDraftFormBody,
+  ): DirectMessageDraft {
+    return {
+      text: body.text ?? '',
+      attachmentIds: asArray(body.attachmentIds),
+    };
+  }
+
+  private async renderDirectMessageForm(
+    res: Response,
+    req: Request,
+    admin: AdminUser,
+    draft: DirectMessageDraft,
+    options: {
+      status?: number;
+      flash?: string;
+      reason?: string;
+      error?: string | null;
+      dmQuery?: string;
+    } = {},
+  ): Promise<void> {
+    // Тот же приём, что у карточки поста: пусто — поиск ещё не запускали,
+    // отличать от «запустили и никого не нашли».
+    const dmQuery = options.dmQuery?.trim() || null;
+    const [dmResults, activeGroups] = await Promise.all([
+      dmQuery ? this.platformUsers.search('max', dmQuery) : null,
+      this.activeGroups(),
+    ]);
+    // Только MAX — тот же фильтр, что у карточки поста: личка через VK не
+    // умеет уходить от имени сообщества.
+    const dmGroups = activeGroups.filter((group) => group.platform === 'max');
+    res.status(options.status ?? 200).render('layout', {
+      ...this.shell(
+        req,
+        'Написать в личку',
+        admin,
+        'direct-message-new',
+        options.flash,
+        options.reason,
+      ),
+      page: 'direct-message-new',
+      draft,
+      media: await this.mediaWithPinned(draft.attachmentIds),
+      error: options.error ?? null,
+      dmQuery,
+      dmResults,
+      dmGroups,
+      mediaKindLabel,
+    });
   }
 
   // ----- группы -----------------------------------------------------------
@@ -1064,54 +1483,52 @@ export class PanelController {
   // Объявлен **до** `contests/:id`: Nest сопоставляет маршруты в порядке
   // объявления, и ниже `new` уехал бы в карточку конкурса как id.
   @Get('contests/new')
-  @Render('layout')
   @UseGuards(AdminAuthGuard)
   @RequirePermissions('contests_manage')
   async newContest(
     @Req() req: Request,
     @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
     @Query('flash') flash?: string,
-  ) {
-    return {
-      ...this.shell(req, 'Новый конкурс', admin, 'contests', flash),
-      page: 'new-contest',
-      posts: await this.contests.listAnnouncementCandidates(LIST_LIMIT),
-      listLimit: LIST_LIMIT,
-      statusLabel,
-      draft: {
-        title: '',
-        postId: '',
-        joinButtonLabel: '',
-        resultsButtonLabel: '',
-        notifyWinners: true,
-        publishResultsInPost: true,
-      },
-      formatDate,
-      error: null,
-    };
+  ): Promise<void> {
+    await this.renderNewContest(res, req, admin, this.emptyNewContestDraft(), {
+      flash,
+    });
   }
 
+  /**
+   * Создание конкурса вместе с анонс-постом — одной формой и одним
+   * сабмитом. Раньше это были два экрана (создать пост, вернуться сюда,
+   * найти его в списке): конкурс и его публикация — по сути одно действие
+   * администратора, а не два независимых.
+   *
+   * Пост создаётся первым, только если отмечен хотя бы один канал — иначе
+   * конкурс заводится без анонса, как и раньше. Если пост создался, а
+   * следом отказал сам конкурс (даты, места) — пост остаётся черновиком-
+   * сиротой без конкурса; тот же осознанный компромисс, что и у
+   * `createDirectMessage`: переигрывать создание поста ради одной строки
+   * не стоит, а перепроверить входные данные заранее (группы, вложения) и
+   * так нечем — их провал ловится тем же catch.
+   */
   @Post('contests')
   @UseGuards(AdminAuthGuard, CsrfGuard)
   @RequirePermissions('contests_manage')
   async createContest(
-    @Body()
-    body: {
-      title?: string;
-      postId?: string;
-      joinButtonLabel?: string;
-      resultsButtonLabel?: string;
-      notifyWinners?: string;
-      publishResultsInPost?: string;
-    },
+    @Body() body: NewContestFormBody,
     @Req() req: Request,
     @CurrentAdmin() admin: AdminUser,
     @Res() res: Response,
   ): Promise<void> {
-    // Снятая галочка браузером не присылается вовсе, поэтому «выключено» —
-    // это отсутствие поля, а не значение `false`.
-    const notifyWinners = body.notifyWinners !== undefined;
-    const publishResultsInPost = body.publishResultsInPost !== undefined;
+    const draft = this.newContestDraftFrom(body);
+
+    const pendingFile = body.file?.trim();
+    if (pendingFile) {
+      await this.renderNewContest(res, req, admin, draft, {
+        status: 400,
+        error: `Вы выбрали файл «${pendingFile}», но не загрузили его. Выберите файл заново, нажмите «Загрузить», а потом создавайте.`,
+      });
+      return;
+    }
 
     try {
       const title = body.title?.trim();
@@ -1121,44 +1538,224 @@ export class PanelController {
           'Название конкурса обязательно',
         );
       }
+      const description = body.description?.trim();
+      if (!description) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Описание обязательно — это и есть текст анонса',
+        );
+      }
+      // Те же правила, что у даты отправки поста: `datetime-local` без
+      // пояса, читаем в поясе проекта, чтобы полночь по МСК не уехала на
+      // сервере с другим TZ.
+      const publishAt = this.parseSchedule(draft.publishAt);
+      const endsAt = this.parseSchedule(draft.endsAt);
+      const placesCount = draft.placesCount.trim()
+        ? Number(draft.placesCount)
+        : undefined;
+      if (placesCount !== undefined && !Number.isInteger(placesCount)) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Количество мест — целое число',
+        );
+      }
+      // Те же три проверки, что и в `ContestsService.createContest` —
+      // продублированы намеренно, чтобы отловить их **до** создания
+      // анонс-поста ниже. Без этого отказ уже внутри `createContest`
+      // оставлял бы висеть черновик поста без единого конкурса — тот же
+      // компромисс, что и у `createDirectMessage`, но там сироте просто
+      // неоткуда взяться, если проверить всё заранее.
+      if (publishAt && endsAt && publishAt >= endsAt) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Дата завершения должна быть позже даты начала',
+        );
+      }
+      if (endsAt && endsAt.getTime() <= Date.now()) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Дата завершения не может быть в прошлом',
+        );
+      }
+      if (endsAt && !placesCount) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Для авто-розыгрыша по дате нужно хотя бы одно призовое место — укажите «Кол. мест»',
+        );
+      }
+
+      // Ничего не отмечено — конкурс без анонса, участники только вручную
+      // (старое поведение). `publishAt` отдельным полем поста не становится:
+      // отправку анонса при открытии приёма уже делает `schedulePostIfDraft`
+      // (ручное и авто-открытие, см. panel.controller/contests.service) —
+      // дублировать её здесь через `scheduledAt` поста значило бы завести
+      // два independent триггера одной и той же отправки.
+      let postId: string | undefined;
+      if (draft.groupIds.length > 0) {
+        const post = await this.posts.createPost({
+          text: description,
+          groupIds: draft.groupIds,
+          attachmentIds: draft.attachmentIds,
+        });
+        postId = post.id;
+      }
+
       const contest = await this.contests.createContest({
         title,
-        // Пустое значение из `select` значит «без анонса», и подставлять
-        // его строкой нельзя: сервис принял бы её за id и не нашёл пост.
-        postId: body.postId?.trim() || undefined,
+        description,
+        postId,
         joinButtonLabel: body.joinButtonLabel?.trim() || undefined,
         resultsButtonLabel: body.resultsButtonLabel?.trim() || undefined,
-        notifyWinners,
-        publishResultsInPost,
+        notifyWinners: draft.notifyWinners,
+        publishResultsInPost: draft.publishResultsInPost,
+        startsAt: publishAt,
+        endsAt,
+        placesCount,
       });
       res.redirect(
         `${PANEL_PREFIX}/contests/${contest.id}?flash=contest-created`,
       );
     } catch (err: unknown) {
       this.logger.warn({ err }, 'Не удалось создать конкурс');
-      res.status(400).render('layout', {
-        ...this.shell(req, 'Новый конкурс', admin, 'contests'),
-        page: 'new-contest',
-        posts: await this.contests.listAnnouncementCandidates(LIST_LIMIT),
-        listLimit: LIST_LIMIT,
-        statusLabel,
-        // Форма перерисовывается с набранным: потерять название и выбор
-        // анонса из-за одной ошибки — заставить набирать всё заново.
-        draft: {
-          title: body.title ?? '',
-          postId: body.postId ?? '',
-          joinButtonLabel: body.joinButtonLabel ?? '',
-          resultsButtonLabel: body.resultsButtonLabel ?? '',
-          notifyWinners,
-          publishResultsInPost,
-        },
-        formatDate,
+      await this.renderNewContest(res, req, admin, draft, {
+        status: 400,
         error:
           err instanceof AppException
             ? err.message
             : 'Не удалось создать конкурс',
       });
     }
+  }
+
+  /** Загрузка картинки для «Нового конкурса» — своя копия, тот же приём, что у `/panel/media`. */
+  @Post('contests/media')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('contests_manage')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_FILE_BYTES },
+    }),
+    CsrfInterceptor,
+  )
+  async uploadNewContestMedia(
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Body() body: NewContestFormBody,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    const draft = this.newContestDraftFrom(body);
+
+    if (!file) {
+      await this.renderNewContest(res, req, admin, draft, {
+        status: 400,
+        error: 'Файл не выбран',
+      });
+      return;
+    }
+
+    let asset: MediaAsset;
+    try {
+      asset = await this.uploadFormFile(file);
+    } catch (err: unknown) {
+      if (!(err instanceof AppException)) {
+        this.logger.error({ err }, 'Не удалось загрузить вложение');
+      }
+      await this.renderNewContest(res, req, admin, draft, {
+        status: 400,
+        error:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось загрузить файл',
+      });
+      return;
+    }
+
+    const attachmentIds = [...new Set([...draft.attachmentIds, asset.id])];
+    try {
+      await this.posts.assertAttachmentsUsable(attachmentIds);
+    } catch (err: unknown) {
+      await this.renderNewContest(
+        res,
+        req,
+        admin,
+        { ...draft, attachmentIds },
+        {
+          status: 400,
+          error:
+            err instanceof AppException
+              ? err.message
+              : 'Не удалось загрузить файл',
+        },
+      );
+      return;
+    }
+
+    await this.renderNewContest(
+      res,
+      req,
+      admin,
+      { ...draft, attachmentIds },
+      { flash: 'uploaded' },
+    );
+  }
+
+  private emptyNewContestDraft(): NewContestDraft {
+    return {
+      title: '',
+      description: '',
+      groupIds: [],
+      attachmentIds: [],
+      joinButtonLabel: '',
+      resultsButtonLabel: '',
+      notifyWinners: true,
+      publishResultsInPost: true,
+      publishAt: '',
+      endsAt: '',
+      placesCount: '',
+    };
+  }
+
+  private newContestDraftFrom(body: NewContestFormBody): NewContestDraft {
+    return {
+      title: body.title ?? '',
+      description: body.description ?? '',
+      groupIds: asArray(body.groupIds),
+      attachmentIds: asArray(body.attachmentIds),
+      joinButtonLabel: body.joinButtonLabel ?? '',
+      resultsButtonLabel: body.resultsButtonLabel ?? '',
+      // Снятая галочка браузером не присылается вовсе, поэтому «выключено» —
+      // это отсутствие поля, а не значение `false`.
+      notifyWinners: body.notifyWinners !== undefined,
+      publishResultsInPost: body.publishResultsInPost !== undefined,
+      publishAt: body.publishAt ?? '',
+      endsAt: body.endsAt ?? '',
+      placesCount: body.placesCount ?? '',
+    };
+  }
+
+  private async renderNewContest(
+    res: Response,
+    req: Request,
+    admin: AdminUser,
+    draft: NewContestDraft,
+    options: { status?: number; flash?: string; error?: string | null } = {},
+  ): Promise<void> {
+    const [groups, media] = await Promise.all([
+      this.activeGroups(),
+      this.mediaWithPinned(draft.attachmentIds),
+    ]);
+    res.status(options.status ?? 200).render('layout', {
+      ...this.shell(req, 'Новый конкурс', admin, 'contests', options.flash),
+      page: 'new-contest',
+      groups,
+      media,
+      draft,
+      formatDate,
+      error: options.error ?? null,
+      mediaKindLabel,
+    });
   }
 
   @Get('contests/:id')
@@ -1196,12 +1793,81 @@ export class PanelController {
       // Подписи мест — одной строкой на место, в том же виде, в каком форма
       // их принимает обратно.
       prizesText: contest.prizes.map((prize) => prize.label).join('\n'),
+      // Форма правки — не перерисовывается набранным при отказе (см.
+      // комментарий у `editContestPanel`), поэтому всегда строится из
+      // текущего состояния конкурса, как и остальные поля этой страницы.
+      contestEditDraft: {
+        title: contest.title,
+        description: contest.description,
+        joinButtonLabel: contest.joinButtonLabel,
+        resultsButtonLabel: contest.resultsButtonLabel,
+        notifyWinners: contest.notifyWinners,
+        publishResultsInPost: contest.publishResultsInPost,
+        startsAt: contest.startsAt
+          ? utcToZoned(contest.startsAt, this.defaultTimezone())
+          : '',
+        endsAt: contest.endsAt
+          ? utcToZoned(contest.endsAt, this.defaultTimezone())
+          : '',
+      },
       contestColor,
       contestLabel,
       notifyColor,
       notifyLabel,
       formatDate,
     };
+  }
+
+  /**
+   * Правка условий конкурса — заголовок, описание, подписи кнопок, флаги
+   * уведомлений и даты. Тот же лёгкий приём, что у остальных действий этой
+   * страницы (`runContestAction`): при отказе — редирект с баннером-причиной,
+   * без перерисовки формы набранным. Публичный текст анонса (сам пост)
+   * правится отдельно, по ссылке «анонс-пост» — эта форма его не трогает.
+   */
+  @Post('contests/:id/edit')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async editContestPanel(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body()
+    body: {
+      title?: string;
+      description?: string;
+      joinButtonLabel?: string;
+      resultsButtonLabel?: string;
+      notifyWinners?: string;
+      publishResultsInPost?: string;
+      startsAt?: string;
+      endsAt?: string;
+    },
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.runContestAction(
+      res,
+      id,
+      `${PANEL_PREFIX}/contests/${id}?flash=contest-edited`,
+      () => {
+        const title = body.title?.trim();
+        if (!title) {
+          throw new AppException(
+            ErrorCode.VALIDATION_ERROR,
+            'Название конкурса обязательно',
+          );
+        }
+        return this.contests.editContest(id, {
+          title,
+          description: body.description?.trim() ?? '',
+          joinButtonLabel: body.joinButtonLabel?.trim() || undefined,
+          resultsButtonLabel: body.resultsButtonLabel?.trim() || undefined,
+          // Та же логика отсутствующего поля, что и у создания.
+          notifyWinners: body.notifyWinners !== undefined,
+          publishResultsInPost: body.publishResultsInPost !== undefined,
+          startsAt: this.parseSchedule(body.startsAt),
+          endsAt: this.parseSchedule(body.endsAt),
+        });
+      },
+    );
   }
 
   @Post('contests/:id/open')
@@ -1215,7 +1881,24 @@ export class PanelController {
       res,
       id,
       `${PANEL_PREFIX}/contests/${id}?flash=contest-opened`,
-      () => this.contests.openContest(id),
+      async () => {
+        const contest = await this.contests.openContest(id);
+        if (!contest.postId) {
+          return;
+        }
+        // Отдельным try: анонс-пост, всё ещё черновик, не должен блокировать
+        // открытие приёма — участие и публикация независимы (см. комментарий
+        // у `openContest` в сервисе), а неудачную отправку админ уже видит на
+        // карточке самого поста.
+        try {
+          await this.posts.schedulePostIfDraft(contest.postId);
+        } catch (err: unknown) {
+          this.logger.warn(
+            { err, contestId: id, postId: contest.postId },
+            'Приём открыт, но анонс-пост отправить не удалось',
+          );
+        }
+      },
     );
   }
 
@@ -1721,6 +2404,8 @@ export class PanelController {
       reason?: string;
       editDraft?: EditDraft;
       editError?: string | null;
+      draftEdit?: DraftEditState;
+      draftEditError?: string | null;
       dmQuery?: string;
     } = {},
   ): Promise<void> {
@@ -1731,6 +2416,10 @@ export class PanelController {
     const [post, editDraft, media] = options.editDraft
       ? await this.loadCampaignWith(id, options.editDraft)
       : await this.loadCampaignDefault(id);
+    // Тот же приём, что у `editDraft` выше — набранное в форме переживает
+    // перерисовку после загрузки файла или отказа валидации.
+    const draftEdit = options.draftEdit ?? this.draftEditFromPost(post);
+    const draftMedia = await this.mediaWithPinned(draftEdit.attachmentIds);
     // Пусто — поиск ещё не запускали, отличать от «запустили и никого не
     // нашли» (пустой массив): первое молчит, второе показывает «не нашлось».
     const dmQuery = options.dmQuery?.trim() || null;
@@ -1768,6 +2457,13 @@ export class PanelController {
       editDraft,
       editError: options.editError ?? null,
       media,
+      // Группы для формы правки черновика — все активные площадки, а не
+      // только MAX: в отличие от рассылки в личку, обычный пост уходит и
+      // в VK тоже.
+      groups: activeGroups,
+      draftEdit,
+      draftEditError: options.draftEditError ?? null,
+      draftMedia,
       dmQuery,
       dmResults,
       dmGroups,
@@ -1823,6 +2519,37 @@ export class PanelController {
       maxTextOverride: body.maxTextOverride ?? '',
       autoDeleteAfterMinutes: body.autoDeleteAfterMinutes ?? '',
       attachmentIds: asArray(body.attachmentIds),
+    };
+  }
+
+  private draftEditFromPost(post: {
+    text: string;
+    vkTextOverride: string | null;
+    maxTextOverride: string | null;
+    scheduledAt: Date | null;
+    attachments: { mediaAssetId: string }[];
+    deliveries: { group: { id: string } }[];
+  }): DraftEditState {
+    return {
+      text: post.text,
+      vkTextOverride: post.vkTextOverride ?? '',
+      maxTextOverride: post.maxTextOverride ?? '',
+      groupIds: post.deliveries.map((d) => d.group.id),
+      attachmentIds: post.attachments.map((a) => a.mediaAssetId),
+      scheduledAt: post.scheduledAt
+        ? utcToZoned(post.scheduledAt, this.defaultTimezone())
+        : '',
+    };
+  }
+
+  private draftEditFrom(body: EditDraftPostFormBody): DraftEditState {
+    return {
+      text: body.text ?? '',
+      vkTextOverride: body.vkTextOverride ?? '',
+      maxTextOverride: body.maxTextOverride ?? '',
+      groupIds: asArray(body.groupIds),
+      attachmentIds: asArray(body.attachmentIds),
+      scheduledAt: body.scheduledAt ?? '',
     };
   }
 
@@ -2148,6 +2875,7 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
     message: 'Выберите получателя, группу или «всех в базе»',
   },
   'contest-created': { kind: 'success', message: 'Конкурс создан' },
+  'contest-edited': { kind: 'success', message: 'Конкурс обновлён' },
   'contest-opened': { kind: 'success', message: 'Приём участников открыт' },
   'contest-drawn': { kind: 'success', message: 'Розыгрыш проведён' },
   'prizes-saved': { kind: 'success', message: 'Призовые места сохранены' },
@@ -2177,6 +2905,7 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
     message: 'Действие над конкурсом не выполнено',
   },
   edited: { kind: 'success', message: 'Текст обновлён во всех группах' },
+  'draft-edited': { kind: 'success', message: 'Черновик сохранён' },
   deleted: { kind: 'success', message: 'Удалено из выбранных групп' },
   partial: {
     kind: 'warning',

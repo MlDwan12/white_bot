@@ -79,6 +79,9 @@
     <% if (editError) { %>
       <div class="alert alert-danger mb-3" role="alert"><%= editError %></div>
     <% } %>
+    <% if (draftEditError) { %>
+      <div class="alert alert-danger mb-3" role="alert"><%= draftEditError %></div>
+    <% } %>
     <% if (publishedGroups.length > 0) { %>
       <div class="card mb-3">
         <div class="card-header"><h3 class="card-title">Правка опубликованного</h3></div>
@@ -192,6 +195,91 @@
           </div>
         </form>
       </div>
+    <% } else if (post.status === 'draft') { %>
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Править черновик</h3></div>
+        <form method="post" action="/panel/campaigns/<%= post.id %>/edit-draft">
+          <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+          <div class="card-body">
+            <div class="mb-3">
+              <label class="form-label" for="draft-text">Текст</label>
+              <textarea class="form-control" id="draft-text" name="text" rows="5"
+                        required><%= draftEdit.text %></textarea>
+            </div>
+            <div class="mb-3">
+              <label class="form-label" for="draft-vk-text">Текст для VK</label>
+              <textarea class="form-control" id="draft-vk-text" name="vkTextOverride" rows="2"
+                        placeholder="пусто — общий текст"><%= draftEdit.vkTextOverride %></textarea>
+            </div>
+            <div class="mb-3">
+              <label class="form-label" for="draft-max-text">Текст для MAX</label>
+              <textarea class="form-control" id="draft-max-text" name="maxTextOverride" rows="2"
+                        placeholder="пусто — общий текст"><%= draftEdit.maxTextOverride %></textarea>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">Куда отправить</label>
+              <% if (groups.length === 0) { %>
+                <div class="text-secondary">Нет активных групп.</div>
+              <% } else { %>
+                <% groups.forEach(function (g) { %>
+                  <label class="form-check">
+                    <input class="form-check-input" type="checkbox" name="groupIds"
+                           value="<%= g.id %>"
+                           <%= draftEdit.groupIds.includes(g.id) ? 'checked' : '' %> />
+                    <span class="form-check-label">
+                      <%= g.title %>
+                      <span class="tag tag-<%= platformColor(g.platform) %> ms-1"><%= platformLabel(g.platform) %></span>
+                    </span>
+                  </label>
+                <% }); %>
+              <% } %>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label" for="draft-scheduledAt">Когда</label>
+              <input class="form-control" id="draft-scheduledAt" type="datetime-local"
+                     name="scheduledAt" value="<%= draftEdit.scheduledAt %>" />
+              <small class="form-hint">Пусто — отправлять сразу кнопкой «Отправить» в списке.</small>
+            </div>
+
+            <% if (draftMedia.length > 0) { %>
+              <div class="mb-3">
+                <label class="form-label">Вложения</label>
+                <% draftMedia.forEach(function (m) { %>
+                  <label class="form-check d-flex align-items-center">
+                    <input class="form-check-input" type="checkbox" name="attachmentIds"
+                           value="<%= m.id %>"
+                           <%= draftEdit.attachmentIds.includes(m.id) ? 'checked' : '' %> />
+                    <span class="form-check-label d-flex align-items-center">
+                      <%- include('media-thumb', { m: m }) %>
+                      <%= m.filename %> <span class="text-secondary small ms-1"><%= mediaKindLabel(m.kind) %></span>
+                    </span>
+                  </label>
+                <% }); %>
+              </div>
+            <% } %>
+            <div class="mb-1">
+              <label class="form-label" for="draft-file">Загрузить новый файл</label>
+              <input class="form-control" id="draft-file" type="file" name="file" />
+              <small class="form-hint">
+                До 50 МБ. Загрузится и отметится сам, набранное в форме
+                сохранится. К посту файл прикрепляется только кнопкой
+                «Загрузить» — «Сохранить» его не берёт.
+              </small>
+            </div>
+          </div>
+          <div class="card-footer d-flex gap-2">
+            <button class="btn btn-primary" type="submit">Сохранить</button>
+            <%
+               /* `formnovalidate`: у текста стоит `required`, и без этого
+                  загрузить файл до правки текста было бы нельзя. */
+            %>
+            <button class="btn" type="submit" formaction="/panel/campaigns/<%= post.id %>/media-draft"
+                    formenctype="multipart/form-data" formnovalidate>Загрузить</button>
+          </div>
+        </form>
+      </div>
     <% } else { %>
       <div class="card">
         <div class="card-body text-secondary">
@@ -269,6 +357,10 @@
                     <option value="<%= g.id %>"><%= g.title %></option>
                   <% }); %>
                 </select>
+                <small class="form-hint">
+                  Все согласившиеся участники конкурсов, чей анонс уходил в
+                  эту группу — не только те, кто пришёл именно из неё.
+                </small>
               <% } else { %>
                 <span class="text-secondary small">Нет активных MAX-групп</span>
               <% } %>

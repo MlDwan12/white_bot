@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { GroupRateLimiter } from '../queue/group-rate-limiter';
 import { MaxApiClient } from '../max/max-api.client';
 import { PostSender } from '../posts/post-sender';
+import { AttachmentUploader } from '../posts/attachment-uploader';
 import { classifyDeliveryError } from '../posts/delivery-outcome';
 import { sleep } from '../common/sleep';
 import {
@@ -30,6 +31,7 @@ export class DirectMessageSenderProcessor extends WorkerHost {
   constructor(
     private readonly prisma: PrismaService,
     private readonly max: MaxApiClient,
+    private readonly attachments: AttachmentUploader,
     private readonly rateLimiter: GroupRateLimiter,
     private readonly logger: PinoLogger,
   ) {
@@ -44,7 +46,15 @@ export class DirectMessageSenderProcessor extends WorkerHost {
       select: {
         status: true,
         post: {
-          select: { text: true, vkTextOverride: true, maxTextOverride: true },
+          select: {
+            text: true,
+            vkTextOverride: true,
+            maxTextOverride: true,
+            attachments: {
+              orderBy: { position: 'asc' },
+              include: { mediaAsset: true },
+            },
+          },
         },
         platformUser: { select: { platform: true, externalUserId: true } },
       },
@@ -102,9 +112,16 @@ export class DirectMessageSenderProcessor extends WorkerHost {
 
     let externalMessageId: string;
     try {
+      // Личка — только MAX (гвард выше), поэтому конвертировать вложения
+      // для VK здесь незачем — `maxAttachments` тот же кэш, что и у
+      // рассылки постов в группы.
+      const attachments = await this.attachments.maxAttachments(
+        delivery.post.attachments.map((attachment) => attachment.mediaAsset),
+      );
       const result = await this.max.sendMessageToUser(
         Number(delivery.platformUser.externalUserId),
         PostSender.resolveText(delivery.post, 'max'),
+        { attachments },
       );
       externalMessageId = result.messageId;
     } catch (err: unknown) {
@@ -112,15 +129,53 @@ export class DirectMessageSenderProcessor extends WorkerHost {
       return;
     }
 
-    await this.prisma.directMessageDelivery.update({
-      where: { id: deliveryId },
-      data: {
-        status: 'sent',
-        externalMessageId,
-        sentAt: new Date(),
-        error: null,
-      },
-    });
+    // Тот же приём, что у `PostDeliveryProcessor`: дальше сообщение уже
+    // существует на платформе, и бросок отсюда — незаконченная попытка для
+    // BullMQ, только строка остаётся `sending` навсегда (guard вверху не
+    // пускает повтор ни в `sending`, ни в `sent` — задваивания не будет, но
+    // и правды в базе тоже). В отличие от `PostDelivery`, у
+    // `DirectMessageDelivery` нет сверщика зависших доставок — если и это
+    // письмо в базу не пройдёт, строка так и останется без ответа, только
+    // вручную.
+    try {
+      await this.prisma.directMessageDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: 'sent',
+          externalMessageId,
+          sentAt: new Date(),
+          error: null,
+        },
+      });
+    } catch (err: unknown) {
+      this.logger.error(
+        { err, deliveryId, externalMessageId },
+        'Личное сообщение отправлено, но результат не записан в БД',
+      );
+      await this.markUnknownAfterSend(deliveryId, externalMessageId);
+    }
+  }
+
+  private async markUnknownAfterSend(
+    deliveryId: string,
+    externalMessageId: string,
+  ): Promise<void> {
+    try {
+      await this.prisma.directMessageDelivery.update({
+        where: { id: deliveryId },
+        data: {
+          status: 'unknown',
+          externalMessageId,
+          error:
+            'Сообщение отправлено, но запись результата не удалась. Проверьте вручную.',
+        },
+      });
+    } catch (err: unknown) {
+      this.logger.error(
+        { err, deliveryId },
+        'Не удалось пометить личное сообщение как unknown — останется sending без сверщика',
+      );
+    }
   }
 
   private async handleError(

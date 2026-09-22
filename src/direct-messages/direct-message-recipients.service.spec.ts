@@ -69,7 +69,7 @@ describe('DirectMessageRecipientsService.resolve — user', () => {
 });
 
 describe('DirectMessageRecipientsService.resolve — group', () => {
-  it('ищет уникальных PlatformUser по участию в конкурсе из этой группы, только согласившихся', async () => {
+  it('ищет уникальных PlatformUser по доставкам анонса в эту группу, только согласившихся', async () => {
     const { service, prisma } = setup();
     prisma.platformUser.findMany.mockResolvedValue([
       { id: 'pu-1', platform: 'max', externalUserId: '42' },
@@ -83,15 +83,26 @@ describe('DirectMessageRecipientsService.resolve — group', () => {
     expect(result).toEqual([
       { id: 'pu-1', platform: 'max', externalUserId: '42' },
     ]);
+    // Не `ContestParticipant.groupId` самого участника: в MAX участие идёт
+    // по кнопке-ссылке под постом, а не по колбэку из конкретной группы, и
+    // у конкурса, кросс-постнутого в 2+ MAX-группы, это поле участника
+    // всегда null (см. комментарий у resolveGroup). Доставки поста —
+    // единственное место, которое всегда знает, в какие группы он вышел.
     const call = callArg<{
       where: {
         consentedAt: { not: null };
-        contestEntries: { some: { groupId: string } };
+        contestEntries: {
+          some: { contest: { post: { deliveries: { some: unknown } } } };
+        };
       };
     }>(prisma.platformUser.findMany);
     expect(call.where).toEqual({
       consentedAt: { not: null },
-      contestEntries: { some: { groupId: 'group-1' } },
+      contestEntries: {
+        some: {
+          contest: { post: { deliveries: { some: { groupId: 'group-1' } } } },
+        },
+      },
     });
   });
 

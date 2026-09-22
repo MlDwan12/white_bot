@@ -31,6 +31,8 @@
                 </a>
                 <div class="text-secondary small">
                   <%= formatDate(c.createdAt) %>
+                  <% if (c.startsAt) { %> · с <%= formatDate(c.startsAt) %><% } %>
+                  <% if (c.endsAt) { %> · до <%= formatDate(c.endsAt) %><% } %>
                   <% if (c.postId) { %>
                     · анонс:
                     <a href="/panel/campaigns/<%= c.postId %>"><%= (c.postText || '').slice(0, 60) %></a>

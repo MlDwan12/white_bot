@@ -4,12 +4,21 @@
     <div class="text-secondary small mt-1">
       <span class="tag tag-<%= contestColor(contest.status) %>"><%= contestLabel(contest.status) %></span>
       · создан <%= formatDate(contest.createdAt) %>
+      <% if (contest.startsAt) { %>
+        · начало <%= formatDate(contest.startsAt) %><% if (contest.status === 'draft') { %> (откроется автоматически)<% } %>
+      <% } %>
+      <% if (contest.endsAt) { %>
+        · завершение <%= formatDate(contest.endsAt) %><% if (contest.status === 'open') { %> (разыграется автоматически)<% } %>
+      <% } %>
       <% if (contest.postId) { %>
         · <a href="/panel/campaigns/<%= contest.postId %>">анонс-пост</a>
       <% } else { %>
         · без анонса, участники только вручную
       <% } %>
     </div>
+    <% if (contest.description) { %>
+      <p class="text-secondary mt-2 mb-0"><%= contest.description %></p>
+    <% } %>
   </div>
   <div class="d-flex gap-2">
     <% if (contest.status === 'draft') { %>
@@ -282,5 +291,97 @@
         <div class="card-body text-secondary">Пока никто не участвует.</div>
       <% } %>
     </div>
+
+    <%
+       /* До розыгрыша включительно — открытый приём это не «уже
+          опубликовано и нельзя трогать», а «идёт сейчас», и дату
+          завершения, например, иногда нужно подвинуть, пока конкурс живой.
+          После `drawn` условия менять поздно: розыгрыш уже состоялся по
+          старым. Публичный текст анонса эта форма не трогает — он правится
+          на карточке самого поста, по ссылке выше. */
+    %>
+    <% if (contest.status !== 'drawn') { %>
+      <div class="card">
+        <div class="card-header"><h3 class="card-title">Править конкурс</h3></div>
+        <form method="post" action="/panel/contests/<%= contest.id %>/edit">
+          <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+          <div class="card-body">
+            <div class="mb-3">
+              <label class="form-label" for="contest-edit-title">Заголовок</label>
+              <input class="form-control" id="contest-edit-title" name="title" required
+                     value="<%= contestEditDraft.title %>" />
+              <small class="form-hint">Видно только в панели.</small>
+            </div>
+            <div class="mb-3">
+              <label class="form-label" for="contest-edit-description">Описание</label>
+              <textarea class="form-control" id="contest-edit-description" name="description"
+                        rows="3"><%= contestEditDraft.description %></textarea>
+              <small class="form-hint">Тоже только для панели.</small>
+            </div>
+            <div class="mb-3">
+              <label class="form-label" for="contest-edit-join">Текст кнопки участия</label>
+              <input class="form-control" id="contest-edit-join" name="joinButtonLabel"
+                     value="<%= contestEditDraft.joinButtonLabel %>" />
+            </div>
+            <div class="mb-3">
+              <label class="form-label" for="contest-edit-results">Текст кнопки итогов</label>
+              <input class="form-control" id="contest-edit-results" name="resultsButtonLabel"
+                     value="<%= contestEditDraft.resultsButtonLabel %>" />
+            </div>
+            <div class="row g-3 mb-3">
+              <div class="col-sm-6">
+                <label class="form-label" for="contest-edit-startsAt">Начало</label>
+                <%
+                   /* `readonly`, не убрано из формы: поле продолжает
+                      уходить с сабмитом неизменным, так что заголовок
+                      можно поправить, не обнулив дату начала заодно (её
+                      тогда переписало бы на `null`). Авто-открытие
+                      (`openDueContests`) читает `startsAt` только у
+                      конкурсов в статусе `draft` — после открытия (вручную
+                      или само) значение больше ни на что не влияет, и
+                      предлагать его к правке — приглашение на путаницу. */
+                %>
+                <input class="form-control" id="contest-edit-startsAt" type="datetime-local"
+                       name="startsAt" value="<%= contestEditDraft.startsAt %>"
+                       <%= contest.status === 'draft' ? '' : 'readonly' %> />
+                <small class="form-hint">
+                  <% if (contest.status === 'draft') { %>
+                    Пусто — открыть только вручную.
+                  <% } else { %>
+                    Приём уже идёт — дальше ни на что не влияет.
+                  <% } %>
+                </small>
+              </div>
+              <div class="col-sm-6">
+                <label class="form-label" for="contest-edit-endsAt">Завершение</label>
+                <input class="form-control" id="contest-edit-endsAt" type="datetime-local"
+                       name="endsAt" value="<%= contestEditDraft.endsAt %>" />
+                <small class="form-hint">
+                  Пусто — разыграть только вручную. Не в прошлом и требует
+                  хотя бы одного призового места.
+                </small>
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-check">
+                <input class="form-check-input" type="checkbox" name="notifyWinners"
+                       <%= contestEditDraft.notifyWinners ? 'checked' : '' %> />
+                <span class="form-check-label">Уведомлять победителей в личку</span>
+              </label>
+            </div>
+            <div class="mb-1">
+              <label class="form-check">
+                <input class="form-check-input" type="checkbox" name="publishResultsInPost"
+                       <%= contestEditDraft.publishResultsInPost ? 'checked' : '' %> />
+                <span class="form-check-label">Публиковать итоги в анонс-посте</span>
+              </label>
+            </div>
+          </div>
+          <div class="card-footer">
+            <button class="btn btn-primary" type="submit">Сохранить</button>
+          </div>
+        </form>
+      </div>
+    <% } %>
   </div>
 </div>

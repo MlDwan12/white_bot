@@ -5,6 +5,7 @@ import { PostReconcilerService } from './post-reconciler.service';
 import { PostsService } from './posts.service';
 import { PostTemplatesService } from './post-templates.service';
 import { PostModerationService } from './post-moderation.service';
+import { ContestsService } from '../contests/contests.service';
 
 /** Reads one argument of a recorded call as `T` — `mock.calls` is `any[][]`,
  * which trips the type-aware lint rules when indexed directly. */
@@ -25,8 +26,14 @@ function setup(lockAcquired = true) {
     enqueueDispatch: jest.fn().mockResolvedValue(undefined),
     finalizeIfComplete: jest.fn().mockResolvedValue({}),
     redispatchPending: jest.fn().mockResolvedValue(false),
+    schedulePostIfDraft: jest.fn().mockResolvedValue(undefined),
   };
   const templates = { fireDueTemplates: jest.fn().mockResolvedValue(0) };
+  const contests = {
+    openDueContests: jest.fn().mockResolvedValue({ opened: [] }),
+    openContestsWithUnsentAnnouncement: jest.fn().mockResolvedValue([]),
+    drawDueContests: jest.fn().mockResolvedValue({ drawn: 0 }),
+  };
   const redis = {
     set: jest.fn().mockResolvedValue(lockAcquired ? 'OK' : null),
   };
@@ -44,10 +51,20 @@ function setup(lockAcquired = true) {
     posts as unknown as PostsService,
     templates as unknown as PostTemplatesService,
     moderation as unknown as PostModerationService,
+    contests as unknown as ContestsService,
     redis as unknown as Redis,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma, posts, templates, redis, logger, moderation };
+  return {
+    service,
+    prisma,
+    posts,
+    templates,
+    redis,
+    logger,
+    moderation,
+    contests,
+  };
 }
 
 describe('PostReconcilerService', () => {
@@ -225,6 +242,80 @@ describe('PostReconcilerService', () => {
 
     await expect(service.runSweep()).resolves.toBeUndefined();
     expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('sends the draft announcement post of every open contest with one still pending', async () => {
+    const { service, contests, posts } = setup();
+    // Not `openDueContests`'s own `opened` list — a contest can reach this
+    // state on a *later* sweep too, if its send failed the first time
+    // (see the retry test below). `openContestsWithUnsentAnnouncement`
+    // covers both by construction.
+    contests.openContestsWithUnsentAnnouncement.mockResolvedValue([
+      { id: 'c1', postId: 'post-1' },
+    ]);
+
+    await service.runSweep();
+
+    expect(posts.schedulePostIfDraft).toHaveBeenCalledTimes(1);
+    expect(posts.schedulePostIfDraft).toHaveBeenCalledWith(
+      'post-1',
+      expect.any(Date),
+    );
+  });
+
+  it('does not let a failed announcement send cancel the rest of the sweep', async () => {
+    const { service, contests, posts, logger } = setup();
+    contests.openContestsWithUnsentAnnouncement.mockResolvedValue([
+      { id: 'c1', postId: 'post-1' },
+    ]);
+    posts.schedulePostIfDraft.mockRejectedValue(new Error('MAX недоступен'));
+
+    await expect(service.runSweep()).resolves.toBeUndefined();
+
+    // The contest is already open in the database; a post that failed to go
+    // out is a problem visible on its own campaign card, not a reason to
+    // undo opening the contest or to abort the rest of the sweep.
+    expect(logger.error).toHaveBeenCalled();
+    // A failed send must not stop it from being retried on the next pass —
+    // the whole point of sourcing this list fresh every sweep.
+    expect(contests.drawDueContests).toHaveBeenCalled();
+  });
+
+  it('keeps retrying an announcement left over from an earlier failed pass', async () => {
+    // `openDueContests` itself reports nothing new this time — the contest
+    // opened on a *previous* sweep, and only its announcement send failed
+    // back then. Before this fix, nothing would ever look at it again.
+    const { service, contests, posts } = setup();
+    contests.openDueContests.mockResolvedValue({ opened: [] });
+    contests.openContestsWithUnsentAnnouncement.mockResolvedValue([
+      { id: 'c1', postId: 'post-1' },
+    ]);
+
+    await service.runSweep();
+
+    expect(posts.schedulePostIfDraft).toHaveBeenCalledWith(
+      'post-1',
+      expect.any(Date),
+    );
+  });
+
+  it('draws due contests and keeps going when the contest sweep as a whole fails', async () => {
+    const { service, contests, logger } = setup();
+    contests.openDueContests.mockRejectedValue(new Error('база недоступна'));
+
+    await expect(service.runSweep()).resolves.toBeUndefined();
+
+    // Isolated from the rest of the sweep, like every other recovery step.
+    expect(contests.drawDueContests).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('draws due contests independently of whether any contest opened', async () => {
+    const { service, contests } = setup();
+
+    await service.runSweep();
+
+    expect(contests.drawDueContests).toHaveBeenCalledWith(expect.any(Date));
   });
 
   it('stops its timer on shutdown', () => {

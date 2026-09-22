@@ -1,4 +1,4 @@
-import { zonedToUtc } from './zoned-time';
+import { utcToZoned, zonedToUtc } from './zoned-time';
 
 describe('zonedToUtc', () => {
   it('reads a wall-clock time in the given zone, not the server one', () => {
@@ -41,5 +41,34 @@ describe('zonedToUtc', () => {
     for (const bad of ['', 'вчера', '2026-09-20', '2026-13-45T99:99']) {
       expect(Number.isNaN(zonedToUtc(bad, 'UTC').getTime())).toBe(true);
     }
+  });
+});
+
+describe('utcToZoned', () => {
+  it('is the inverse of zonedToUtc', () => {
+    const local = '2026-09-20T18:00';
+    const roundTripped = utcToZoned(
+      zonedToUtc(local, 'Europe/Moscow'),
+      'Europe/Moscow',
+    );
+    expect(roundTripped).toBe(local);
+  });
+
+  it('handles a zone with daylight saving in summer', () => {
+    expect(
+      utcToZoned(new Date('2026-07-01T10:00:00.000Z'), 'Europe/Berlin'),
+    ).toBe('2026-07-01T12:00');
+  });
+
+  it('handles the same zone in winter', () => {
+    expect(
+      utcToZoned(new Date('2026-01-15T11:00:00.000Z'), 'Europe/Berlin'),
+    ).toBe('2026-01-15T12:00');
+  });
+
+  it('is a no-op for UTC', () => {
+    expect(utcToZoned(new Date('2026-09-20T18:00:00.000Z'), 'UTC')).toBe(
+      '2026-09-20T18:00',
+    );
   });
 });

@@ -484,10 +484,18 @@ export class MaxBotHandlers {
   }
 
   /** Ответ в диалоге, провал которого только логируется. */
+  /**
+   * `resumePayload` — не всегда id конкурса: `handleBotStarted` зовёт это
+   * и для обычного «Начать» без метки (пустая строка), и только
+   * `proceedAfterStart` (после разбора `c_<uuid>`) передаёт сюда настоящий
+   * id. Раньше параметр назывался `contestId`, и лог безусловно утверждал
+   * «диалог открыт по ссылке конкурса» даже когда это был просто пустой
+   * старт — записи по обоим путям было не различить при разборе логов.
+   */
   private async replyBestEffort(
     chatId: number,
     text: string,
-    contestId: string,
+    resumePayload: string,
     userId: number,
   ): Promise<boolean> {
     try {
@@ -495,10 +503,11 @@ export class MaxBotHandlers {
       return true;
     } catch (err: unknown) {
       // Диалог только что открыт, так что провал — уже настоящий сбой, а не
-      // ожидаемое «бот не может писать». Участие при этом записано.
+      // ожидаемое «бот не может писать». Участие (если оно тут было) при
+      // этом уже записано.
       this.logger.warn(
-        { err, contestId, userId },
-        'Не удалось ответить в диалоге, открытом по ссылке конкурса',
+        { err, resumePayload, userId },
+        'Не удалось ответить в диалоге, открытом при старте бота',
       );
       return false;
     }

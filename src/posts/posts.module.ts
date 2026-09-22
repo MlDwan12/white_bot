@@ -5,6 +5,7 @@ import { VkModule } from '../vk/vk.module';
 import { MaxModule } from '../max/max.module';
 import { MediaModule } from '../media/media.module';
 import { QueueModule } from '../queue/queue.module';
+import { ContestsModule } from '../contests/contests.module';
 import { PostsController } from './posts.controller';
 import { PostTemplatesController } from './post-templates.controller';
 import { PostsService } from './posts.service';
@@ -28,6 +29,10 @@ import { AuthModule } from '../auth/auth.module';
     // second registerQueue here would build a second Queue instance (and a
     // second set of Redis connections) behind the same token.
     QueueModule,
+    // Только за `ContestsService` — авто-открытие/авто-розыгрыш конкурсов
+    // по датам живёт в общей сверке `PostReconcilerService`, не в своём
+    // отдельном таймере (см. комментарий там же).
+    ContestsModule,
   ],
   controllers: [PostsController, PostTemplatesController],
   providers: [
@@ -39,6 +44,15 @@ import { AuthModule } from '../auth/auth.module';
     PostReconcilerService,
     PostModerationService,
   ],
-  exports: [PostsService, PostTemplatesService, PostModerationService],
+  // AttachmentUploader is exported for DirectMessagesModule, which needs the
+  // same MAX-upload cache the campaign pipeline uses — building a second
+  // instance would need its own copy of VkModule/MediaModule wiring for a
+  // VK path direct messages never take.
+  exports: [
+    PostsService,
+    PostTemplatesService,
+    PostModerationService,
+    AttachmentUploader,
+  ],
 })
 export class PostsModule {}

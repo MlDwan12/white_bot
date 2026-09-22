@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
@@ -20,19 +21,34 @@ import { buildDedupKey, parseParticipantLines } from './contest-participants';
 
 export interface CreateContestInput {
   title: string;
+  description?: string;
   /** Анонс-пост с кнопкой участия. Без него остаётся только ручной список. */
   postId?: string;
   joinButtonLabel?: string;
   resultsButtonLabel?: string;
   notifyWinners?: boolean;
   publishResultsInPost?: boolean;
+  /** Открыть приём участников автоматически в этот момент. */
+  startsAt?: Date;
+  /** Провести розыгрыш автоматически в этот момент. */
+  endsAt?: Date;
+  /**
+   * Сколько призовых мест завести сразу же, с местами `1..N` и подписями
+   * «Место N» — правятся потом как обычно через `setPrizes`. Без этого
+   * поля создание конкурса и раскладка мест были бы двумя раздельными
+   * действиями там, где админу нужно одно.
+   */
+  placesCount?: number;
 }
 
 export interface ContestSummary {
   id: string;
   title: string;
+  description: string;
   status: ContestStatus;
   createdAt: Date;
+  startsAt: Date | null;
+  endsAt: Date | null;
   participantsCount: number;
   placesCount: number;
   /** Анонс-пост, если он есть: по нему список показывает, к чему конкурс. */
@@ -61,7 +77,10 @@ export class ContestsService {
     this.logger.setContext(ContestsService.name);
   }
 
-  async createContest(input: CreateContestInput): Promise<Contest> {
+  async createContest(
+    input: CreateContestInput,
+    now: Date = new Date(),
+  ): Promise<Contest> {
     if (input.postId) {
       const post = await this.prisma.post.findUnique({
         where: { id: input.postId },
@@ -77,15 +96,155 @@ export class ContestsService {
         );
       }
     }
+    if (input.startsAt && input.endsAt && input.startsAt >= input.endsAt) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Дата завершения должна быть позже даты начала',
+      );
+    }
+    // Прошедшее время завершения означало бы, что сверка попытается
+    // разыграть конкурс на первом же проходе — до того, как админ вообще
+    // успел бы что-то с ним сделать. `startsAt` в прошлом отдельно не
+    // проверяется: это осмысленный способ открыть приём сразу же, а не
+    // ошибка.
+    if (input.endsAt && input.endsAt.getTime() <= now.getTime()) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Дата завершения не может быть в прошлом',
+      );
+    }
+    if (input.placesCount !== undefined && input.placesCount < 0) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Количество мест не может быть отрицательным',
+      );
+    }
+    // Без этого авто-розыгрыш по `endsAt` молча и бесконечно повторял бы
+    // попытку каждую минуту — `draw()` отказывает без призовых мест, а
+    // никакого способа завести их автоматически после создания нет.
+    // `placesCount` — единственный способ задать места прямо при создании,
+    // поэтому именно он и требуется здесь, а не факт их наличия в базе.
+    if (input.endsAt && !input.placesCount) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Для авто-розыгрыша по дате нужно хотя бы одно призовое место — укажите «Мест»',
+      );
+    }
 
-    return this.prisma.contest.create({
+    // Id генерируется здесь, а не Postgres'ом, чтобы места можно было
+    // создать в одной транзакции с самим конкурсом: раньше это были два
+    // отдельных запроса, и сбой второго (например, обрыв соединения между
+    // ними) оставлял бы висеть ровно то, что вся эта проверка выше должна
+    // была не допустить — конкурс с `endsAt`, но без единого места.
+    const contestId = randomUUID();
+    const queries: Prisma.PrismaPromise<unknown>[] = [
+      this.prisma.contest.create({
+        data: {
+          id: contestId,
+          title: input.title,
+          description: input.description ?? '',
+          postId: input.postId ?? null,
+          joinButtonLabel: input.joinButtonLabel,
+          resultsButtonLabel: input.resultsButtonLabel,
+          notifyWinners: input.notifyWinners,
+          publishResultsInPost: input.publishResultsInPost,
+          startsAt: input.startsAt ?? null,
+          endsAt: input.endsAt ?? null,
+        },
+      }),
+    ];
+    if (input.placesCount) {
+      queries.push(
+        this.prisma.contestPrize.createMany({
+          data: Array.from({ length: input.placesCount }, (_, i) => ({
+            contestId,
+            place: i + 1,
+            label: `Место ${i + 1}`,
+          })),
+        }),
+      );
+    }
+    const [contest] = (await this.prisma.$transaction(queries)) as [Contest];
+
+    return contest;
+  }
+
+  /**
+   * Правка уже существующего конкурса — заголовок, описание, подписи кнопок,
+   * флаги уведомлений и даты. Работает до розыгрыша включительно (черновик
+   * и уже открытый приём), а не только до публикации: `endsAt` живого
+   * конкурса — это как раз то время, которое иногда нужно подвинуть, пока
+   * приём ещё идёт. После `drawn` — нет, розыгрыш уже состоялся, и что-либо
+   * менять в его условиях задним числом означало бы переписывать историю.
+   *
+   * `description` здесь — тот же панельный текст, что и при создании
+   * (публичный текст живёт в самом анонс-посте и правится отдельно, через
+   * его карточку): форма специально не синхронизирует их обратно, иначе
+   * правка одного поля молча переписывала бы то, что админ мог заранее
+   * набрать в другом.
+   *
+   * `postId` не входит в список правимых полей: привязка анонса — решение
+   * времени создания, смена поста задним числом — отдельная, не запрошенная
+   * возможность.
+   */
+  async editContest(
+    contestId: string,
+    input: {
+      title: string;
+      description?: string;
+      joinButtonLabel?: string;
+      resultsButtonLabel?: string;
+      notifyWinners?: boolean;
+      publishResultsInPost?: boolean;
+      startsAt?: Date;
+      endsAt?: Date;
+    },
+    now: Date = new Date(),
+  ): Promise<Contest> {
+    const contest = await this.requireContest(contestId);
+    if (contest.status === 'drawn') {
+      throw new AppException(
+        ErrorCode.CONTEST_ALREADY_DRAWN,
+        'Розыгрыш уже проведён — условия конкурса больше не редактируются',
+      );
+    }
+    if (input.startsAt && input.endsAt && input.startsAt >= input.endsAt) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Дата завершения должна быть позже даты начала',
+      );
+    }
+    // Только если дата реально меняется: форма всегда присылает текущее
+    // значение конкурса, даже когда админ правит не его, а что-то другое
+    // (например, заголовок). Конкурс, который сверка не смогла разыграть
+    // (мало участников — открытый вопрос ждёт человека) сам собой уезжает
+    // датой в прошлое — без этой оговорки его вообще нельзя было бы
+    // сохранить, пока не подвинута и сама дата.
+    const endsAtChanged =
+      (input.endsAt?.getTime() ?? null) !== (contest.endsAt?.getTime() ?? null);
+    if (
+      endsAtChanged &&
+      input.endsAt &&
+      input.endsAt.getTime() <= now.getTime()
+    ) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Дата завершения не может быть в прошлом',
+      );
+    }
+    await this.assertPrizesForAutoDraw(contestId, input.endsAt);
+
+    return this.prisma.contest.update({
+      where: { id: contestId },
       data: {
         title: input.title,
-        postId: input.postId ?? null,
+        description: input.description ?? '',
         joinButtonLabel: input.joinButtonLabel,
         resultsButtonLabel: input.resultsButtonLabel,
         notifyWinners: input.notifyWinners,
         publishResultsInPost: input.publishResultsInPost,
+        startsAt: input.startsAt ?? null,
+        endsAt: input.endsAt ?? null,
       },
     });
   }
@@ -103,10 +262,121 @@ export class ContestsService {
         'Розыгрыш уже проведён',
       );
     }
+    // Повторная защита той же дыры, что и в `createContest`/`editContest`:
+    // места можно снести до нуля через `setPrizes` уже после того, как
+    // `endsAt` назначен. Открытие — последний момент, где это ещё можно
+    // поймать до того, как приём вообще начнётся.
+    await this.assertPrizesForAutoDraw(contestId, contest.endsAt);
     return this.prisma.contest.update({
       where: { id: contestId },
       data: { status: 'open' },
     });
+  }
+
+  /**
+   * Общая проверка для `editContest`/`openContest`/`setPrizes`: конкурс с
+   * назначенным `endsAt` не может остаться без единого призового места —
+   * `draw()` откажет, а сверка будет молча и бесконечно повторять попытку
+   * раз в минуту. `createContest` проверяет тот же факт иначе (по
+   * `input.placesCount`, не по базе): на момент проверки там ещё нет
+   * строки конкурса, которую можно было бы посчитать.
+   */
+  private async assertPrizesForAutoDraw(
+    contestId: string,
+    endsAt: Date | null | undefined,
+  ): Promise<void> {
+    if (!endsAt) {
+      return;
+    }
+    const prizeCount = await this.prisma.contestPrize.count({
+      where: { contestId },
+    });
+    if (prizeCount === 0) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'У конкурса с датой завершения должно быть хотя бы одно призовое место',
+      );
+    }
+  }
+
+  /**
+   * Часть общей сверки `PostReconcilerService` — своего таймера и лока у
+   * конкурсов нет осознанно (см. комментарий там же: один планировщик,
+   * один лок, одно место отказа). Открывает `draft`-конкурсы, чьё время
+   * настало; провал одного не должен останавливать остальные.
+   */
+  async openDueContests(
+    now: Date,
+  ): Promise<{ opened: Array<{ id: string; postId: string | null }> }> {
+    const due = await this.prisma.contest.findMany({
+      where: { status: 'draft', startsAt: { lte: now } },
+      select: { id: true, postId: true },
+    });
+    const opened: Array<{ id: string; postId: string | null }> = [];
+    for (const contest of due) {
+      try {
+        await this.openContest(contest.id);
+        opened.push({ id: contest.id, postId: contest.postId });
+      } catch (err: unknown) {
+        this.logger.error(
+          { err, contestId: contest.id },
+          'Не удалось автоматически открыть приём участников',
+        );
+      }
+    }
+    return { opened };
+  }
+
+  /**
+   * Открытые конкурсы, чей анонс-пост всё ещё черновик — не только только
+   * что открытые в этом же проходе, а любые: если отправка при открытии
+   * упала (сетевой сбой VK/MAX), `openDueContests` эту связку больше
+   * никогда не увидит — она спрашивает только `status: 'draft'` у самого
+   * конкурса, а он уже `open`. Без отдельного прохода пост так и остался
+   * бы черновиком навсегда, без единой попытки повторить и без следа для
+   * админа, кроме одной строки в логе на момент отказа.
+   */
+  async openContestsWithUnsentAnnouncement(): Promise<
+    Array<{ id: string; postId: string }>
+  > {
+    const stuck = await this.prisma.contest.findMany({
+      where: { status: 'open', post: { status: 'draft' } },
+      select: { id: true, postId: true },
+    });
+    return stuck
+      .filter(
+        (contest): contest is { id: string; postId: string } =>
+          contest.postId != null,
+      )
+      .map((contest) => ({ id: contest.id, postId: contest.postId }));
+  }
+
+  /**
+   * Тот же приём, что у `openDueContests`. Конкурс без участников на
+   * момент `endsAt` не считается сбоем сверки — `draw` откажет ожидаемой
+   * `CONTEST_INSUFFICIENT_PARTICIPANTS`, конкурс остаётся `open`, и
+   * следующий проход пробует снова: добавят участника вручную — разыграется
+   * сам, а нет — так и останется ждать, не застряв ни в каком неверном
+   * статусе.
+   */
+  async drawDueContests(now: Date): Promise<{ drawn: number }> {
+    const due = await this.prisma.contest.findMany({
+      where: { status: 'open', endsAt: { lte: now } },
+      select: { id: true },
+    });
+    let drawn = 0;
+    for (const contest of due) {
+      try {
+        await this.draw(contest.id);
+        drawn++;
+      } catch (err: unknown) {
+        this.logger.warn(
+          { err, contestId: contest.id },
+          'Не удалось автоматически провести розыгрыш',
+        );
+      }
+    }
+    return { drawn };
   }
 
   async setPrizes(contestId: string, prizes: PrizeInput[]): Promise<void> {
@@ -123,6 +393,17 @@ export class ContestsService {
       throw new AppException(
         ErrorCode.VALIDATION_ERROR,
         'Призовые места повторяются',
+      );
+    }
+    // Последнее звено той же цепочки, что и в `createContest`/`editContest`/
+    // `openContest`: панель не даёт отправить пустой список, но сервис сам
+    // по себе это не проверял — вызов API в обход панели мог обнулить места
+    // у уже открытого конкурса с `endsAt`, и сверка молча повторяла бы
+    // розыгрыш каждую минуту без единого места для победителя.
+    if (prizes.length === 0 && contest.endsAt) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'У конкурса с датой завершения должно быть хотя бы одно призовое место',
       );
     }
 
@@ -466,39 +747,16 @@ export class ContestsService {
     return contests.map((contest) => ({
       id: contest.id,
       title: contest.title,
+      description: contest.description,
       status: contest.status,
       createdAt: contest.createdAt,
+      startsAt: contest.startsAt,
+      endsAt: contest.endsAt,
       participantsCount: contest._count.participants,
       placesCount: contest._count.prizes,
       postId: contest.post?.id ?? null,
       postText: contest.post?.text ?? null,
     }));
-  }
-
-  /**
-   * Посты, которые можно взять анонсом.
-   *
-   * Не отправленные: кнопка участия вшивается в доставку **в момент
-   * отправки**, и у вышедшего поста её уже не появится — только правкой
-   * опубликованного, которая в VK пока и вовсе недоступна. Предложить такой
-   * пост значило бы отдать конкурс без единого входа для участников, да ещё
-   * и молча. По той же причине исключены шаблоны повторяющихся постов: их
-   * вхождения — отдельные строки, конкурс к ним не привязан.
-   *
-   * Пост с конкурсом отсекается заодно: связь один к одному, такой выбор
-   * `createContest` всё равно отвергнет.
-   */
-  async listAnnouncementCandidates(limit = 50) {
-    return this.prisma.post.findMany({
-      where: {
-        contest: { is: null },
-        recurrenceRule: null,
-        status: { in: ['draft', 'scheduled'] },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-      select: { id: true, text: true, status: true, createdAt: true },
-    });
   }
 
   /** Приз существует и участник относится к тому же конкурсу. */

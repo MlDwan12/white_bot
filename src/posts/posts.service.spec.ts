@@ -56,13 +56,19 @@ function buildService() {
     },
     postDelivery: {
       count: jest.fn().mockResolvedValue(0),
-      findMany: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
       updateMany: jest.fn(),
+      deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      createMany: jest.fn().mockResolvedValue({ count: 0 }),
       groupBy: jest.fn().mockResolvedValue([]),
     },
     group: { findMany: jest.fn() },
     mediaAsset: { count: jest.fn().mockResolvedValue(0) },
-    postAttachment: { findMany: jest.fn().mockResolvedValue([]) },
+    postAttachment: {
+      findMany: jest.fn().mockResolvedValue([]),
+      deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      createMany: jest.fn().mockResolvedValue({ count: 0 }),
+    },
     mediaPlatformUpload: {
       count: jest.fn().mockResolvedValue(0),
       findMany: jest.fn().mockResolvedValue([]),
@@ -620,6 +626,203 @@ describe('PostsService', () => {
       expect((await service.finalizeIfComplete('post-1')).status).toBe(
         'partially_failed',
       );
+    });
+  });
+
+  describe('createDirectMessageDraft', () => {
+    it('creates a groupless draft, unlike a campaign post', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.create.mockResolvedValue(post({ status: 'draft' }));
+
+      await service.createDirectMessageDraft({ text: 'привет' });
+
+      const args = callArg<{ data: Record<string, unknown> }>(
+        prisma.post.create,
+        0,
+        0,
+      );
+      // No group picker in this form, so there is nothing to freeze into
+      // deliveries — unlike createPost, which always writes them.
+      expect(args.data.deliveries).toBeUndefined();
+      expect(args.data.status).toBe('draft');
+    });
+
+    it('validates attachments the same way createPost does', async () => {
+      const { service, prisma } = buildService();
+      prisma.mediaAsset.count.mockResolvedValue(0);
+
+      await expect(
+        service.createDirectMessageDraft({
+          text: 'привет',
+          attachmentIds: ['missing'],
+        }),
+      ).rejects.toBeInstanceOf(AppException);
+      expect(prisma.post.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('schedulePostIfDraft', () => {
+    it('schedules a post still sitting in draft', async () => {
+      const { service, prisma, queue } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.postAttachment.findMany.mockResolvedValue([]);
+
+      await service.schedulePostIfDraft('post-1');
+
+      expect(prisma.post.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { status: 'scheduled' } }),
+      );
+      expect(queue.add).toHaveBeenCalled();
+    });
+
+    it('leaves an already-scheduled post alone', async () => {
+      const { service, prisma, queue } = buildService();
+      // Called twice (auto-open in the reconciler, manual open in the panel)
+      // must not try to schedule the same announcement post a second time.
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'scheduled' }));
+
+      await service.schedulePostIfDraft('post-1');
+
+      expect(prisma.post.update).not.toHaveBeenCalled();
+      expect(queue.add).not.toHaveBeenCalled();
+    });
+
+    it('does nothing for a contest with no announcement post', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.schedulePostIfDraft('missing'),
+      ).resolves.toBeUndefined();
+      expect(prisma.post.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('editDraft', () => {
+    it('refuses to edit a post that is no longer a draft', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'scheduled' }));
+
+      // Deliveries may already be queued or sent by this point — rewriting
+      // them here would race the worker, not just annoy the admin.
+      await expect(
+        service.editDraft('post-1', { text: 'x', groupIds: ['g1'] }),
+      ).rejects.toBeInstanceOf(AppException);
+      expect(prisma.postDelivery.deleteMany).not.toHaveBeenCalled();
+      expect(prisma.post.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses an empty group list, same as createPost', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+
+      await expect(
+        service.editDraft('post-1', { text: 'x', groupIds: [] }),
+      ).rejects.toBeInstanceOf(AppException);
+      expect(prisma.post.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses an unusable target group', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g1', status: 'bot_removed', title: 'Мёртвая' },
+      ]);
+
+      await expect(
+        service.editDraft('post-1', { text: 'x', groupIds: ['g1'] }),
+      ).rejects.toBeInstanceOf(AppException);
+      expect(prisma.post.update).not.toHaveBeenCalled();
+    });
+
+    it('adds and removes deliveries by diffing against the current target list', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g2', status: 'active', title: 'B' },
+        { id: 'g3', status: 'active', title: 'C' },
+      ]);
+      // Currently targets g1 and g2; the edit keeps g2 and adds g3.
+      prisma.postDelivery.findMany.mockResolvedValue([
+        { groupId: 'g1' },
+        { groupId: 'g2' },
+      ]);
+
+      await service.editDraft('post-1', {
+        text: 'x',
+        groupIds: ['g2', 'g3'],
+      });
+
+      const removeArgs = callArg<{ where: { groupId: { in: string[] } } }>(
+        prisma.postDelivery.deleteMany,
+        0,
+        0,
+      );
+      expect(removeArgs.where.groupId.in).toEqual(['g1']);
+      const addArgs = callArg<{ data: { groupId: string; postId: string }[] }>(
+        prisma.postDelivery.createMany,
+        0,
+        0,
+      );
+      expect(addArgs.data).toEqual([{ groupId: 'g3', postId: 'post-1' }]);
+    });
+
+    it('replaces attachments wholesale, like editPublished does', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g1', status: 'active', title: 'A' },
+      ]);
+      prisma.mediaAsset.count.mockResolvedValue(1);
+
+      await service.editDraft('post-1', {
+        text: 'x',
+        groupIds: ['g1'],
+        attachmentIds: ['m1'],
+      });
+
+      expect(prisma.postAttachment.deleteMany).toHaveBeenCalledWith({
+        where: { postId: 'post-1' },
+      });
+      const created = callArg<{
+        data: { mediaAssetId: string; position: number; postId: string }[];
+      }>(prisma.postAttachment.createMany, 0, 0);
+      expect(created.data).toEqual([
+        { mediaAssetId: 'm1', position: 0, postId: 'post-1' },
+      ]);
+    });
+
+    it('saves text, both overrides and the schedule in one update', async () => {
+      const { service, prisma } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g1', status: 'active', title: 'A' },
+      ]);
+      const scheduledAt = new Date('2026-10-01T10:00:00.000Z');
+
+      await service.editDraft('post-1', {
+        text: 'новый текст',
+        vkTextOverride: 'для VK',
+        maxTextOverride: '',
+        groupIds: ['g1'],
+        scheduledAt,
+      });
+
+      const updateCall = callArg<{
+        where: unknown;
+        data: Record<string, unknown>;
+      }>(prisma.post.update, 0, 0);
+      expect(updateCall).toEqual({
+        where: { id: 'post-1' },
+        data: {
+          text: 'новый текст',
+          vkTextOverride: 'для VK',
+          // Empty string means "no override", same convention as
+          // editPublished — stored as null, not as an empty string.
+          maxTextOverride: null,
+          scheduledAt,
+        },
+      });
     });
   });
 });

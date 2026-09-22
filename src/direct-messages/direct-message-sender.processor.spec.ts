@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { GroupRateLimiter } from '../queue/group-rate-limiter';
 import { MaxApiClient } from '../max/max-api.client';
 import { MaxApiError } from '../max/max-api.error';
+import { AttachmentUploader } from '../posts/attachment-uploader';
 import { DeliverDirectMessageJob } from '../queue/queue.constants';
 import { DirectMessageSenderProcessor } from './direct-message-sender.processor';
 
@@ -17,7 +18,12 @@ function deliveryRow(overrides: Record<string, unknown> = {}) {
   return {
     id: 'd1',
     status: 'pending',
-    post: { id: 'post-1', text: 'привет', maxTextOverride: null },
+    post: {
+      id: 'post-1',
+      text: 'привет',
+      maxTextOverride: null,
+      attachments: [],
+    },
     platformUser: { platform: 'max', externalUserId: '42' },
     ...overrides,
   };
@@ -46,18 +52,27 @@ function setup() {
   const max = {
     sendMessageToUser: jest.fn().mockResolvedValue({ messageId: 'm1' }),
   };
+  const attachments = {
+    maxAttachments: jest.fn().mockResolvedValue([]),
+  };
   const rateLimiter = {
     reserve: jest.fn().mockResolvedValue({ acquired: true, waitMs: 0 }),
   };
-  const logger = { setContext: jest.fn(), info: jest.fn(), warn: jest.fn() };
+  const logger = {
+    setContext: jest.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+  };
 
   const processor = new DirectMessageSenderProcessor(
     prisma as unknown as PrismaService,
     max as unknown as MaxApiClient,
+    attachments as unknown as AttachmentUploader,
     rateLimiter as unknown as GroupRateLimiter,
     logger as unknown as PinoLogger,
   );
-  return { processor, prisma, max, rateLimiter, logger };
+  return { processor, prisma, max, attachments, rateLimiter, logger };
 }
 
 describe('DirectMessageSenderProcessor', () => {
@@ -128,7 +143,12 @@ describe('DirectMessageSenderProcessor', () => {
     const { processor, prisma, max } = setup();
     prisma.directMessageDelivery.findUnique.mockResolvedValue(
       deliveryRow({
-        post: { id: 'post-1', text: 'общий', maxTextOverride: 'для MAX' },
+        post: {
+          id: 'post-1',
+          text: 'общий',
+          maxTextOverride: 'для MAX',
+          attachments: [],
+        },
       }),
     );
 
@@ -142,7 +162,36 @@ describe('DirectMessageSenderProcessor', () => {
       where: { id: 'd1' },
       data: { status: 'sending', attemptsMade: { increment: 1 } },
     });
-    expect(max.sendMessageToUser).toHaveBeenCalledWith(42, 'для MAX');
+    expect(max.sendMessageToUser).toHaveBeenCalledWith(42, 'для MAX', {
+      attachments: [],
+    });
+  });
+
+  it('прикладывает вложения поста, а не только текст', async () => {
+    const { processor, prisma, max, attachments } = setup();
+    const mediaAsset = { id: 'm1', kind: 'image' };
+    prisma.directMessageDelivery.findUnique.mockResolvedValue(
+      deliveryRow({
+        post: {
+          id: 'post-1',
+          text: 'привет',
+          maxTextOverride: null,
+          attachments: [{ mediaAsset }],
+        },
+      }),
+    );
+    const built = [{ type: 'image', payload: { photos: [] } }];
+    attachments.maxAttachments.mockResolvedValue(built);
+
+    await processor.process(deliverJob());
+
+    // The dedicated cache used by campaign deliveries — a personal message
+    // must not silently drop to text-only just because it has its own
+    // sender rather than PostSender.
+    expect(attachments.maxAttachments).toHaveBeenCalledWith([mediaAsset]);
+    expect(max.sendMessageToUser).toHaveBeenCalledWith(42, 'привет', {
+      attachments: built,
+    });
   });
 
   it('записывает id сообщения и sentAt при успехе', async () => {
@@ -160,6 +209,31 @@ describe('DirectMessageSenderProcessor', () => {
       status: 'sent',
       externalMessageId: 'm1',
       error: null,
+    });
+  });
+
+  it('не роняет джоб, если запись "sent" не удалась после реальной отправки', async () => {
+    const { processor, prisma } = setup();
+    // Отправка уже случилась (max.sendMessageToUser выше замокан успешным) —
+    // падает только сама запись результата в базу.
+    prisma.directMessageDelivery.update
+      .mockResolvedValueOnce({}) // status: 'sending'
+      .mockRejectedValueOnce(new Error('база недоступна')) // status: 'sent'
+      .mockResolvedValueOnce({}); // markUnknownAfterSend: status: 'unknown'
+
+    // Бросок отсюда БullMQ засчитал бы как неудачную попытку — а сообщение
+    // уже реально ушло получателю.
+    await expect(processor.process(deliverJob())).resolves.toBeUndefined();
+
+    const calls = prisma.directMessageDelivery.update.mock.calls as unknown[][];
+    const lastCall = calls[calls.length - 1][0] as {
+      where: unknown;
+      data: Record<string, unknown>;
+    };
+    expect(lastCall.where).toEqual({ id: 'd1' });
+    expect(lastCall.data).toMatchObject({
+      status: 'unknown',
+      externalMessageId: 'm1',
     });
   });
 

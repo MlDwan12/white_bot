@@ -53,6 +53,15 @@ export interface CampaignSummary {
   unknown: number;
 }
 
+export interface EditDraftInput {
+  text: string;
+  vkTextOverride?: string;
+  maxTextOverride?: string;
+  groupIds: string[];
+  attachmentIds?: string[];
+  scheduledAt?: Date;
+}
+
 export interface CreatePostInput {
   text: string;
   vkTextOverride?: string;
@@ -99,6 +108,37 @@ export class PostsService {
         deliveries: {
           create: groupIds.map((groupId) => ({ groupId })),
         },
+        attachments: {
+          create: PostsService.attachmentCreateData(attachmentIds),
+        },
+      },
+    });
+  }
+
+  /**
+   * DM-only пост: без единой группы и без `scheduledAt`. В отличие от
+   * `createPost`, не проходит через `assertGroupsUsable` — рассылка в
+   * личку не публикует ничего на стену, выбирать группу-мишень незачем.
+   *
+   * Остаётся `draft` навсегда: `schedulePost` для таких постов не
+   * вызывается ни разу, дальше ими пользуется только
+   * `DirectMessageDispatchService.sendNow`. Без вызова `schedulePost`
+   * `finalizeIfComplete` тоже не задевает пост — иначе с нулём доставок он
+   * тут же осел бы статусом `sent`, хотя никуда не публиковался (тот же
+   * краевой случай, что уже описан у повторяющихся постов с пустым
+   * списком групп).
+   */
+  async createDirectMessageDraft(input: {
+    text: string;
+    attachmentIds?: string[];
+  }): Promise<Post> {
+    const attachmentIds = input.attachmentIds ?? [];
+    await this.assertAttachmentsUsable(attachmentIds);
+
+    return this.prisma.post.create({
+      data: {
+        text: input.text,
+        status: 'draft',
         attachments: {
           create: PostsService.attachmentCreateData(attachmentIds),
         },
@@ -216,6 +256,92 @@ export class PostsService {
     // reconciler delivered it on the next start.)
     await this.enqueueDispatch(updated, now);
     return updated;
+  }
+
+  /**
+   * Отправка анонс-поста конкурса при открытии приёма — вызывающая сторона
+   * (открытие вручную из панели, авто-открытие по `startsAt` в сверке) не
+   * знает и не должна знать, в каком статусе сейчас пост: черновик — шлём,
+   * уже запланирован или отправлен — не трогаем. Идемпотентна по той же
+   * причине, что и `DirectMessageDispatchService.sendNow`: повторное
+   * открытие того же конкурса (или два прохода сверки подряд) не должны
+   * попытаться отправить один и тот же пост дважды.
+   */
+  async schedulePostIfDraft(id: string, now: Date = new Date()): Promise<void> {
+    const post = await this.prisma.post.findUnique({
+      where: { id },
+      select: { status: true },
+    });
+    if (post?.status !== 'draft') {
+      return;
+    }
+    await this.schedulePost(id, now);
+  }
+
+  /**
+   * Правка черновика целиком — текст, оба переопределения, вложения, группы
+   * и расписание — единственная точка входа, аналогичная тому, как
+   * `editPublished` — единственная для уже отправленного. До отправки менять
+   * можно свободно: ни одна доставка ещё не тронута сетью.
+   *
+   * Группы правятся пересборкой `PostDelivery`, а не точечным
+   * добавлением/удалением по одной: `createPost` уже фиксирует список одним
+   * проходом, и здесь та же форма — целевой список целиком, а не набор
+   * действий над старым. Удалять безопасно можно только *не начатые*
+   * доставки, но для черновика это все доставки без исключения: ничего не
+   * шлётся, пока `schedulePost` не переведёт пост из `draft`.
+   */
+  async editDraft(id: string, input: EditDraftInput): Promise<Post> {
+    const post = await this.findOrThrow(id);
+    if (post.status !== 'draft') {
+      throw new AppException(
+        ErrorCode.REQUEST_ERROR,
+        `Пост нельзя редактировать из статуса «${post.status}»`,
+      );
+    }
+
+    const groupIds = [...new Set(input.groupIds)];
+    await this.assertGroupsUsable(groupIds);
+    const attachmentIds = input.attachmentIds ?? [];
+    await this.assertAttachmentsUsable(attachmentIds);
+
+    const existingDeliveries = await this.prisma.postDelivery.findMany({
+      where: { postId: id },
+      select: { groupId: true },
+    });
+    const existingGroupIds = existingDeliveries.map((d) => d.groupId);
+    const toRemove = existingGroupIds.filter((g) => !groupIds.includes(g));
+    const toAdd = groupIds.filter((g) => !existingGroupIds.includes(g));
+
+    await this.prisma.$transaction([
+      this.prisma.postDelivery.deleteMany({
+        where: { postId: id, groupId: { in: toRemove } },
+      }),
+      this.prisma.postDelivery.createMany({
+        data: toAdd.map((groupId) => ({ postId: id, groupId })),
+      }),
+      // Тот же приём, что у `editPublished`: форма несёт полный список
+      // вложений всегда, снятая галочка — это осознанное «убрать», а не
+      // «поле не прислали».
+      this.prisma.postAttachment.deleteMany({ where: { postId: id } }),
+      this.prisma.postAttachment.createMany({
+        data: PostsService.attachmentCreateData(attachmentIds).map((a) => ({
+          ...a,
+          postId: id,
+        })),
+      }),
+      this.prisma.post.update({
+        where: { id },
+        data: {
+          text: input.text,
+          vkTextOverride: input.vkTextOverride || null,
+          maxTextOverride: input.maxTextOverride || null,
+          scheduledAt: input.scheduledAt ?? null,
+        },
+      }),
+    ]);
+
+    return this.findOrThrow(id);
   }
 
   /**

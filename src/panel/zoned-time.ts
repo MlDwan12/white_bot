@@ -37,6 +37,31 @@ export function zonedToUtc(local: string, timeZone: string): Date {
   return result;
 }
 
+/**
+ * Обратное направление: момент времени → строка для `value` в
+ * `datetime-local`, в том же поясе, что и `zonedToUtc`. Нужна там, где форма
+ * правки предзаполняется уже сохранённым временем (а не набирается с нуля,
+ * как при создании) — без нёе редактирование расписания черновика показывало
+ * бы время сервера вместо того, что реально набрал админ.
+ */
+export function utcToZoned(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).formatToParts(date);
+
+  const get = (type: string) =>
+    parts.find((part) => part.type === type)?.value ?? '00';
+  // Та же поправка на полночь, что и в `offsetMs`.
+  const hour = get('hour') === '24' ? '00' : get('hour');
+  return `${get('year')}-${get('month')}-${get('day')}T${hour}:${get('minute')}`;
+}
+
 /** Смещение зоны относительно UTC в данный момент, в миллисекундах. */
 function offsetMs(instant: Date, timeZone: string): number {
   const parts = new Intl.DateTimeFormat('en-US', {
