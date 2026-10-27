@@ -1,7 +1,7 @@
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import { MaxApiClient } from '../max/max-api.client';
-import { MaxAdminResolver } from '../max/max-admin.resolver';
+import { AdminNotifier } from '../max/admin-notifier';
 import { ContestNotifier } from './contest-notifier';
 import { ContestParticipationService } from './contest-participation.service';
 
@@ -20,6 +20,7 @@ const winnerPrize = (overrides: Record<string, unknown> = {}) => ({
     platform: 'max',
     externalUserId: '42',
     displayName: 'Иван',
+    source: 'button',
   },
   ...overrides,
 });
@@ -60,24 +61,30 @@ function setup(
       unsupported: [],
     }),
   };
-  const admins = {
-    listNotifiableAdmins: jest
-      .fn()
-      .mockResolvedValue([{ id: 'a1', maxUserId: '7' }]),
-  };
+  const adminNotifier = { notifyAll: jest.fn().mockResolvedValue(1) };
+  // Вид анонса после розыгрыша собирает сервис участия (его логику
+  // проверяет свой спек); уведомитель лишь пишет его во все сообщения.
   const participation = {
     winnersList: jest.fn().mockResolvedValue('1. Главный приз — Иван'),
+    announcementRefresh: jest.fn().mockResolvedValue({
+      text: options.publishResultsInPost
+        ? 'Анонс\n\nПобедители:\n1. Главный приз — Иван'
+        : 'Анонс',
+      buttonText: 'Узнать результаты',
+      payload: `contest:join:${CONTEST_ID}`,
+      messageIds: ['mid.1'],
+    }),
   };
   const logger = { setContext: jest.fn(), warn: jest.fn(), info: jest.fn() };
 
   const notifier = new ContestNotifier(
     prisma as unknown as PrismaService,
     max as unknown as MaxApiClient,
-    admins as unknown as MaxAdminResolver,
+    adminNotifier as unknown as AdminNotifier,
     participation as unknown as ContestParticipationService,
     logger as unknown as PinoLogger,
   );
-  return { notifier, prisma, max, admins, logger };
+  return { notifier, prisma, max, adminNotifier, logger };
 }
 
 /** The status written for a prize by the notification pass. */
@@ -117,7 +124,7 @@ describe('ContestNotifier', () => {
     ]);
   });
 
-  it('appends the winners to the post when publishing is on', async () => {
+  it('writes the results view (winners in text) into the post', async () => {
     const { notifier, max } = setup({ publishResultsInPost: true });
 
     await notifier.announceResults(CONTEST_ID);
@@ -170,6 +177,29 @@ describe('ContestNotifier', () => {
     expect(notifyStatusOf(prisma)).toBe('manual_required');
   });
 
+  it('не пишет по цифровому нику ручного участника — это не его id', async () => {
+    // `Иван @100500` — ник «100500»; лс ушло бы постороннему с id 100500.
+    const { notifier, max, prisma } = setup();
+    prisma.contestPrize.findMany.mockResolvedValue([
+      winnerPrize({
+        winnerParticipant: {
+          platform: 'max',
+          externalUserId: '100500',
+          displayName: 'Иван',
+          source: 'manual',
+        },
+      }),
+    ]);
+
+    await notifier.announceResults(CONTEST_ID);
+
+    expect(max.sendMessageToUser).not.toHaveBeenCalledWith(
+      100500,
+      expect.anything(),
+    );
+    expect(notifyStatusOf(prisma)).toBe('manual_required');
+  });
+
   it('marks an undelivered DM as manual and records why', async () => {
     const { notifier, max, prisma } = setup();
     max.sendMessageToUser.mockRejectedValueOnce(new Error('нет диалога'));
@@ -200,34 +230,25 @@ describe('ContestNotifier', () => {
   });
 
   it('tells the admins when a winner was replaced by hand', async () => {
-    const { notifier, max } = setup();
+    const { notifier, adminNotifier } = setup();
 
     await notifier.announceResults(CONTEST_ID, 'override');
 
-    const adminCall = max.sendMessageToUser.mock.calls.find(
-      ([userId]) => userId === 7,
-    ) as [number, string];
-    expect(adminCall[1]).toContain('победитель изменён вручную');
+    expect(callArg<string>(adminNotifier.notifyAll)).toContain(
+      'победитель изменён вручную',
+    );
   });
 
   it('reports the finished contest to the admins', async () => {
-    const { notifier, max } = setup();
+    const { notifier, adminNotifier } = setup();
 
     await notifier.announceResults(CONTEST_ID);
 
-    const adminCall = max.sendMessageToUser.mock.calls.find(
-      ([userId]) => userId === 7,
-    ) as [number, string];
-    expect(adminCall[1]).toContain('Конкурс «Конкурс» завершён');
-    expect(adminCall[1]).toContain('Канал');
-    expect(adminCall[1]).toContain('1. Главный приз — Иван');
-  });
-
-  it('warns rather than throws when no admin can be reached', async () => {
-    const { notifier, admins, logger } = setup();
-    admins.listNotifiableAdmins.mockResolvedValue([]);
-
-    await expect(notifier.announceResults(CONTEST_ID)).resolves.toBeUndefined();
-    expect(logger.warn).toHaveBeenCalled();
+    // Рассылку админам (нет админов, MAX не настроен, сбой по одному) ведёт
+    // общий AdminNotifier — здесь только текст отчёта.
+    const text = callArg<string>(adminNotifier.notifyAll);
+    expect(text).toContain('Конкурс «Конкурс» завершён');
+    expect(text).toContain('Канал');
+    expect(text).toContain('1. Главный приз — Иван');
   });
 });

@@ -5,6 +5,7 @@ import { VkModule } from '../vk/vk.module';
 import { MaxModule } from '../max/max.module';
 import { MediaModule } from '../media/media.module';
 import { QueueModule } from '../queue/queue.module';
+import { ContestParticipationModule } from '../contests/contest-participation.module';
 import { ContestsModule } from '../contests/contests.module';
 import { PostsController } from './posts.controller';
 import { PostTemplatesController } from './post-templates.controller';
@@ -33,6 +34,9 @@ import { AuthModule } from '../auth/auth.module';
     // по датам живёт в общей сверке `PostReconcilerService`, не в своём
     // отдельном таймере (см. комментарий там же).
     ContestsModule,
+    // Вид анонса конкурса (текст с итогами, подпись кнопки) — при отправке и
+    // правке поста-носителя.
+    ContestParticipationModule,
   ],
   controllers: [PostsController, PostTemplatesController],
   providers: [

@@ -10,7 +10,7 @@ import {
   Prisma,
 } from '../generated/prisma/client';
 import { MediaService } from '../media/media.service';
-import { VkApiClient } from '../vk/vk-api.client';
+import { VkApiClient, type VkAttachmentInput } from '../vk/vk-api.client';
 import { MaxApiClient, MaxAttachmentInput } from '../max/max-api.client';
 import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 
@@ -32,6 +32,9 @@ export const MAX_SCOPE = 'bot';
  * VK references don't expire and aren't aged.
  */
 const MAX_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Видео в кэше старше этого MAX уже обработал — готовность не опрашиваем. */
+const VIDEO_SETTLED_MS = 10 * 60 * 1000;
 
 /** True for Prisma's unique-constraint violation (P2002). */
 function isUniqueConstraintViolation(err: unknown): boolean {
@@ -75,15 +78,29 @@ export class AttachmentUploader {
     const refs: string[] = [];
     for (const asset of assets) {
       refs.push(
-        await this.resolve('vk', group.id, asset, async () => {
-          const buffer = await this.media.readForUpload(asset);
-          return this.vk.uploadAttachment(await getToken(), group.externalId, {
-            kind: asset.kind === 'image' ? 'photo' : 'doc',
-            filename: asset.filename,
-            mimeType: asset.mimeType,
-            buffer,
-          });
-        }),
+        // Видео — со своим ключом кэша: до 23.09.2026 оно уходило в VK
+        // документом, и под обычным ключом лежит `doc…`, который иначе
+        // продолжал бы подставляться вместо видеозаписи.
+        (
+          await this.resolve(
+            'vk',
+            vkUploadScope(group.id, asset.kind),
+            asset,
+            async () => {
+              const buffer = await this.media.readForUpload(asset);
+              return this.vk.uploadAttachment(
+                await getToken(),
+                group.externalId,
+                {
+                  kind: AttachmentUploader.vkUploadKind(asset.kind),
+                  filename: asset.filename,
+                  mimeType: asset.mimeType,
+                  buffer,
+                },
+              );
+            },
+          )
+        ).externalRef,
       );
     }
     return refs;
@@ -93,20 +110,49 @@ export class AttachmentUploader {
   async maxAttachments(assets: MediaAsset[]): Promise<AttachmentRequest[]> {
     const attachments: AttachmentRequest[] = [];
     for (const asset of assets) {
-      const ref = await this.resolve('max', MAX_SCOPE, asset, async () =>
-        // A path carrying the original file name, not the bytes: the SDK takes
-        // the displayed name from its source, so a Buffer would show a random
-        // uuid and the raw storage path would show our generated one. For a
-        // document that name is what the recipient sees.
-        this.media.withUploadPath(asset, async (source) => {
-          const attachment = await this.max.uploadAttachment({
-            kind: AttachmentUploader.maxUploadKind(asset.kind),
-            source,
-          });
-          return JSON.stringify(attachment);
-        }),
+      // Видео — под своим ключом, как и у VK: файл, загруженный раньше
+      // документом и потом распознанный как видео, иначе ещё неделю уходил бы
+      // из кэша файлом на скачивание, а не проигрывателем.
+      const scope = asset.kind === 'video' ? `${MAX_SCOPE}:video` : MAX_SCOPE;
+      const { externalRef: ref, cachedAt } = await this.resolve(
+        'max',
+        scope,
+        asset,
+        async () =>
+          // A path carrying the original file name, not the bytes: the SDK takes
+          // the displayed name from its source, so a Buffer would show a random
+          // uuid and the raw storage path would show our generated one. For a
+          // document that name is what the recipient sees.
+          this.media.withUploadPath(asset, async (source) => {
+            const attachment = await this.max.uploadAttachment({
+              kind: AttachmentUploader.maxUploadKind(asset.kind),
+              source,
+            });
+            // Без токена ждать готовности нечем — а закэшировать такое видео
+            // значило бы неделю отдавать ссылку, которую MAX отвергнет.
+            if (attachment.type === 'video' && !attachment.payload.token) {
+              throw new Error('MAX не вернул токен загруженного видео');
+            }
+            return JSON.stringify(attachment);
+          }),
       );
-      attachments.push(JSON.parse(ref) as AttachmentRequest);
+      const attachment = JSON.parse(ref) as AttachmentRequest;
+      // Видео MAX ещё перекодирует, и сообщение с ним до этого отвергается.
+      // Ждём **после** записи в кэш: если обработка дольше срока ожидания,
+      // повтор доставки найдёт в кэше то же видео (к тому времени
+      // обработанное), а не зальёт его заново и снова упрётся в срок. Видео,
+      // давно лежащее в кэше, не опрашиваем: лишний запрос на каждую
+      // доставку тратил бы лимит MAX, а сбой опроса ронял бы готовое видео.
+      // ponytail: «давно» — по возрасту записи, а не по факту готовности;
+      // если MAX начнёт обрабатывать дольше 10 мин — хранить флаг готовности.
+      if (
+        attachment.type === 'video' &&
+        attachment.payload.token &&
+        (!cachedAt || Date.now() - cachedAt.getTime() < VIDEO_SETTLED_MS)
+      ) {
+        await this.max.waitForVideoReady(attachment.payload.token);
+      }
+      attachments.push(attachment);
     }
     return attachments;
   }
@@ -124,7 +170,7 @@ export class AttachmentUploader {
     scope: string,
     asset: MediaAsset,
     upload: () => Promise<string>,
-  ): Promise<string> {
+  ): Promise<{ externalRef: string; cachedAt: Date | null }> {
     const where = {
       mediaAssetId_platform_scope: {
         mediaAssetId: asset.id,
@@ -134,10 +180,15 @@ export class AttachmentUploader {
     };
     const cached = await this.prisma.mediaPlatformUpload.findUnique({ where });
     if (cached && this.isFresh(platform, cached.createdAt)) {
-      return cached.externalRef;
+      // Когда ссылка легла в кэш: по возрасту видно, успел ли MAX
+      // обработать видео (см. `maxAttachments`).
+      return { externalRef: cached.externalRef, cachedAt: cached.createdAt };
     }
 
     const externalRef = await upload();
+    // Свежая загрузка (или чужая, выигравшая гонку секунды назад) — для
+    // проверки готовности видео она «только что легла в кэш».
+    const fresh = { externalRef, cachedAt: null };
 
     if (cached) {
       // Stale MAX entry: replace it rather than leaving the dead reference to
@@ -150,20 +201,23 @@ export class AttachmentUploader {
             'Не удалось обновить устаревшую ссылку на вложение',
           ),
         );
-      return externalRef;
+      return fresh;
     }
 
     try {
       await this.prisma.mediaPlatformUpload.create({
         data: { mediaAssetId: asset.id, platform, scope, externalRef },
       });
-      return externalRef;
+      return fresh;
     } catch (err: unknown) {
       if (isUniqueConstraintViolation(err)) {
         const winner = await this.prisma.mediaPlatformUpload.findUnique({
           where,
         });
-        return winner?.externalRef ?? externalRef;
+        return {
+          externalRef: winner?.externalRef ?? externalRef,
+          cachedAt: null,
+        };
       }
       // Any other failure means the cache stays cold and the next retry will
       // upload this file again — wasteful, but not wrong, so the delivery
@@ -173,7 +227,7 @@ export class AttachmentUploader {
         { err, assetId: asset.id, platform, scope },
         'Не удалось сохранить ссылку на загруженное вложение в кэш',
       );
-      return externalRef;
+      return fresh;
     }
   }
 
@@ -200,4 +254,26 @@ export class AttachmentUploader {
         return 'file';
     }
   }
+
+  /** `MediaKind` → вид вложения VK: видео — видеозаписью, а не документом. */
+  private static vkUploadKind(kind: MediaKind): VkAttachmentInput['kind'] {
+    switch (kind) {
+      case 'image':
+        return 'photo';
+      case 'video':
+        return 'video';
+      case 'document':
+        return 'doc';
+    }
+  }
+}
+
+/**
+ * Ключ кэша загрузки в VK-сообщество. Видео — со своим ключом: до 23.09.2026
+ * оно уходило в VK документом, и под обычным ключом лежит `doc…`. Экспортом,
+ * а не приватным методом: проверка «нужен ли токен загрузчика»
+ * (`PostsService`) обязана искать кэш по тому же ключу.
+ */
+export function vkUploadScope(groupId: string, kind: MediaKind): string {
+  return kind === 'video' ? `${groupId}:video` : groupId;
 }

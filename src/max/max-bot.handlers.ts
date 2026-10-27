@@ -3,6 +3,7 @@ import { Bot } from '@maxhub/max-bot-api';
 import type { Attachment } from '@maxhub/max-bot-api/types';
 import { PinoLogger } from 'nestjs-pino';
 import { GroupsService, PublicGroup } from '../groups/groups.service';
+import { AdminNotifier } from './admin-notifier';
 import { MaxAdminResolver } from './max-admin.resolver';
 import { MaxApiClient } from './max-api.client';
 import {
@@ -15,10 +16,13 @@ import {
   type PlatformUserProfile,
 } from '../platform-users/platform-users.service';
 import {
+  CONTEST_CHECK_PAYLOAD,
   CONTEST_JOIN_PAYLOAD,
   CONTEST_START_PAYLOAD,
   contestDmUrl,
   contestKeyboard,
+  subscriptionKeyboard,
+  type ContestKeyboardButton,
 } from '../contests/contest-button';
 import {
   CONSENT_ACCEPT_PAYLOAD,
@@ -89,6 +93,7 @@ export class MaxBotHandlers {
     private readonly contests: ContestParticipationService,
     private readonly platformUsers: PlatformUsersService,
     private readonly api: MaxApiClient,
+    private readonly notifier: AdminNotifier,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(MaxBotHandlers.name);
@@ -166,6 +171,18 @@ export class MaxBotHandlers {
         // Апдейт приносит исходное сообщение целиком, так что медиа не
         // приходится запрашивать отдельно — только передать обратно.
         ctx.update.message?.body?.attachments,
+      );
+    });
+
+    bot.action(CONTEST_CHECK_PAYLOAD, async (ctx) => {
+      const contestId = ctx.match?.[1];
+      if (!contestId) {
+        return;
+      }
+      await this.handleSubscriptionCheck(
+        contestId,
+        ctx.user,
+        ctx.callback.callback_id,
       );
     });
 
@@ -322,7 +339,21 @@ export class MaxBotHandlers {
         : undefined,
     );
 
-    await this.sendPrivately(user.user_id, outcome.message);
+    // Ответ на колбэк собран до ответа: если за это время прошёл розыгрыш,
+    // он мог затереть итоги в этом сообщении — тогда доводим все сообщения
+    // анонса до вида итогов. На сдвиг счётчика не перерисовываем: при
+    // потоке нажатий это гоняло бы правки всех каналов на каждый клик.
+    if (outcome.refresh && !outcome.refresh.drawn) {
+      await this.redrawIfDrawnSince(contestId);
+    }
+
+    await this.sendPrivately(
+      user.user_id,
+      outcome.message,
+      outcome.missingChannels
+        ? subscriptionKeyboard(outcome.missingChannels, contestId)
+        : undefined,
+    );
   }
 
   /**
@@ -460,6 +491,7 @@ export class MaxBotHandlers {
       reply.text,
       contestId,
       user.user_id,
+      reply.buttons,
     );
     this.logger.info(
       {
@@ -497,9 +529,14 @@ export class MaxBotHandlers {
     text: string,
     resumePayload: string,
     userId: number,
+    buttons?: ContestKeyboardButton[][],
   ): Promise<boolean> {
     try {
-      await this.api.sendMessageToChat(chatId, text);
+      await this.api.sendMessageToChat(
+        chatId,
+        text,
+        ...(buttons ? [{ buttons }] : []),
+      );
       return true;
     } catch (err: unknown) {
       // Диалог только что открыт, так что провал — уже настоящий сбой, а не
@@ -510,6 +547,57 @@ export class MaxBotHandlers {
         'Не удалось ответить в диалоге, открытом при старте бота',
       );
       return false;
+    }
+  }
+
+  /**
+   * «Проверить подписку» под сообщением со списком каналов. Та же логика,
+   * что и при переходе по ссылке из поста (`startedFromLink`): человек уже в
+   * открытом диалоге, и повторять ради проверки путь через пост незачем.
+   *
+   * Ответ на колбэк заменяет само сообщение со списком: подписался — оно
+   * становится «Вы участвуете», нет — остаётся списком оставшихся каналов с
+   * той же кнопкой.
+   */
+  private async handleSubscriptionCheck(
+    contestId: string,
+    user: MaxUserLike,
+    callbackId: string,
+  ): Promise<void> {
+    let reply: StartedFromLink;
+    try {
+      reply = await this.contests.startedFromLink(contestId, toProfile(user));
+    } catch (err: unknown) {
+      this.logger.error(
+        { err, contestId, userId: user.user_id },
+        'Не удалось повторно проверить подписку участника',
+      );
+      // Пустой ответ оставляет сообщение с кнопкой как есть — её можно нажать
+      // ещё раз.
+      await this.safeAnswer(callbackId);
+      return;
+    }
+
+    let answered = true;
+    try {
+      await this.api.answerCallback(callbackId, {
+        text: reply.text,
+        buttons: reply.buttons,
+      });
+    } catch (err: unknown) {
+      answered = false;
+      this.logger.warn(
+        { err, contestId, userId: user.user_id },
+        'Не удалось ответить на проверку подписки — участие при этом уже обработано',
+      );
+    }
+    // Как и в `proceedAfterStart`: поздравление считается доставленным, только
+    // если ответ дошёл, а счётчик обновляется независимо от ответа.
+    if (answered) {
+      await this.contests.markWinnersNotified(reply.prizeIdsToMark);
+    }
+    if (reply.joined) {
+      await this.redrawAnnouncements(contestId);
     }
   }
 
@@ -539,14 +627,23 @@ export class MaxBotHandlers {
     try {
       do {
         state.again = false;
-        await this.redrawOnce(contestId);
+        // Розыгрыш мог пройти, пока шли правки: тогда наша запоздалая правка
+        // затёрла бы итоги — пост снова стал бы «Участвовать (N)». Поэтому
+        // после прохода сверяемся и при смене статуса повторяем.
+        const written = await this.redrawOnce(contestId);
+        if (written && !state.again) {
+          state.again = await this.viewChangedSince(contestId, written);
+        }
       } while (state.again);
     } finally {
       this.redrawing.delete(contestId);
     }
   }
 
-  private async redrawOnce(contestId: string): Promise<void> {
+  /** Возвращает записанный вид — или `null`, если перерисовывать нечего. */
+  private async redrawOnce(
+    contestId: string,
+  ): Promise<{ drawn: boolean } | null> {
     let redraw: Awaited<
       ReturnType<ContestParticipationService['announcementRefresh']>
     >;
@@ -557,10 +654,10 @@ export class MaxBotHandlers {
         { err, contestId },
         'Не удалось собрать данные для обновления счётчика под анонсом',
       );
-      return;
+      return null;
     }
     if (!redraw) {
-      return;
+      return null;
     }
 
     const buttons = contestKeyboard(
@@ -587,6 +684,39 @@ export class MaxBotHandlers {
         );
       }
     }
+    return redraw;
+  }
+
+  private async redrawIfDrawnSince(contestId: string): Promise<void> {
+    let drawn = false;
+    try {
+      drawn = await this.contests.isDrawn(contestId);
+    } catch (err: unknown) {
+      this.logger.warn({ err, contestId }, 'Не удалось сверить вид анонса');
+    }
+    if (drawn) {
+      await this.redrawAnnouncements(contestId);
+    }
+  }
+
+  /** Отличается ли текущий вид анонса от уже записанного. Сбой — «нет». */
+  private async viewChangedSince(
+    contestId: string,
+    written: { drawn: boolean },
+  ): Promise<boolean> {
+    // Только смена «до розыгрыша / после», а не сдвиг счётчика: счётчик
+    // поправит следующая перерисовка по следующему вступлению, а повтор на
+    // каждый сдвиг при потоке нажатий гонял бы правку всех каналов подряд и
+    // выбирал общий лимит бота MAX.
+    // Статус меняется только в одну сторону (идёт → разыгран): повтор нужен,
+    // лишь если записан вид «до», а конкурс уже разыгран. После записи итогов
+    // цикл заведомо останавливается.
+    try {
+      return !written.drawn && (await this.contests.isDrawn(contestId));
+    } catch (err: unknown) {
+      this.logger.warn({ err, contestId }, 'Не удалось сверить вид анонса');
+      return false;
+    }
   }
 
   /**
@@ -612,9 +742,17 @@ export class MaxBotHandlers {
    * сообщение тому, кто сам не открывал диалог с ботом, так что провал здесь
    * ожидаем: счётчик на кнопке остаётся единственным общим подтверждением.
    */
-  private async sendPrivately(userId: number, text: string): Promise<void> {
+  private async sendPrivately(
+    userId: number,
+    text: string,
+    buttons?: ContestKeyboardButton[][],
+  ): Promise<void> {
     try {
-      await this.api.sendMessageToUser(userId, text);
+      await this.api.sendMessageToUser(
+        userId,
+        text,
+        ...(buttons ? [{ buttons }] : []),
+      );
     } catch (err: unknown) {
       this.logger.info(
         { err, userId },
@@ -637,20 +775,17 @@ export class MaxBotHandlers {
         { userId, groupId },
         'Нажатие кнопки подтверждения группы от неизвестного пользователя — проигнорировано',
       );
-      await this.api.answerCallback(callbackId);
+      await this.safeAnswer(callbackId);
       return;
     }
 
     try {
       if (action === 'confirm') {
         const group = await this.groups.confirmMaxGroup(groupId);
-        await this.api.answerCallback(
-          callbackId,
-          `Группа «${group.title}» подключена`,
-        );
+        await this.safeAnswer(callbackId, `Группа «${group.title}» подключена`);
       } else {
         await this.groups.rejectMaxGroup(groupId);
-        await this.api.answerCallback(callbackId, 'Группа отклонена');
+        await this.safeAnswer(callbackId, 'Группа отклонена');
       }
     } catch (err: unknown) {
       // Most likely the other admin already decided, or the draft is gone —
@@ -659,7 +794,7 @@ export class MaxBotHandlers {
         { err, groupId, action, adminId: admin.id },
         'Не удалось применить решение по MAX-группе',
       );
-      await this.api.answerCallback(
+      await this.safeAnswer(
         callbackId,
         'Не удалось применить решение — возможно, группа уже обработана',
       );
@@ -667,21 +802,10 @@ export class MaxBotHandlers {
   }
 
   /**
-   * Best-effort, like the VK connection test post: MAX refuses to deliver a
-   * bot's first message to a user who never opened a dialog with it, so a
-   * failure here is expected rather than exceptional. The draft is already
-   * saved and stays confirmable through the REST endpoints either way.
+   * Best-effort (see AdminNotifier): the draft is already saved and stays
+   * confirmable in the panel even if no admin can be reached over MAX.
    */
   private async notifyAdminsOfPendingGroup(group: PublicGroup): Promise<void> {
-    const admins = await this.admins.listNotifiableAdmins();
-    if (admins.length === 0) {
-      this.logger.warn(
-        { groupId: group.id },
-        'Нет администраторов с привязанным maxUserId — некому подтвердить группу',
-      );
-      return;
-    }
-
     const kindLabel = group.kind === 'channel' ? 'канал' : 'чат';
     const text = `Бот добавлен в ${kindLabel} «${group.title}».\nПодтвердить его как цель для рассылок?`;
     const buttons = [
@@ -698,18 +822,6 @@ export class MaxBotHandlers {
         },
       ],
     ];
-
-    for (const admin of admins) {
-      try {
-        await this.api.sendMessageToUser(Number(admin.maxUserId), text, {
-          buttons,
-        });
-      } catch (err: unknown) {
-        this.logger.warn(
-          { err, adminId: admin.id, groupId: group.id },
-          'Не удалось уведомить администратора о новой MAX-группе',
-        );
-      }
-    }
+    await this.notifier.notifyAll(text, buttons);
   }
 }

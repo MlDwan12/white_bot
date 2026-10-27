@@ -6,6 +6,7 @@ import { VkApiError } from '../vk/vk-api.error';
 import { Prisma } from '../generated/prisma/client';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { VkApiClient } from '../vk/vk-api.client';
+import type { AdminNotifier } from '../max/admin-notifier';
 import type { TokenEncryptionService } from '../common/crypto/token-encryption.service';
 
 function uniqueConstraintError(): Prisma.PrismaClientKnownRequestError {
@@ -36,8 +37,8 @@ function buildService() {
   };
   const vkApiClient = {
     resolveGroupInfo: jest.fn(),
-    postTestMessage: jest.fn(),
   };
+  const notifier = { notifyAll: jest.fn().mockResolvedValue(1) };
   const tokenEncryption = {
     encrypt: jest.fn((plaintext: string) => `enc(${plaintext})`),
     decrypt: jest.fn(),
@@ -53,23 +54,23 @@ function buildService() {
     prisma as unknown as PrismaService,
     vkApiClient as unknown as VkApiClient,
     tokenEncryption as unknown as TokenEncryptionService,
+    notifier as unknown as AdminNotifier,
     logger as unknown as PinoLogger,
     vkTokenProvider,
   );
 
-  return { service, prisma, vkApiClient, tokenEncryption, logger };
+  return { service, prisma, vkApiClient, tokenEncryption, notifier, logger };
 }
 
 describe('GroupsService', () => {
   describe('createVkGroup', () => {
-    it('creates a new active group and sends the test message', async () => {
-      const { service, prisma, vkApiClient } = buildService();
+    it('creates a new active group and tells the admins, not the community wall', async () => {
+      const { service, prisma, vkApiClient, notifier } = buildService();
       prisma.group.findUnique.mockResolvedValue(null);
       vkApiClient.resolveGroupInfo.mockResolvedValue({
         externalId: '42',
         title: 'Тестовое сообщество',
       });
-      vkApiClient.postTestMessage.mockResolvedValue(undefined);
       prisma.group.create.mockResolvedValue({
         id: 'g1',
         platform: 'vk',
@@ -97,7 +98,9 @@ describe('GroupsService', () => {
           tags: ['news'],
         },
       });
-      expect(result.testMessageSent).toBe(true);
+      expect(notifier.notifyAll).toHaveBeenCalledWith(
+        'VK-сообщество «Тестовое сообщество» подключено.',
+      );
       expect(result).not.toHaveProperty('accessTokenEncrypted');
     });
 
@@ -114,7 +117,6 @@ describe('GroupsService', () => {
         externalId: '42',
         title: 'Тестовое сообщество',
       });
-      vkApiClient.postTestMessage.mockResolvedValue(undefined);
       prisma.group.update.mockResolvedValue({
         id: 'g1',
         platform: 'vk',
@@ -136,6 +138,38 @@ describe('GroupsService', () => {
       });
     });
 
+    it('says "token updated", not "connected", when the community was already active', async () => {
+      const { service, prisma, vkApiClient, notifier } = buildService();
+      prisma.group.findUnique.mockResolvedValue({
+        id: 'g1',
+        platform: 'vk',
+        externalId: '42',
+        tags: [],
+        status: 'active',
+      });
+      vkApiClient.resolveGroupInfo.mockResolvedValue({
+        externalId: '42',
+        title: 'Тестовое сообщество',
+      });
+      prisma.group.update.mockResolvedValue({
+        id: 'g1',
+        platform: 'vk',
+        kind: 'community',
+        externalId: '42',
+        title: 'Тестовое сообщество',
+        tokenMask: 'mask',
+        tags: [],
+        status: 'active',
+        createdAt: new Date(),
+      });
+
+      await service.createVkGroup({ token: 'token' });
+
+      expect(notifier.notifyAll).toHaveBeenCalledWith(
+        'Токен VK-сообщества «Тестовое сообщество» обновлён.',
+      );
+    });
+
     it('throws a validation error when VK rejects the token', async () => {
       const { service, vkApiClient } = buildService();
       vkApiClient.resolveGroupInfo.mockRejectedValue(
@@ -150,35 +184,6 @@ describe('GroupsService', () => {
       ).rejects.toMatchObject({ code: ErrorCode.VALIDATION_ERROR });
     });
 
-    it('still connects the group when only the test message fails', async () => {
-      const { service, prisma, vkApiClient, logger } = buildService();
-      prisma.group.findUnique.mockResolvedValue(null);
-      vkApiClient.resolveGroupInfo.mockResolvedValue({
-        externalId: '42',
-        title: 'Тестовое сообщество',
-      });
-      vkApiClient.postTestMessage.mockRejectedValue(
-        new VkApiError(214, 'Access denied: no rights to perform this action'),
-      );
-      prisma.group.create.mockResolvedValue({
-        id: 'g1',
-        platform: 'vk',
-        kind: 'community',
-        externalId: '42',
-        title: 'Тестовое сообщество',
-        tokenMask: 'mask',
-        tags: [],
-        status: 'active',
-        createdAt: new Date(),
-      });
-
-      const result = await service.createVkGroup({ token: 'token' });
-
-      expect(result.testMessageSent).toBe(false);
-      expect(logger.warn).toHaveBeenCalled();
-      expect(prisma.group.create).toHaveBeenCalled();
-    });
-
     it('converges to an update when a concurrent request wins the create race', async () => {
       const { service, prisma, vkApiClient } = buildService();
       prisma.group.findUnique.mockResolvedValue(null);
@@ -186,7 +191,6 @@ describe('GroupsService', () => {
         externalId: '42',
         title: 'Тестовое сообщество',
       });
-      vkApiClient.postTestMessage.mockResolvedValue(undefined);
       prisma.group.create.mockRejectedValue(uniqueConstraintError());
       prisma.group.findUniqueOrThrow.mockResolvedValue({
         id: 'winner',
@@ -448,6 +452,28 @@ describe('GroupsService', () => {
       await service.rejectMaxGroup('g1');
 
       expect(prisma.group.delete).toHaveBeenCalledWith({ where: { id: 'g1' } });
+    });
+
+    it('falls back to a soft delete when a returning group still has history pinning it', async () => {
+      const { service, prisma } = buildService();
+      prisma.group.findUnique.mockResolvedValue({
+        id: 'g1',
+        platform: 'max',
+        status: 'pending_confirmation',
+      });
+      prisma.group.delete.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('fk', {
+          code: 'P2003',
+          clientVersion: 'test',
+        }),
+      );
+
+      await service.rejectMaxGroup('g1');
+
+      expect(prisma.group.update).toHaveBeenCalledWith({
+        where: { id: 'g1' },
+        data: { status: 'removed' },
+      });
     });
   });
 

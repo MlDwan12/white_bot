@@ -6,6 +6,7 @@ import { GroupRateLimiter } from '../queue/group-rate-limiter';
 import { JOB_DELIVER, JOB_DISPATCH_POST } from '../queue/queue.constants';
 import { VkApiError } from '../vk/vk-api.error';
 import { MaxApiError } from '../max/max-api.error';
+import { ContestParticipationService } from '../contests/contest-participation.service';
 import { PostDeliveryProcessor } from './post-delivery.processor';
 import { PostSender } from './post-sender';
 import { PostsService } from './posts.service';
@@ -67,6 +68,7 @@ function setup() {
   const sender = {
     send: jest.fn().mockResolvedValue({ externalMessageId: '42' }),
   };
+  const participation = { contestButton: jest.fn().mockResolvedValue(null) };
   const rateLimiter = {
     reserve: jest.fn().mockResolvedValue({ acquired: true, waitMs: 0 }),
   };
@@ -87,6 +89,7 @@ function setup() {
     sender as unknown as PostSender,
     rateLimiter as unknown as GroupRateLimiter,
     vkUploaderToken as unknown as VkUploaderTokenService,
+    participation as unknown as ContestParticipationService,
     queue as unknown as Queue,
     logger as unknown as PinoLogger,
   );

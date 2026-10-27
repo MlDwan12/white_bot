@@ -49,6 +49,7 @@ function setup() {
     uploadAttachment: jest
       .fn()
       .mockResolvedValue({ type: 'image', payload: { token: 'tok' } }),
+    waitForVideoReady: jest.fn().mockResolvedValue(undefined),
   };
   const vkUploaderToken = {
     getValidAccessToken: jest.fn().mockResolvedValue('personal-token'),
@@ -94,6 +95,27 @@ describe('AttachmentUploader', () => {
         '123',
         expect.objectContaining({ kind: 'doc' }),
       );
+    });
+
+    it('sends a video as a VK video, under its own cache key so an old doc reference is not reused', async () => {
+      const { uploader, prisma, vk } = setup();
+
+      await uploader.vkRefs([asset({ kind: 'video' })], vkGroup);
+
+      expect(vk.uploadAttachment).toHaveBeenCalledWith(
+        'personal-token',
+        '123',
+        expect.objectContaining({ kind: 'video' }),
+      );
+      expect(prisma.mediaPlatformUpload.findUnique).toHaveBeenCalledWith({
+        where: {
+          mediaAssetId_platform_scope: {
+            mediaAssetId: 'asset-1',
+            platform: 'vk',
+            scope: 'g1:video',
+          },
+        },
+      });
     });
 
     it('reuses a cached reference instead of uploading again', async () => {
@@ -212,6 +234,98 @@ describe('AttachmentUploader', () => {
       )[0] as { data: { scope: string; platform: string } };
       expect(data.data).toMatchObject({ platform: 'max' });
       expect(data.data.scope).not.toBe('g1');
+    });
+
+    it('кладёт видео в кэш до ожидания обработки, а ждёт уже после', async () => {
+      const { uploader, max, prisma } = setup();
+      max.uploadAttachment.mockResolvedValue({
+        type: 'video',
+        payload: { token: 'vid' },
+      });
+
+      await uploader.maxAttachments([asset({ kind: 'video' })]);
+
+      expect(max.waitForVideoReady).toHaveBeenCalledWith('vid');
+      expect(
+        prisma.mediaPlatformUpload.create.mock.invocationCallOrder[0],
+      ).toBeLessThan(max.waitForVideoReady.mock.invocationCallOrder[0]);
+    });
+
+    it('после таймаута обработки повтор берёт видео из кэша и не заливает заново', async () => {
+      // MAX перекодирует дольше срока ожидания: первая отправка падает, но
+      // загрузка уже в кэше — повтор ждёт то же (к тому времени готовое)
+      // видео, а не заливает файл снова и не упирается в тот же срок.
+      const { uploader, max, prisma } = setup();
+      max.uploadAttachment.mockResolvedValue({
+        type: 'video',
+        payload: { token: 'vid' },
+      });
+      max.waitForVideoReady.mockRejectedValueOnce(new Error('не обработал'));
+
+      await expect(
+        uploader.maxAttachments([asset({ kind: 'video' })]),
+      ).rejects.toThrow('не обработал');
+      expect(prisma.mediaPlatformUpload.create).toHaveBeenCalledTimes(1);
+
+      prisma.mediaPlatformUpload.findUnique.mockResolvedValue({
+        externalRef: JSON.stringify({
+          type: 'video',
+          payload: { token: 'vid' },
+        }),
+        createdAt: new Date(),
+      });
+      await uploader.maxAttachments([asset({ kind: 'video' })]);
+
+      expect(max.uploadAttachment).toHaveBeenCalledTimes(1);
+      expect(max.waitForVideoReady).toHaveBeenCalledTimes(2);
+    });
+
+    it('давно лежащее в кэше видео не опрашивает — MAX его уже обработал', async () => {
+      const { uploader, max, prisma } = setup();
+      prisma.mediaPlatformUpload.findUnique.mockResolvedValue({
+        externalRef: JSON.stringify({
+          type: 'video',
+          payload: { token: 'vid' },
+        }),
+        createdAt: new Date(Date.now() - 60 * 60 * 1000),
+      });
+
+      await uploader.maxAttachments([asset({ kind: 'video' })]);
+
+      expect(max.waitForVideoReady).not.toHaveBeenCalled();
+    });
+
+    it('видео кэширует под своим ключом — не подставляет файл, загруженный документом', async () => {
+      const { uploader, max, prisma } = setup();
+      max.uploadAttachment.mockResolvedValue({
+        type: 'video',
+        payload: { token: 'vid' },
+      });
+
+      await uploader.maxAttachments([asset({ kind: 'video' })]);
+
+      const { where } = (
+        prisma.mediaPlatformUpload.findUnique.mock.calls[0] as unknown[]
+      )[0] as { where: { mediaAssetId_platform_scope: { scope: string } } };
+      expect(where.mediaAssetId_platform_scope.scope).toBe('bot:video');
+    });
+
+    it('видео без токена в кэш не кладёт — ждать его готовности нечем', async () => {
+      const { uploader, max, prisma } = setup();
+      max.uploadAttachment.mockResolvedValue({ type: 'video', payload: {} });
+
+      await expect(
+        uploader.maxAttachments([asset({ kind: 'video' })]),
+      ).rejects.toThrow('токен');
+      expect(prisma.mediaPlatformUpload.create).not.toHaveBeenCalled();
+    });
+
+    it('картинку готовности не ждёт', async () => {
+      const { uploader, max } = setup();
+
+      await uploader.maxAttachments([asset()]);
+
+      expect(max.waitForVideoReady).not.toHaveBeenCalled();
     });
 
     it('returns the attachment object a send call can use', async () => {

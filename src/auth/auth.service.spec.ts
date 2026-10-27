@@ -55,6 +55,34 @@ describe('AuthService.login', () => {
     expect(sessions.issue).toHaveBeenCalledWith('admin-1');
   });
 
+  it('не пускает отключённого админа — тем же ответом, что и неверный пароль', async () => {
+    const { service, sessions, passwords } = setup({
+      ...ADMIN,
+      disabledAt: new Date(),
+    });
+
+    await expect(service.login('dev@local', 'пароль')).rejects.toMatchObject({
+      code: ErrorCode.UNAUTHORIZED,
+      message: 'Неверный email или пароль',
+    });
+    // Пароль всё равно проверен — по времени ответа отключённого не отличить.
+    expect(passwords.verify).toHaveBeenCalled();
+    expect(sessions.issue).not.toHaveBeenCalled();
+  });
+
+  it('гасит выданную сессию, если админа отключили за время проверки пароля', async () => {
+    const { service, prisma, sessions } = setup();
+    // Первое чтение — до argon2 (активен), второе — после выдачи (отключён).
+    prisma.adminUser.findUnique
+      .mockResolvedValueOnce(ADMIN)
+      .mockResolvedValueOnce({ disabledAt: new Date() });
+
+    await expect(service.login('dev@local', 'пароль')).rejects.toMatchObject({
+      code: ErrorCode.UNAUTHORIZED,
+    });
+    expect(sessions.revoke).toHaveBeenCalledWith('refresh-1');
+  });
+
   it('normalises the email before looking it up', async () => {
     const { service, prisma } = setup();
 
@@ -137,6 +165,18 @@ describe('AuthService.refresh', () => {
     });
   });
 
+  it('гасит только что выданную сессию, если админа успели отключить', async () => {
+    // Обновление прочитало старую сессию до гашения при отключении и
+    // вставило новую после него — без этой проверки она пережила бы
+    // отключение и снова заработала бы после «Включить».
+    const { service, sessions } = setup({ ...ADMIN, disabledAt: new Date() });
+
+    await expect(service.refresh('refresh-1')).rejects.toMatchObject({
+      code: ErrorCode.UNAUTHORIZED,
+    });
+    expect(sessions.revoke).toHaveBeenCalledWith('refresh-2');
+  });
+
   it('refuses an unknown refresh token', async () => {
     const { service, sessions } = setup();
     sessions.rotate.mockResolvedValue({ status: 'invalid' });
@@ -159,6 +199,18 @@ describe('AuthService.resolveAdmin', () => {
   it('rejects an admin who no longer exists', async () => {
     const { service, prisma } = setup();
     prisma.adminUser.findUnique.mockResolvedValue(null);
+
+    await expect(service.resolveAdmin('access-token')).rejects.toMatchObject({
+      code: ErrorCode.UNAUTHORIZED,
+    });
+  });
+
+  it('отвергает живой access-токен отключённого админа', async () => {
+    const { service, prisma } = setup();
+    prisma.adminUser.findUnique.mockResolvedValue({
+      ...ADMIN,
+      disabledAt: new Date(),
+    });
 
     await expect(service.resolveAdmin('access-token')).rejects.toMatchObject({
       code: ErrorCode.UNAUTHORIZED,

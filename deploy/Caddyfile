@@ -1,0 +1,7 @@
+# Сертификат Let's Encrypt Caddy получает сам — A-запись домена должна
+# смотреть на сервер до первого запуска.
+panel.couchreboot.site {
+	# В корне у приложения ничего нет — сразу в панель.
+	redir / /panel/login
+	reverse_proxy app:3000
+}

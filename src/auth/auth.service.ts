@@ -5,6 +5,7 @@ import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { PrismaService } from '../prisma/prisma.service';
 import { AdminUser } from '../generated/prisma/client';
+import { normalizeAdminEmail } from './admin-email';
 import { PasswordService } from './password.service';
 import { IssuedRefresh, SessionService } from './session.service';
 
@@ -30,7 +31,7 @@ export class AuthService {
 
   async login(email: string, password: string): Promise<LoggedIn> {
     const admin = await this.prisma.adminUser.findUnique({
-      where: { email: email.trim().toLowerCase() },
+      where: { email: normalizeAdminEmail(email) },
     });
 
     // Пароль проверяется даже для несуществующего адреса — по времени ответа
@@ -38,16 +39,41 @@ export class AuthService {
     const hash = admin?.passwordHash ?? DUMMY_HASH;
     const ok = await this.passwords.verify(hash, password);
 
-    if (!admin || !ok) {
-      // Одна и та же формулировка на оба случая: «нет такого админа» и
-      // «неверный пароль» — разные сообщения сдали бы список аккаунтов.
+    if (!admin || !ok || admin.disabledAt) {
+      // Одна и та же формулировка на все случаи: «нет такого админа»,
+      // «неверный пароль» и «отключён» — разные сообщения сдали бы список
+      // аккаунтов. Отключение проверяется после пароля, чтобы и время ответа
+      // не отличалось.
       throw new AppException(
         ErrorCode.UNAUTHORIZED,
         'Неверный email или пароль',
       );
     }
 
-    return this.issueFor(admin.id);
+    const issued = await this.issueFor(admin.id);
+    // Та же гонка, что у `refresh`: отключение, прошедшее за время проверки
+    // пароля (argon2 — десятки миллисекунд), уже погасило сессии, а эта
+    // вставлена после — она пережила бы отключение и ожила после «Включить».
+    await this.revokeIfDisabled(admin.id, issued.refresh.token);
+    return issued;
+  }
+
+  /** Гасит только что выданную сессию, если админа успели отключить. */
+  private async revokeIfDisabled(
+    adminUserId: string,
+    refreshToken: string,
+  ): Promise<void> {
+    const admin = await this.prisma.adminUser.findUnique({
+      where: { id: adminUserId },
+      select: { disabledAt: true },
+    });
+    if (!admin || admin.disabledAt) {
+      await this.sessions.revoke(refreshToken);
+      throw new AppException(
+        ErrorCode.UNAUTHORIZED,
+        'Сессия недействительна, войдите заново',
+      );
+    }
   }
 
   async refresh(token: string): Promise<LoggedIn> {
@@ -70,6 +96,12 @@ export class AuthService {
         'Сессия недействительна, войдите заново',
       );
     }
+    // Проверяется **после** выдачи новой сессии: отключение сначала ставит
+    // `disabledAt`, потом гасит сессии, и обновление, успевшее прочитать
+    // старую сессию до гашения, вставило бы новую уже после него — она
+    // пережила бы отключение (и снова заработала бы после «Включить»).
+    // Новая сессия вставлена позже `disabledAt`, значит здесь он уже виден.
+    await this.revokeIfDisabled(result.adminUserId, result.next.token);
     return {
       access: this.signAccess(result.adminUserId),
       refresh: result.next,
@@ -96,7 +128,10 @@ export class AuthService {
     const admin = payload.sub
       ? await this.prisma.adminUser.findUnique({ where: { id: payload.sub } })
       : null;
-    if (!admin) {
+    // Отключённый — как несуществующий: access-токен живёт ещё до 15 минут,
+    // и без этой проверки отключение действовало бы только после его
+    // истечения (сессии для обновления гасятся отдельно, при отключении).
+    if (!admin || admin.disabledAt) {
       throw new AppException(ErrorCode.UNAUTHORIZED, 'Сессия недействительна');
     }
     return admin;

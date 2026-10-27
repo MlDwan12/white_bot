@@ -118,3 +118,59 @@ export function announcementText(
 ): string {
   return winnersList ? `${postText}\n\nПобедители:\n${winnersList}` : postText;
 }
+
+/**
+ * Кнопка «Проверить подписку» в лс: `contest:check:<uuid>`. Отдельная от
+ * `contest:join:…` намеренно — ответ на колбэк заменяет сообщение, на котором
+ * сидит кнопка, и обработчик кнопки под анонсом перерисовал бы личное
+ * сообщение текстом анонса.
+ */
+export const CONTEST_CHECK_PAYLOAD = /^contest:check:([0-9a-fA-F-]{36})$/;
+
+export function contestCheckPayload(contestId: string): string {
+  return `contest:check:${contestId}`;
+}
+
+/** Длинное название канала растянуло бы кнопку на весь экран. */
+const CHANNEL_BUTTON_TITLE_MAX = 40;
+
+/**
+ * Сообщение человеку, не выполнившему условие подписки: по кнопке-ссылке на
+ * каждый канал и «Проверить подписку» последней строкой — после неё участие
+ * записывается без повторного перехода по ссылке из поста.
+ */
+export function subscriptionKeyboard(
+  missing: { title: string; link: string | null }[],
+  contestId: string,
+): ContestKeyboardButton[][] {
+  const rows: ContestKeyboardButton[][] = missing.flatMap((channel) =>
+    channel.link
+      ? [
+          [
+            {
+              type: 'link' as const,
+              text: `Подписаться: ${truncate(channel.title, CHANNEL_BUTTON_TITLE_MAX)}`,
+              url: channel.link,
+            },
+          ],
+        ]
+      : [],
+  );
+  rows.push([
+    {
+      type: 'callback',
+      text: 'Проверить подписку',
+      payload: contestCheckPayload(contestId),
+    },
+  ]);
+  return rows;
+}
+
+export function notSubscribedText(missing: { title: string }[]): string {
+  const list = missing.map((channel) => `• ${channel.title}`).join('\n');
+  return `Чтобы участвовать, подпишитесь:\n${list}\n\nЗатем нажмите «Проверить подписку».`;
+}
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}

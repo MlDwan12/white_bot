@@ -9,9 +9,10 @@ import {
   VK_TOKEN_PROVIDER,
 } from './token-provider/vk-token.provider';
 import { AuthModule } from '../auth/auth.module';
+import { MaxCoreModule } from '../max/max-core.module';
 
 @Module({
-  imports: [AuthModule, PrismaModule, CryptoModule, VkModule],
+  imports: [AuthModule, PrismaModule, CryptoModule, VkModule, MaxCoreModule],
   controllers: [GroupsController],
   providers: [
     GroupsService,

@@ -76,6 +76,25 @@ describe('PostReconcilerService', () => {
     expect(prisma.post.findMany).not.toHaveBeenCalled();
   });
 
+  it('не запускает вторую сверку, пока идёт первая — даже когда Redis-лок истёк', async () => {
+    // Розыгрыш с проверкой подписки держит проход до минуты, а лок живёт
+    // 30 с: следующий тик таймера иначе пошёл бы параллельно.
+    const { service, contests, redis } = setup();
+    let release!: () => void;
+    contests.drawDueContests.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve({ drawn: 0 }))),
+    );
+
+    const first = service.runSweep();
+    await new Promise((resolve) => setImmediate(resolve));
+    await service.runSweep();
+    release();
+    await first;
+
+    expect(redis.set).toHaveBeenCalledTimes(1);
+    expect(contests.drawDueContests).toHaveBeenCalledTimes(1);
+  });
+
   it('takes the lock with NX and an expiry, so a crash cannot wedge it', async () => {
     const { service, redis } = setup();
 

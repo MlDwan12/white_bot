@@ -5,6 +5,7 @@ import { hash } from '@node-rs/argon2';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
 import { PrismaClient } from '../generated/prisma/client';
+import { isValidAdminEmail, normalizeAdminEmail } from '../auth/admin-email';
 
 /**
  * Заводит первого администратора.
@@ -35,13 +36,11 @@ async function main(): Promise<void> {
   loadEnv();
 
   const [argEmail, argMaxUserId] = process.argv.slice(2);
-  const email = (argEmail ?? (await ask('Email администратора: ')))
-    .trim()
-    .toLowerCase();
+  const email = normalizeAdminEmail(
+    argEmail ?? (await ask('Email администратора: ')),
+  );
 
-  // Та же строгость, что у формы входа (`IsEmail`): иначе скрипт заведёт
-  // аккаунт, которым нельзя войти, — ровно это и случилось с `dev@local`.
-  if (!/^[^\s@]+@[^\s@.]+\.[^\s@]+$/.test(email)) {
+  if (!isValidAdminEmail(email)) {
     throw new Error(
       'Непохоже на email. Нужен домен с точкой, например admin@example.com',
     );

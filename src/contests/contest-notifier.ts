@@ -2,13 +2,10 @@ import { Injectable } from '@nestjs/common';
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import { MaxApiClient } from '../max/max-api.client';
-import { MaxAdminResolver } from '../max/max-admin.resolver';
-import { PostSender } from '../posts/post-sender';
+import { AdminNotifier } from '../max/admin-notifier';
 import { ContestParticipationService } from './contest-participation.service';
 import {
-  announcementText,
   contestDmUrl,
-  contestJoinPayload,
   contestKeyboard,
   winnerCongratulation,
 } from './contest-button';
@@ -26,7 +23,7 @@ export class ContestNotifier {
   constructor(
     private readonly prisma: PrismaService,
     private readonly max: MaxApiClient,
-    private readonly admins: MaxAdminResolver,
+    private readonly adminNotifier: AdminNotifier,
     private readonly participation: ContestParticipationService,
     private readonly logger: PinoLogger,
   ) {
@@ -52,64 +49,38 @@ export class ContestNotifier {
    * результаты, а не зарегистрирует опоздавшего.
    */
   private async swapButtons(contestId: string): Promise<void> {
-    const contest = await this.prisma.contest.findUnique({
-      where: { id: contestId },
-      include: {
-        post: {
-          include: {
-            deliveries: {
-              where: { status: 'sent', group: { platform: 'max' } },
-              include: { group: true },
-            },
-          },
-        },
-      },
-    });
-
-    if (!contest?.post) {
+    // Тот же вид, что собирают все остальные перерисовки (итоги и «Узнать
+    // результаты» — по статусу конкурса), а не своя копия.
+    const view = await this.participation.announcementRefresh(contestId);
+    if (!view) {
       return;
     }
-
-    // Победители дописываются в сам пост: лс от бота доходит не всем, а пост
-    // видят все подписчики. Временная мера до мини-аппа.
-    const winners = contest.publishResultsInPost
-      ? await this.participation.winnersList(contestId)
-      : null;
-    const text = announcementText(
-      PostSender.resolveText(contest.post, 'max'),
-      winners,
+    const buttons = contestKeyboard(
+      { text: view.buttonText, payload: view.payload },
+      // Ссылка на бота остаётся и после розыгрыша: победитель, который
+      // открыл диалог позже, получает поздравление сразу при старте.
+      contestDmUrl(this.max.botUsername(), contestId),
     );
 
-    for (const delivery of contest.post.deliveries) {
-      if (!delivery.externalMessageId) continue;
+    for (const messageId of view.messageIds) {
       try {
         // Правка заменяет сообщение целиком, поэтому медиа снимается со
         // старой версии и передаётся заново — иначе картинка анонса
         // исчезнет у всех.
-        const current = await this.max.getMessageBody(
-          delivery.externalMessageId,
-        );
+        const current = await this.max.getMessageBody(messageId);
         if (current.unsupported.length > 0) {
           this.logger.warn(
             { contestId, dropped: current.unsupported },
             'Вложения анонса, которые нечем пересобрать, потеряются при правке',
           );
         }
-        await this.max.editMessage(delivery.externalMessageId, text, {
+        await this.max.editMessage(messageId, view.text, {
           attachments: current.attachments,
-          // Ссылка на бота остаётся и после розыгрыша: победитель, который
-          // открыл диалог позже, получает поздравление сразу при старте.
-          buttons: contestKeyboard(
-            {
-              text: contest.resultsButtonLabel,
-              payload: contestJoinPayload(contest.id),
-            },
-            contestDmUrl(this.max.botUsername(), contest.id),
-          ),
+          buttons,
         });
       } catch (err: unknown) {
         this.logger.warn(
-          { err, contestId, deliveryId: delivery.id },
+          { err, contestId, messageId },
           'Не удалось обновить анонс конкурса — останется кнопка «Участвовать», результаты отдаст обработчик нажатия',
         );
       }
@@ -158,17 +129,19 @@ export class ContestNotifier {
 
       // VK-конкурсы отложены: личку от сообщества может получить только тот,
       // кто сам в него писал, и бот-лонгполла у нас пока нет.
-      // Только числовой id: у участника, добавленного вручную по @нику,
-      // в этом поле лежит ник, а не id, и `Number()` дал бы NaN — лс ушло бы
-      // в никуда с невнятной ошибкой платформы.
+      // Только сам нажавший кнопку: у участника, добавленного вручную по
+      // @нику, в этом поле лежит ник, а не id. Даже цифровой ник
+      // (`Иван @100500`) — не id: `Number()` дал бы id постороннего человека,
+      // и поздравление ушло бы ему.
       if (
+        winner.source !== 'button' ||
         winner.platform !== 'max' ||
         !/^\d+$/.test(winner.externalUserId ?? '')
       ) {
         await this.markNotify(
           prize.id,
           'manual_required',
-          'Нет числового MAX-id участника — уведомить можно только вручную',
+          'Участник добавлен вручную или без MAX-id — уведомить можно только вручную',
         );
         continue;
       }
@@ -215,15 +188,6 @@ export class ContestNotifier {
     contestId: string,
     reason: 'draw' | 'override',
   ): Promise<void> {
-    const admins = await this.admins.listNotifiableAdmins();
-    if (admins.length === 0) {
-      this.logger.warn(
-        { contestId },
-        'Нет администраторов с привязанным maxUserId — отчёт о розыгрыше не отправлен',
-      );
-      return;
-    }
-
     const contest = await this.prisma.contest.findUnique({
       where: { id: contestId },
       select: {
@@ -250,15 +214,8 @@ export class ContestNotifier {
         : `Конкурс «${contest.title}» завершён.`;
     const text = `${headline}${where}\n\n${await this.participation.winnersList(contestId)}`;
 
-    for (const admin of admins) {
-      try {
-        await this.max.sendMessageToUser(Number(admin.maxUserId), text);
-      } catch (err: unknown) {
-        this.logger.warn(
-          { err, contestId, adminId: admin.id },
-          'Не удалось отправить админу отчёт о розыгрыше',
-        );
-      }
-    }
+    // Общая рассылка админам: та же обработка «нет админов», «MAX не
+    // настроен» и сбоев по одному — без своей копии этого цикла.
+    await this.adminNotifier.notifyAll(text);
   }
 }

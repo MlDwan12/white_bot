@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { headerSafeFileName } from './header-safe-filename';
 import sharp from 'sharp';
 import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
@@ -215,7 +216,12 @@ export class MediaService {
   ): Promise<T> {
     return this.storage.withNamedPath(
       this.relativePathForUpload(asset),
-      asset.filename,
+      // Видео уходит частями, и имя попадает в HTTP-заголовки — там кириллица
+      // роняет загрузку (см. `headerSafeFileName`). Имя видео получатель и
+      // так не видит — оно играет в плеере; у документа имя остаётся как есть.
+      asset.kind === 'video'
+        ? headerSafeFileName(asset.filename)
+        : asset.filename,
       use,
     );
   }

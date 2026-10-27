@@ -1,3 +1,4 @@
+import { vkUploadScope } from './attachment-uploader';
 import { Injectable } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -523,20 +524,7 @@ export class PostsService {
     // are already on VK's side and need no token at all, which is the whole
     // point of the cache.
     const assetIds = [...new Set(mediaAssetIds)];
-    const cached = await this.prisma.mediaPlatformUpload.findMany({
-      where: {
-        platform: 'vk',
-        mediaAssetId: { in: assetIds },
-        scope: { in: vkGroupIds },
-      },
-      select: { scope: true, mediaAssetId: true },
-    });
-    const cachedPerGroup = new Map<string, Set<string>>();
-    for (const row of cached) {
-      const forGroup = cachedPerGroup.get(row.scope) ?? new Set<string>();
-      forGroup.add(row.mediaAssetId);
-      cachedPerGroup.set(row.scope, forGroup);
-    }
+    const cachedPerGroup = await this.cachedVkUploads(assetIds, vkGroupIds);
     return vkGroupIds.filter(
       (groupId) => cachedPerGroup.get(groupId)?.size === assetIds.length,
     );
@@ -555,14 +543,57 @@ export class PostsService {
     // is resumed a day later with everything already uploaded and the
     // 24-hour token long gone. Counting cached references keeps that working
     // instead of refusing a campaign that has nothing left to upload.
-    const cached = await this.prisma.mediaPlatformUpload.count({
+    const assetIds = [...new Set(mediaAssetIds)];
+    const cachedPerGroup = await this.cachedVkUploads(assetIds, vkGroupIds);
+    return vkGroupIds.some(
+      (groupId) => (cachedPerGroup.get(groupId)?.size ?? 0) < assetIds.length,
+    );
+  }
+
+  /**
+   * Какие файлы уже лежат в каждом VK-сообществе — по тому же ключу кэша,
+   * что ищет загрузчик (`vkUploadScope`): видео с 23.09 кэшируется под
+   * `<groupId>:video`, и проверка по голому `groupId` ошибалась бы в обе
+   * стороны — требовала токен для уже загруженного видео и пропускала без
+   * токена видео, у которого под старым ключом лежит прежний документ.
+   */
+  private async cachedVkUploads(
+    assetIds: string[],
+    vkGroupIds: string[],
+  ): Promise<Map<string, Set<string>>> {
+    const assets = await this.prisma.mediaAsset.findMany({
+      where: { id: { in: assetIds } },
+      select: { id: true, kind: true },
+    });
+    const wanted = new Map<string, { groupId: string; assetId: string }>();
+    for (const groupId of vkGroupIds) {
+      for (const asset of assets) {
+        wanted.set(`${asset.id}|${vkUploadScope(groupId, asset.kind)}`, {
+          groupId,
+          assetId: asset.id,
+        });
+      }
+    }
+    const scopes = [
+      ...new Set([...wanted.keys()].map((key) => key.split('|')[1])),
+    ];
+    const rows = await this.prisma.mediaPlatformUpload.findMany({
       where: {
         platform: 'vk',
-        mediaAssetId: { in: mediaAssetIds },
-        scope: { in: vkGroupIds },
+        mediaAssetId: { in: assetIds },
+        scope: { in: scopes },
       },
+      select: { scope: true, mediaAssetId: true },
     });
-    return cached < mediaAssetIds.length * vkGroupIds.length;
+    const perGroup = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const pair = wanted.get(`${row.mediaAssetId}|${row.scope}`);
+      if (!pair) continue;
+      const forGroup = perGroup.get(pair.groupId) ?? new Set<string>();
+      forGroup.add(pair.assetId);
+      perGroup.set(pair.groupId, forGroup);
+    }
+    return perGroup;
   }
 
   /**
@@ -723,7 +754,9 @@ export class PostsService {
    */
   async listCampaigns(limit = 50): Promise<CampaignSummary[]> {
     const posts = await this.prisma.post.findMany({
-      where: { recurrenceRule: null },
+      // Посты-носители конкурсов здесь не показываются: текст и картинка
+      // конкурса правятся на его карточке.
+      where: { recurrenceRule: null, contest: { is: null } },
       orderBy: { createdAt: 'desc' },
       take: limit,
     });

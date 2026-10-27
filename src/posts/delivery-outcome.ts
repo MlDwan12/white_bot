@@ -98,6 +98,16 @@ function classifyMaxError(err: MaxApiError): DeliveryOutcome {
   if (err.status === 429) {
     return { kind: 'retryable', message: err.message };
   }
+  // Вложение ещё обрабатывается: MAX отказал явно, сообщение не создано —
+  // повтор дубля не даст. Обычно до этого не доходит (видео ждём после
+  // загрузки, `waitForVideoReady`), это страховка на случай, когда признак
+  // готовности соврал: иначе доставка упала бы окончательно из-за секунд.
+  if (
+    err.status === 400 &&
+    /attachment[.\w]*not\.(ready|processed)/.test(`${err.code} ${err.message}`)
+  ) {
+    return { kind: 'retryable', message: err.message };
+  }
   if (err.tokenInvalid) {
     // One bot token serves every MAX chat, so an invalid token is not this
     // group's fault — flagging the group would mislabel a global problem.

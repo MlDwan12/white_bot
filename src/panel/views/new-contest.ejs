@@ -1,11 +1,9 @@
 <h1 class="page-title mb-3">Новый конкурс</h1>
 
 <%
-   /* Одна форма: конкурс и его анонс-пост создаются вместе, одним
-      сабмитом — раньше это были два разных экрана (создать пост, вернуться
-      сюда, выбрать его из списка), и найти нужный пост в списке было легко
-      перепутать. Группы не выбраны — поста не будет вовсе (конкурс без
-      анонса, участники только вручную — старое поведение, оно осталось).
+   /* Конкурс — самостоятельная сущность со своим текстом, картинкой и
+      каналами; в «Постах» его нет. Без каналов не создаётся: конкурс
+      всегда публикуется.
 
       Порядок в документе важен: неявную отправку по Enter выполняет первая
       кнопка отправки, и это должна быть «Создать», а не «Загрузить» —
@@ -29,18 +27,12 @@
         </div>
 
         <div class="mb-3">
-          <label class="form-label" for="description">Описание</label>
+          <label class="form-label" for="description">Текст конкурса</label>
           <textarea class="form-control" id="description" name="description" rows="4"
                     required><%= draft.description %></textarea>
-          <%
-             /* Раньше это было панельное поле, а текст анонса набирался
-                отдельно на карточке поста — два места для одного и того же
-                смысла. Теперь описание и есть текст анонса: подписчики
-                видят ровно то, что здесь набрано. */
-          %>
           <small class="form-hint">
-            Это и есть текст анонс-поста — то, что увидят подписчики (если
-            ниже отмечен хотя бы один канал).
+            То, что увидят подписчики под кнопкой участия. Правится потом на
+            карточке конкурса — и после публикации тоже.
           </small>
         </div>
 
@@ -88,7 +80,8 @@
             <input class="form-control" id="publishAt" type="datetime-local"
                    name="publishAt" value="<%= draft.publishAt %>" />
             <small class="form-hint">
-              Пусто — открыть приём и отправить анонс только вручную.
+              Пусто — опубликовать кнопкой «Опубликовать» на карточке
+              конкурса. Публикация открывает приём участников.
             </small>
           </div>
           <div class="col-sm-4">
@@ -104,10 +97,10 @@
 
         <div class="mb-3">
           <label class="form-label">Каналы публикации</label>
-          <% if (groups.length === 0) { %>
-            <div class="text-secondary">Нет активных групп.</div>
+          <% if (maxGroups.length === 0) { %>
+            <div class="text-secondary">Нет подключённых MAX-каналов — конкурс публиковать некуда.</div>
           <% } else { %>
-            <% groups.forEach(function (g) { %>
+            <% maxGroups.forEach(function (g) { %>
               <label class="form-check">
                 <input class="form-check-input" type="checkbox" name="groupIds"
                        value="<%= g.id %>"
@@ -120,10 +113,11 @@
             <% }); %>
           <% } %>
           <small class="form-hint">
-            Ничего не отмечено — конкурс без анонса, участники вносятся
-            только вручную.
+            Хотя бы один. Только MAX: у постов на стене VK кнопок не бывает.
           </small>
         </div>
+
+        <%- include('required-groups', { maxGroups: maxGroups, selected: draft.requiredGroupIds, inactiveGroups: [] }) %>
 
         <label class="form-check">
           <input class="form-check-input" type="checkbox" name="notifyWinners"
@@ -138,11 +132,10 @@
         <label class="form-check">
           <input class="form-check-input" type="checkbox" name="publishResultsInPost"
                  <%= draft.publishResultsInPost ? 'checked' : '' %> />
-          <span class="form-check-label">Дописать победителей в текст анонса</span>
+          <span class="form-check-label">Дописать победителей в текст конкурса</span>
         </label>
         <div class="form-hint">
-          Единственный канал, который видят все подписчики. Без выбранного
-          канала выше ни на что не влияет.
+          Единственный канал, который видят все подписчики.
         </div>
       </div>
       <div class="card-footer d-flex gap-2">
@@ -167,7 +160,7 @@
       <div class="card-footer">
         <%
            /* `formnovalidate`: у описания стоит `required`, и без этого
-              загрузить картинку до того, как оно набрано, было бы нельзя. */
+              загрузить картинку до того, как текст набран, было бы нельзя. */
         %>
         <button class="btn w-100" type="submit" formaction="/panel/contests/media"
                 formenctype="multipart/form-data" formnovalidate>Загрузить</button>

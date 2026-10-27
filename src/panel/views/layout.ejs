@@ -123,6 +123,11 @@
                   <a class="nav-link" href="/panel/groups">Группы</a>
                 </li>
               <% } %>
+              <% if (can('admins_manage')) { %>
+                <li class="nav-item<%= active === 'admins' ? ' active' : '' %>">
+                  <a class="nav-link" href="/panel/admins">Админы</a>
+                </li>
+              <% } %>
             </ul>
             <div class="ms-auto d-flex align-items-center gap-2">
               <span class="text-secondary small"><%= admin.email %></span>

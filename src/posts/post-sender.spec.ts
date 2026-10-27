@@ -111,7 +111,11 @@ describe('PostSender', () => {
 
 describe('PostSender: кнопки конкурса в MAX', () => {
   const CONTEST_ID = '11111111-1111-4111-8111-111111111111';
-  const button = { contestId: CONTEST_ID, label: 'Участвовать (2)' };
+  const button = {
+    contestId: CONTEST_ID,
+    label: 'Участвовать (2)',
+    text: 'Текст конкурса',
+  };
   const maxGroup = () => group({ platform: 'max', externalId: '-100' });
 
   type Row = { type: string; text: string; url?: string; payload?: string }[];
@@ -158,6 +162,21 @@ describe('PostSender: кнопки конкурса в MAX', () => {
       buttons: Row[];
     };
     expect(options.buttons[0].map((b) => b.type)).toEqual(['callback']);
+  });
+
+  it('шлёт и правит текстом из вида конкурса, а не текстом поста', async () => {
+    // После розыгрыша в виде конкурса итоги — текст поста их стёр бы.
+    const { sender, max } = setup();
+
+    await sender.send(post(), maxGroup(), [], button);
+    await sender.edit(post(), maxGroup(), 'mid.1', [], button);
+
+    expect((max.sendMessageToChat.mock.calls as unknown[][])[0][1]).toBe(
+      'Текст конкурса',
+    );
+    expect((max.editMessage.mock.calls as unknown[][])[0][1]).toBe(
+      'Текст конкурса',
+    );
   });
 
   it('без конкурса клавиатуры нет вовсе', async () => {

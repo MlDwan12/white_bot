@@ -39,7 +39,13 @@ export function statusColor(status: PostStatus): string {
   return COLORS[status] ?? 'secondary';
 }
 
-/** Дата в привычном виде и в часовом поясе сервера. */
+/**
+ * Время в поясе проекта, а не процесса. В контейнере на сервере пояс
+ * процесса — UTC, и панель показывала «08:19» при московских 11:19, хотя
+ * поля ввода дат читаются в `DEFAULT_TIMEZONE` (прод, 23.09.2026; на машине
+ * разработки пояс московский, и расхождения не было видно). Запасное
+ * значение — то же, что у проверки конфига.
+ */
 export function formatDate(value: Date): string {
   return new Intl.DateTimeFormat('ru-RU', {
     day: '2-digit',
@@ -47,6 +53,7 @@ export function formatDate(value: Date): string {
     year: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: process.env.DEFAULT_TIMEZONE || 'Europe/Moscow',
   }).format(value);
 }
 

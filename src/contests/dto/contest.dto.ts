@@ -17,10 +17,13 @@ export class CreateContestDto {
   @IsNotEmpty()
   title: string;
 
-  /** Анонс-пост, в доставки которого вшивается кнопка участия. */
-  @IsOptional()
+  /**
+   * Пост-носитель публикации конкурса (черновик с целевыми MAX-каналами), в
+   * доставки которого вшивается кнопка участия. Обязателен: конкурс без
+   * публикации не создаётся.
+   */
   @IsUUID('4')
-  postId?: string;
+  postId: string;
 
   @IsOptional()
   @IsString()
@@ -40,6 +43,12 @@ export class CreateContestDto {
   @IsOptional()
   @IsBoolean()
   publishResultsInPost?: boolean;
+
+  /** Условие участия: подписка на эти MAX-каналы (подключённые группы). */
+  @IsOptional()
+  @IsArray()
+  @IsUUID('4', { each: true })
+  requiredGroupIds?: string[];
 }
 
 export class PrizeDto {

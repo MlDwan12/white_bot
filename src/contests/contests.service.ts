@@ -7,6 +7,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import {
   Contest,
   ContestStatus,
+  Group,
   Platform,
   Prisma,
 } from '../generated/prisma/client';
@@ -18,12 +19,31 @@ import {
   type DrawAssignment,
 } from './contest-draw';
 import { buildDedupKey, parseParticipantLines } from './contest-participants';
+import { ContestSubscriptions } from './contest-subscriptions';
+
+/**
+ * Розыгрыш с условием подписки ходит в MAX изнутри транзакции: по запросу на
+ * канал на каждый проход. Запас с большим избытком над обычными сотнями
+ * миллисекунд, но конечный — зависший MAX не должен держать соединение с
+ * базой бесконечно.
+ */
+const DRAW_TX_TIMEOUT_MS = 60_000;
+
+/**
+ * Удаление ждёт строку конкурса, которую может держать идущий розыгрыш
+ * (до `DRAW_TX_TIMEOUT_MS`), а потом за миллисекунды стирает строки.
+ */
+const DELETE_TX_TIMEOUT_MS = DRAW_TX_TIMEOUT_MS + 30_000;
 
 export interface CreateContestInput {
   title: string;
   description?: string;
-  /** Анонс-пост с кнопкой участия. Без него остаётся только ручной список. */
-  postId?: string;
+  /**
+   * Пост-носитель публикации конкурса: его текст и вложения — текст и
+   * картинка конкурса, доставки — каналы. Обязателен: конкурс всегда
+   * публикуется.
+   */
+  postId: string;
   joinButtonLabel?: string;
   resultsButtonLabel?: string;
   notifyWinners?: boolean;
@@ -39,6 +59,8 @@ export interface CreateContestInput {
    * действиями там, где админу нужно одно.
    */
   placesCount?: number;
+  /** Условие участия: подписка на эти MAX-каналы. */
+  requiredGroupIds?: string[];
 }
 
 export interface ContestSummary {
@@ -54,6 +76,13 @@ export interface ContestSummary {
   /** Анонс-пост, если он есть: по нему список показывает, к чему конкурс. */
   postId: string | null;
   postText: string | null;
+}
+
+/** Что снять из каналов после удаления конкурса из базы. */
+export interface DeletedContestMessages {
+  messages: { group: Group; externalMessageId: string }[];
+  /** Каналы с доставкой «неизвестно»: могло опубликоваться, снять нечем. */
+  uncertain: string[];
 }
 
 export interface PrizeInput {
@@ -72,6 +101,7 @@ export class ContestsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly notifier: ContestNotifier,
+    private readonly subscriptions: ContestSubscriptions,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(ContestsService.name);
@@ -81,21 +111,24 @@ export class ContestsService {
     input: CreateContestInput,
     now: Date = new Date(),
   ): Promise<Contest> {
-    if (input.postId) {
-      const post = await this.prisma.post.findUnique({
-        where: { id: input.postId },
-        select: { id: true, contest: { select: { id: true } } },
-      });
-      if (!post) {
-        throw new AppException(ErrorCode.NOT_FOUND, 'Анонс-пост не найден');
-      }
-      if (post.contest) {
-        throw new AppException(
-          ErrorCode.VALIDATION_ERROR,
-          'У этого поста уже есть конкурс',
-        );
-      }
+    const post = await this.prisma.post.findUnique({
+      where: { id: input.postId },
+      select: {
+        id: true,
+        contest: { select: { id: true } },
+        deliveries: { select: { groupId: true } },
+      },
+    });
+    if (!post) {
+      throw new AppException(ErrorCode.NOT_FOUND, 'Пост публикации не найден');
     }
+    if (post.contest) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'У этого поста уже есть конкурс',
+      );
+    }
+    await this.assertPublishChannels(post.deliveries.map((d) => d.groupId));
     if (input.startsAt && input.endsAt && input.startsAt >= input.endsAt) {
       throw new AppException(
         ErrorCode.VALIDATION_ERROR,
@@ -130,6 +163,9 @@ export class ContestsService {
         'Для авто-розыгрыша по дате нужно хотя бы одно призовое место — укажите «Мест»',
       );
     }
+    const requiredGroupIds = await this.assertRequirableGroups(
+      input.requiredGroupIds,
+    );
 
     // Id генерируется здесь, а не Postgres'ом, чтобы места можно было
     // создать в одной транзакции с самим конкурсом: раньше это были два
@@ -143,7 +179,7 @@ export class ContestsService {
           id: contestId,
           title: input.title,
           description: input.description ?? '',
-          postId: input.postId ?? null,
+          postId: input.postId,
           joinButtonLabel: input.joinButtonLabel,
           resultsButtonLabel: input.resultsButtonLabel,
           notifyWinners: input.notifyWinners,
@@ -164,9 +200,84 @@ export class ContestsService {
         }),
       );
     }
+    if (requiredGroupIds.length > 0) {
+      queries.push(
+        this.prisma.contestRequiredGroup.createMany({
+          data: requiredGroupIds.map((groupId) => ({ contestId, groupId })),
+        }),
+      );
+    }
     const [contest] = (await this.prisma.$transaction(queries)) as [Contest];
 
     return contest;
+  }
+
+  /**
+   * Каналы публикации конкурса: хотя бы один, и все — активные MAX-группы.
+   * Кнопка участия есть только у сообщения MAX; пост на стене VK вышел бы
+   * без неё, и участвовать из него было бы нельзя. Публичная — панель
+   * зовёт её до создания поста-носителя, чтобы отказ не оставлял сироту.
+   */
+  async assertPublishChannels(
+    groupIds: string[],
+    /** Каналы, уже стоящие в черновике (VK у старых конкурсов) — не отказ. */
+    alreadyTargeted: string[] = [],
+  ): Promise<void> {
+    const ids = [...new Set(groupIds)];
+    if (ids.length === 0) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Выберите хотя бы один канал — конкурс всегда публикуется',
+      );
+    }
+    // Тот же приём, что у `assertRequirableGroups`: правка текста черновика
+    // конкурса, созданного до правила «только MAX», не должна отказывать из-за
+    // его же VK-канала. Неактивные группы отсекает `editDraft` (рассылка в
+    // них запрещена) — форма предупреждает, что они уйдут.
+    const toCheck = ids.filter((id) => !alreadyTargeted.includes(id));
+    if (
+      toCheck.length > 0 &&
+      (await this.countActiveMaxGroups(toCheck)) !== toCheck.length
+    ) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Публиковать конкурс можно только в подключённые MAX-каналы',
+      );
+    }
+  }
+
+  private countActiveMaxGroups(ids: string[]): Promise<number> {
+    return this.prisma.group.count({
+      where: { id: { in: ids }, platform: 'max', status: 'active' },
+    });
+  }
+
+  /**
+   * Условием подписки может быть только активная MAX-группа: подписку
+   * проверяет MAX-бот, и только там, где он сам состоит. Публичная — панель
+   * зовёт её до создания анонс-поста, чтобы отказ не оставлял
+   * пост-сироту. Возвращает список без повторов.
+   */
+  async assertRequirableGroups(
+    groupIds: string[] = [],
+    alreadyRequired: string[] = [],
+  ): Promise<string[]> {
+    const ids = [...new Set(groupIds)];
+    // Уже стоящее условие не снимается только потому, что группа сейчас
+    // неактивна (бота временно убрали): при правке конкурса она приходит из
+    // формы как была, и отказ означал бы «нельзя сохранить ничего». Новое
+    // условие на неактивную группу — по-прежнему нельзя.
+    const toCheck = ids.filter((id) => !alreadyRequired.includes(id));
+    if (toCheck.length === 0) {
+      return ids;
+    }
+    if ((await this.countActiveMaxGroups(toCheck)) !== toCheck.length) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Условием подписки может быть только подключённый MAX-канал',
+      );
+    }
+    return ids;
   }
 
   /**
@@ -198,6 +309,8 @@ export class ContestsService {
       publishResultsInPost?: boolean;
       startsAt?: Date;
       endsAt?: Date;
+      /** Не передано — условия не трогаем; пустой список — снять все. */
+      requiredGroupIds?: string[];
     },
     now: Date = new Date(),
   ): Promise<Contest> {
@@ -233,20 +346,143 @@ export class ContestsService {
       );
     }
     await this.assertPrizesForAutoDraw(contestId, input.endsAt);
+    const requiredGroupIds =
+      input.requiredGroupIds === undefined
+        ? undefined
+        : await this.assertRequirableGroups(
+            input.requiredGroupIds,
+            (
+              await this.prisma.contestRequiredGroup.findMany({
+                where: { contestId },
+                select: { groupId: true },
+              })
+            ).map((r) => r.groupId),
+          );
 
-    return this.prisma.contest.update({
-      where: { id: contestId },
-      data: {
-        title: input.title,
-        description: input.description ?? '',
-        joinButtonLabel: input.joinButtonLabel,
-        resultsButtonLabel: input.resultsButtonLabel,
-        notifyWinners: input.notifyWinners,
-        publishResultsInPost: input.publishResultsInPost,
-        startsAt: input.startsAt ?? null,
-        endsAt: input.endsAt ?? null,
-      },
+    // Условия меняются и у открытого конкурса. Уже записанных участников это
+    // не выкидывает: новое условие проверится у выпавших победителей при
+    // розыгрыше, как и у всех остальных.
+    return this.prisma.$transaction(async (tx) => {
+      // Условием, а не по голому id: проверка статуса выше — до транзакции,
+      // а розыгрыш держит строку до минуты (проверка подписки). Сохранение,
+      // дождавшееся его коммита, иначе переписало бы условия уже
+      // разыгранного конкурса.
+      const changed = await tx.contest.updateMany({
+        where: { id: contestId, status: { not: 'drawn' } },
+        data: {
+          title: input.title,
+          // Не передано — не трогаем: панель его больше не правит (текст
+          // конкурса живёт в посте публикации), а REST по-прежнему может.
+          ...(input.description !== undefined
+            ? { description: input.description }
+            : {}),
+          joinButtonLabel: input.joinButtonLabel,
+          resultsButtonLabel: input.resultsButtonLabel,
+          notifyWinners: input.notifyWinners,
+          publishResultsInPost: input.publishResultsInPost,
+          startsAt: input.startsAt ?? null,
+          endsAt: input.endsAt ?? null,
+        },
+      });
+      if (changed.count === 0) {
+        throw new AppException(
+          ErrorCode.CONTEST_ALREADY_DRAWN,
+          'Розыгрыш уже проведён — условия конкурса больше не редактируются',
+        );
+      }
+      if (requiredGroupIds !== undefined) {
+        await tx.contestRequiredGroup.deleteMany({ where: { contestId } });
+        await tx.contestRequiredGroup.createMany({
+          data: requiredGroupIds.map((groupId) => ({ contestId, groupId })),
+        });
+      }
+      return tx.contest.findUniqueOrThrow({ where: { id: contestId } });
     });
+  }
+
+  /**
+   * Удаляет конкурс целиком — с участниками, местами, условиями и постом
+   * публикации. Только до розыгрыша: журнал розыгрыша — доказательство, что
+   * итог не подкручен, и стирать его нельзя.
+   *
+   * Только база, без MAX: под блокировкой строки конкурса (розыгрыш и
+   * авто-открытие её ждут) проверяется статус, запоминается, где
+   * опубликованы сообщения, и стираются строки. Сообщения снимает
+   * вызывающий **после** коммита — по возвращённому списку. Наоборот
+   * нельзя: откат транзакции после снятия оставил бы открытый конкурс без
+   * анонсов. Неснятое после удаления сообщение — меньшее зло: его кнопка
+   * отвечает «конкурс не найден», а панель называет канал.
+   */
+  async deleteContest(contestId: string): Promise<DeletedContestMessages> {
+    return this.prisma.$transaction(
+      async (tx) => {
+        const [row] = await tx.$queryRaw<
+          { status: string; postId: string | null }[]
+        >`SELECT status, "postId" FROM "Contest" WHERE id = ${contestId} FOR UPDATE`;
+        if (!row) {
+          throw new AppException(ErrorCode.NOT_FOUND, 'Конкурс не найден');
+        }
+        if (row.status === 'drawn') {
+          throw new AppException(
+            ErrorCode.CONTEST_ALREADY_DRAWN,
+            'Розыгрыш уже проведён — завершённый конкурс не удаляется',
+          );
+        }
+        const result: DeletedContestMessages = { messages: [], uncertain: [] };
+        const postId = row.postId;
+        if (postId) {
+          // Отправка в полёте опубликовала бы сообщение уже после удаления,
+          // с кнопкой на несуществующий конкурс.
+          const [post] = await tx.$queryRaw<{ status: string }[]>`
+            SELECT status FROM "Post" WHERE id = ${postId} FOR UPDATE`;
+          if (post?.status === 'scheduled' || post?.status === 'sending') {
+            throw new AppException(
+              ErrorCode.VALIDATION_ERROR,
+              'Публикация как раз отправляется — подождите минуту и повторите',
+            );
+          }
+          const deliveries = await tx.postDelivery.findMany({
+            where: { postId },
+            include: { group: true },
+          });
+          for (const d of deliveries) {
+            if (d.status === 'sent' && !d.deletedAt && d.externalMessageId) {
+              result.messages.push({
+                group: d.group,
+                externalMessageId: d.externalMessageId,
+              });
+            } else if (d.status === 'unknown') {
+              // Могло опубликоваться, но id сообщения у нас нет — снять нечем.
+              result.uncertain.push(d.group.title);
+            }
+          }
+        }
+
+        // Внешние ключи без каскада: сначала всё, что ссылается на конкурс,
+        // места — раньше участников (место ссылается на победителя).
+        await tx.contestPrize.deleteMany({ where: { contestId } });
+        await tx.contestParticipant.deleteMany({ where: { contestId } });
+        await tx.contestRequiredGroup.deleteMany({ where: { contestId } });
+        await tx.contestDrawLog.deleteMany({ where: { contestId } });
+        await tx.contest.delete({ where: { id: contestId } });
+
+        if (postId) {
+          await tx.postAttachment.deleteMany({ where: { postId } });
+          await tx.postDelivery.deleteMany({ where: { postId } });
+          await tx.directMessageDelivery.deleteMany({ where: { postId } });
+          // Копии поста («повторить») остаются, теряя ссылку на оригинал.
+          await tx.post.updateMany({
+            where: { clonedFromPostId: postId },
+            data: { clonedFromPostId: null },
+          });
+          await tx.post.delete({ where: { id: postId } });
+        }
+        return result;
+      },
+      // Блокировку может держать идущий розыгрыш — до DRAW_TX_TIMEOUT_MS;
+      // ожидание блокировки идёт в счёт `timeout`, стандартных 5 с мало.
+      { timeout: DELETE_TX_TIMEOUT_MS },
+    );
   }
 
   /**
@@ -503,6 +739,16 @@ export class ContestsService {
   /**
    * Один розыгрыш на все места разом. Сид пишется в журнал, поэтому результат
    * можно пересчитать и доказать, что он не подкручен.
+   *
+   * Если у конкурса есть условие подписки, у каждого выпавшего победителя
+   * оно перепроверяется: отписавшийся после нажатия «Участвовать» выбывает, и
+   * розыгрыш повторяется **тем же сидом** на пуле без выбывших. Чистая
+   * `drawWinners` при этом не меняется, а в журнал пишется список выбывших —
+   * пересчёт по-прежнему сводится к `drawWinners(пул − выбывшие, сид)`.
+   * Проверяются только выпавшие, а не весь пул: запросов к MAX столько,
+   * сколько мест (плюс по одному на каждого выбывшего), а не сколько
+   * участников. Назначенные вручную места и участники без MAX-id (ручные
+   * строки) не проверяются — их выбор сделал админ.
    */
   async draw(contestId: string, actorId?: string): Promise<DrawAssignment[]> {
     const contest = await this.requireContest(contestId);
@@ -514,99 +760,168 @@ export class ContestsService {
     }
 
     const seed = generateSeed();
+    const channels = await this.subscriptions.requiredChannels(contestId);
 
-    const assignments = await this.prisma.$transaction(async (tx) => {
-      // Приём закрывается первым же действием транзакции. Читать пул раньше
-      // значило бы оставить окно, в котором успевший нажать кнопку попадает
-      // в таблицу участников, но не в разыгранный пул — и журнал розыгрыша
-      // перестал бы сходиться с тем, что видно в базе.
-      const closed = await tx.contest.updateMany({
-        where: { id: contestId, status: { not: 'drawn' } },
-        data: { status: 'drawn' },
-      });
-      if (closed.count === 0) {
-        // Кто-то успел провести розыгрыш параллельно.
-        throw new AppException(
-          ErrorCode.CONTEST_ALREADY_DRAWN,
-          'Розыгрыш уже проведён — доступны только точечные правки мест',
+    const assignments = await this.prisma.$transaction(
+      async (tx) => {
+        // Приём закрывается первым же действием транзакции. Читать пул раньше
+        // значило бы оставить окно, в котором успевший нажать кнопку попадает
+        // в таблицу участников, но не в разыгранный пул — и журнал розыгрыша
+        // перестал бы сходиться с тем, что видно в базе.
+        const closed = await tx.contest.updateMany({
+          where: { id: contestId, status: { not: 'drawn' } },
+          data: { status: 'drawn' },
+        });
+        if (closed.count === 0) {
+          // Кто-то успел провести розыгрыш параллельно.
+          throw new AppException(
+            ErrorCode.CONTEST_ALREADY_DRAWN,
+            'Розыгрыш уже проведён — доступны только точечные правки мест',
+          );
+        }
+
+        const [participants, prizes] = await Promise.all([
+          tx.contestParticipant.findMany({
+            where: { contestId },
+            select: {
+              id: true,
+              platform: true,
+              externalUserId: true,
+              source: true,
+            },
+          }),
+          tx.contestPrize.findMany({
+            where: { contestId },
+            select: {
+              id: true,
+              place: true,
+              winnerParticipantId: true,
+              isForced: true,
+            },
+          }),
+        ]);
+
+        const prizeInputs = prizes.map((prize) => ({
+          id: prize.id,
+          place: prize.place,
+          forcedWinnerParticipantId: prize.isForced
+            ? prize.winnerParticipantId
+            : null,
+        }));
+        // Кого вообще можно проверить: MAX-участник, нажавший кнопку сам, —
+        // только у него в `externalUserId` настоящий id. У ручной строки там
+        // ник, и даже чисто цифровой (`Иван @100500`) — это ник, а не id:
+        // проверка спросила бы MAX о постороннем человеке, и выбранный
+        // админом участник выбыл бы. Ручные строки не проверяются вовсе.
+        const maxUserIdOf = new Map(
+          participants.flatMap((p) =>
+            p.source === 'button' &&
+            p.platform === 'max' &&
+            p.externalUserId &&
+            /^\d+$/.test(p.externalUserId)
+              ? [[p.id, p.externalUserId] as const]
+              : [],
+          ),
         );
-      }
+        const disqualified = new Set<string>();
+        const verified = new Set<string>();
+        // Каналы-условия, где бота уже нет (403/404): по ним никто не
+        // проверялся, и журнал не должен утверждать обратное.
+        const skippedChannels = new Set<string>();
 
-      const [participants, prizes] = await Promise.all([
-        tx.contestParticipant.findMany({
-          where: { contestId },
-          select: { id: true },
-        }),
-        tx.contestPrize.findMany({
-          where: { contestId },
-          select: {
-            id: true,
-            place: true,
-            winnerParticipantId: true,
-            isForced: true,
-          },
-        }),
-      ]);
+        let drawn: DrawAssignment[];
+        for (;;) {
+          try {
+            drawn = drawWinners({
+              participantIds: participants
+                .map((p) => p.id)
+                .filter((id) => !disqualified.has(id)),
+              prizes: prizeInputs,
+              seed,
+            });
+          } catch (err: unknown) {
+            // Бросок откатывает и закрытие приёма: конкурс остаётся открытым,
+            // а не застревает в `drawn` без победителей.
+            throw toAppException(err, disqualified.size);
+          }
+          if (channels.length === 0) {
+            break;
+          }
+          const toCheck = drawn.filter(
+            (a) =>
+              !a.isForced &&
+              maxUserIdOf.has(a.participantId) &&
+              !verified.has(a.participantId),
+          );
+          if (toCheck.length === 0) {
+            break;
+          }
+          // Сбой MAX здесь откатывает розыгрыш целиком (конкурс остаётся
+          // открытым, авто-розыгрыш повторит попытку): разыграть, не
+          // проверив, значило бы молча отменить условие.
+          const unsubscribed = await this.subscriptions.unsubscribedAmong(
+            // Канал, где бота уже нет, на следующих проходах не спрашиваем:
+            // ответ известен, а каждый запрос — время внутри транзакции.
+            channels.filter((c) => !skippedChannels.has(c.groupId)),
+            toCheck.map((a) => maxUserIdOf.get(a.participantId)!),
+            skippedChannels,
+          );
+          for (const a of toCheck) {
+            const userId = maxUserIdOf.get(a.participantId)!;
+            (unsubscribed.has(userId) ? disqualified : verified).add(
+              a.participantId,
+            );
+          }
+        }
 
-      let drawn: DrawAssignment[];
-      try {
-        drawn = drawWinners({
-          participantIds: participants.map((p) => p.id),
-          prizes: prizes.map((prize) => ({
-            id: prize.id,
-            place: prize.place,
-            forcedWinnerParticipantId: prize.isForced
-              ? prize.winnerParticipantId
-              : null,
-          })),
-          seed,
+        // Победители снимаются со всех мест до расстановки новых: на
+        // `winnerParticipantId` висит unique, и обновление «по одному» упёрлось
+        // бы в него на любой перестановке.
+        await tx.contestPrize.updateMany({
+          where: { contestId },
+          data: { winnerParticipantId: null },
         });
-      } catch (err: unknown) {
-        // Бросок откатывает и закрытие приёма: конкурс остаётся открытым,
-        // а не застревает в `drawn` без победителей.
-        throw toAppException(err);
-      }
 
-      // Победители снимаются со всех мест до расстановки новых: на
-      // `winnerParticipantId` висит unique, и обновление «по одному» упёрлось
-      // бы в него на любой перестановке.
-      await tx.contestPrize.updateMany({
-        where: { contestId },
-        data: { winnerParticipantId: null },
-      });
+        for (const assignment of drawn) {
+          await tx.contestPrize.update({
+            where: { id: assignment.prizeId },
+            data: {
+              winnerParticipantId: assignment.participantId,
+              isForced: assignment.isForced,
+            },
+          });
+        }
 
-      for (const assignment of drawn) {
-        await tx.contestPrize.update({
-          where: { id: assignment.prizeId },
+        await tx.contestDrawLog.create({
           data: {
-            winnerParticipantId: assignment.participantId,
-            isForced: assignment.isForced,
+            contestId,
+            kind: 'draw',
+            seed,
+            actorId: actorId ?? null,
+            resultSnapshot: {
+              // Пул целиком — без него сид бесполезен: пересчёт требует ровно
+              // того же входа, что был на момент розыгрыша.
+              participantIds: participants.map((p) => p.id).sort(),
+              // Выбывшие из-за отписки: пересчёт идёт по пулу без них.
+              disqualifiedParticipantIds: [...disqualified].sort(),
+              requiredGroupIds: channels.map((c) => c.groupId).sort(),
+              skippedRequiredGroupIds: [...skippedChannels].sort(),
+              assignments: drawn.map((a) => ({
+                prizeId: a.prizeId,
+                place: a.place,
+                participantId: a.participantId,
+                isForced: a.isForced,
+              })),
+            },
           },
         });
-      }
 
-      await tx.contestDrawLog.create({
-        data: {
-          contestId,
-          kind: 'draw',
-          seed,
-          actorId: actorId ?? null,
-          resultSnapshot: {
-            // Пул целиком — без него сид бесполезен: пересчёт требует ровно
-            // того же входа, что был на момент розыгрыша.
-            participantIds: participants.map((p) => p.id).sort(),
-            assignments: drawn.map((a) => ({
-              prizeId: a.prizeId,
-              place: a.place,
-              participantId: a.participantId,
-              isForced: a.isForced,
-            })),
-          },
-        },
-      });
-
-      return drawn;
-    });
+        return drawn;
+        // Проверка подписки ходит в MAX изнутри транзакции — пул и закрытие
+        // приёма должны остаться атомарными. Стандартных 5 секунд на это мало.
+      },
+      { timeout: DRAW_TX_TIMEOUT_MS },
+    );
 
     // Розыгрыш уже зафиксирован. Провал уведомлений (в том числе сбой базы
     // внутри них) не должен превращаться в 500: админ повторил бы запрос и
@@ -630,6 +945,16 @@ export class ContestsService {
       prizeId,
       participantId,
     );
+    // До розыгрыша место закрепляют через `forceWinner`. Здесь же правка
+    // запускает объявление итогов: поздравление в лс и «Узнать результаты»
+    // под анонсом ушли бы раньше самого розыгрыша.
+    const contest = await this.requireContest(prize.contestId);
+    if (contest.status !== 'drawn') {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Розыгрыш ещё не проведён — закрепите место за участником, а не меняйте победителя',
+      );
+    }
 
     await this.prisma.$transaction(async (tx) => {
       // Участник может уже занимать другое место: unique на победителе не
@@ -721,6 +1046,33 @@ export class ContestsService {
           },
         },
         drawLogs: { orderBy: { drawnAt: 'desc' } },
+        // Публикация конкурса: текст, картинка и статус по каналам.
+        post: {
+          include: {
+            attachments: {
+              orderBy: { position: 'asc' },
+              include: { mediaAsset: true },
+            },
+            deliveries: {
+              include: {
+                group: {
+                  select: {
+                    id: true,
+                    title: true,
+                    status: true,
+                    platform: true,
+                  },
+                },
+              },
+              orderBy: { group: { title: 'asc' } },
+            },
+          },
+        },
+        requiredGroups: {
+          select: {
+            group: { select: { id: true, title: true, status: true } },
+          },
+        },
       },
     });
     if (!contest) {
@@ -806,15 +1158,21 @@ export class ContestsService {
   }
 }
 
-function toAppException(err: unknown): unknown {
+function toAppException(err: unknown, disqualifiedCount = 0): unknown {
   if (!(err instanceof ContestDrawError)) {
     return err;
   }
-  const code =
-    err.code === 'NOT_ENOUGH_PARTICIPANTS'
-      ? ErrorCode.CONTEST_INSUFFICIENT_PARTICIPANTS
-      : ErrorCode.VALIDATION_ERROR;
-  return new AppException(code, err.message);
+  if (err.code === 'NOT_ENOUGH_PARTICIPANTS') {
+    const reason =
+      disqualifiedCount > 0
+        ? `${err.message}; выбыли из-за отписки от каналов-условий: ${disqualifiedCount}`
+        : err.message;
+    return new AppException(
+      ErrorCode.CONTEST_INSUFFICIENT_PARTICIPANTS,
+      reason,
+    );
+  }
+  return new AppException(ErrorCode.VALIDATION_ERROR, err.message);
 }
 
 function isUniqueViolation(err: unknown): boolean {

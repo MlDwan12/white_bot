@@ -2,10 +2,12 @@ import { Injectable } from '@nestjs/common';
 import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
+import { sleep } from '../common/sleep';
+import type { Group } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PostSender } from './post-sender';
 import { PostsService } from './posts.service';
-import { joinButtonText } from '../contests/contest-button';
+import { ContestParticipationService } from '../contests/contest-participation.service';
 
 export interface ModerationOutcome {
   /** Сколько сообщений реально удалено/отредактировано. */
@@ -38,14 +40,13 @@ const MAX_AUTO_DELETE_ATTEMPTS = 5;
 const DRAIN_TIMEOUT_MS = 15_000;
 const DRAIN_POLL_MS = 500;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 @Injectable()
 export class PostModerationService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly sender: PostSender,
     private readonly posts: PostsService,
+    private readonly participation: ContestParticipationService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(PostModerationService.name);
@@ -73,6 +74,9 @@ export class PostModerationService {
 
     for (const delivery of deliveries) {
       try {
+        // Сообщение, уже удалённое руками в канале, MAX подтверждает
+        // успехом (проверено живьём), отдельной обработки не нужно. 404 же
+        // означает скорее «нет чата» — это неудача, а не «уже удалено».
         await this.sender.delete(delivery.group, delivery.externalMessageId!);
         // Срок автоудаления снимается: удалять уже нечего, а оставленная
         // дата заставляла бы сверщик возвращаться к этой строке вечно.
@@ -182,17 +186,7 @@ export class PostModerationService {
 
     // Кнопка конкурса передаётся при правке заново: в MAX клавиатура — такое
     // же вложение, и правка без неё снесла бы «Участвовать» во всех группах.
-    const contestButton = updated.contest
-      ? {
-          contestId: updated.contest.id,
-          label: joinButtonText(
-            updated.contest.joinButtonLabel,
-            await this.prisma.contestParticipant.count({
-              where: { contestId: updated.contest.id },
-            }),
-          ),
-        }
-      : null;
+    const contestButton = await this.participation.contestButton(updated);
 
     const deliveries = await this.publishedDeliveries(postId);
 
@@ -348,6 +342,29 @@ export class PostModerationService {
         'Не удалось записать результат по доставке — действие на платформе уже выполнено',
       );
     }
+  }
+
+  /**
+   * Снимает сообщения, строк доставки которых уже нет (конкурс удалён из
+   * базы раньше, чем сняты его сообщения, — см. `ContestsService.deleteContest`).
+   * Best-effort: сбой по одному не мешает остальным и возвращается списком.
+   */
+  async deleteMessages(
+    messages: { group: Group; externalMessageId: string }[],
+  ): Promise<{ groupTitle: string; error: string }[]> {
+    const failed: { groupTitle: string; error: string }[] = [];
+    for (const { group, externalMessageId } of messages) {
+      try {
+        await this.sender.delete(group, externalMessageId);
+      } catch (err: unknown) {
+        this.logger.warn(
+          { err, groupId: group.id },
+          'Не удалось удалить сообщение удалённого конкурса',
+        );
+        failed.push({ groupTitle: group.title, error: describe(err) });
+      }
+    }
+    return failed;
   }
 
   private async publishedDeliveries(postId: string, groupIds?: string[]) {

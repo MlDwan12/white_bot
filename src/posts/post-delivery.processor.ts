@@ -12,8 +12,8 @@ import {
   deliverJobId,
 } from '../queue/queue.constants';
 import { PostsService } from './posts.service';
-import { ContestButton, PostSender } from './post-sender';
-import { joinButtonText } from '../contests/contest-button';
+import { PostSender } from './post-sender';
+import { ContestParticipationService } from '../contests/contest-participation.service';
 import { VkUploaderTokenService } from '../vk/vk-uploader-token.service';
 import { classifyDeliveryError } from './delivery-outcome';
 import { autoDeleteDueAt } from './post-moderation.service';
@@ -46,6 +46,7 @@ export class PostDeliveryProcessor extends WorkerHost {
     private readonly sender: PostSender,
     private readonly rateLimiter: GroupRateLimiter,
     private readonly vkUploaderToken: VkUploaderTokenService,
+    private readonly participation: ContestParticipationService,
     @InjectQueue(POST_DELIVERY_QUEUE) private readonly queue: Queue,
     private readonly logger: PinoLogger,
   ) {
@@ -156,22 +157,6 @@ export class PostDeliveryProcessor extends WorkerHost {
     });
   }
 
-  /** Кнопка участия со счётчиком на момент отправки — или ничего. */
-  private async contestButtonFor(
-    contest: { id: string; joinButtonLabel: string } | null,
-  ): Promise<ContestButton | null> {
-    if (!contest) {
-      return null;
-    }
-    const count = await this.prisma.contestParticipant.count({
-      where: { contestId: contest.id },
-    });
-    return {
-      contestId: contest.id,
-      label: joinButtonText(contest.joinButtonLabel, count),
-    };
-  }
-
   private async deliver(job: Job<DeliverJob>): Promise<void> {
     const { deliveryId } = job.data;
     const delivery = await this.prisma.postDelivery.findUnique({
@@ -258,7 +243,7 @@ export class PostDeliveryProcessor extends WorkerHost {
         // У повторяющегося шаблона конкурс сюда не доедет: вхождения — это
         // отдельные Post-строки, у которых `contest` пуст. Связка «конкурс +
         // расписание» в MVP не предусмотрена.
-        await this.contestButtonFor(delivery.post.contest),
+        await this.participation.contestButton(delivery.post),
       ));
     } catch (err: unknown) {
       await this.handleDeliveryError(job, deliveryId, delivery.groupId, err);

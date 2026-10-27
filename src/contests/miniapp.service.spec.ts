@@ -218,6 +218,23 @@ describe('MiniAppService.join', () => {
     });
   });
 
+  it('без подписки отказывает со ссылками на каналы, а не текстом про кнопку бота', async () => {
+    const { service, participation } = setup();
+    participation.join.mockResolvedValue({
+      status: 'not_subscribed',
+      message: 'Затем нажмите «Проверить подписку».',
+      missingChannels: [{ title: 'Новости', link: 'https://max.ru/join/x' }],
+    });
+
+    const failure = service.join(CONTEST_ID, viewer());
+    await expect(failure).rejects.toMatchObject({
+      code: ErrorCode.VALIDATION_ERROR,
+    });
+    await expect(failure).rejects.toThrow(
+      'Чтобы участвовать, подпишитесь: Новости (https://max.ru/join/x) — и нажмите «Участвовать» ещё раз.',
+    );
+  });
+
   it('reports a vanished contest as not found', async () => {
     const { service, participation } = setup();
     participation.join.mockResolvedValue({

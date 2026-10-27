@@ -18,6 +18,11 @@ import {
 export interface ContestButton {
   contestId: string;
   label: string;
+  /**
+   * Текст сообщения целиком: после розыгрыша в нём итоги, поэтому текст
+   * поста здесь не годится (см. `ContestParticipationService.announcementView`).
+   */
+  text: string;
 }
 
 export interface SendResult {
@@ -119,7 +124,7 @@ export class PostSender {
     // «Участвовать» во всех группах разом. Никто бы уже не записался.
     await this.max.editMessage(
       externalMessageId,
-      PostSender.resolveText(post, 'max'),
+      contestButton?.text ?? PostSender.resolveText(post, 'max'),
       { attachments, buttons: this.contestButtons(contestButton) },
     );
   }
@@ -175,7 +180,7 @@ export class PostSender {
     const buttons = this.contestButtons(contestButton);
     const { messageId } = await this.max.sendMessageToChat(
       Number(group.externalId),
-      PostSender.resolveText(post, 'max'),
+      contestButton?.text ?? PostSender.resolveText(post, 'max'),
       { attachments, buttons },
     );
     return { externalMessageId: messageId };

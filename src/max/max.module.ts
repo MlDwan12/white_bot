@@ -3,9 +3,7 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { GroupsModule } from '../groups/groups.module';
 import { ContestParticipationModule } from '../contests/contest-participation.module';
 import { PlatformUsersModule } from '../platform-users/platform-users.module';
-import { MaxAdminResolver } from './max-admin.resolver';
-import { MaxApiClient } from './max-api.client';
-import { maxBotProvider } from './max-bot.provider';
+import { MaxCoreModule } from './max-core.module';
 import { MaxBotHandlers } from './max-bot.handlers';
 import { MaxPollingWorker } from './max-polling.worker';
 import { MaxWebAppGuard } from './max-webapp.guard';
@@ -16,15 +14,9 @@ import { MaxWebAppGuard } from './max-webapp.guard';
     GroupsModule,
     ContestParticipationModule,
     PlatformUsersModule,
+    MaxCoreModule,
   ],
-  providers: [
-    maxBotProvider,
-    MaxApiClient,
-    MaxAdminResolver,
-    MaxBotHandlers,
-    MaxPollingWorker,
-    MaxWebAppGuard,
-  ],
-  exports: [MaxApiClient, MaxAdminResolver, MaxWebAppGuard],
+  providers: [MaxBotHandlers, MaxPollingWorker, MaxWebAppGuard],
+  exports: [MaxCoreModule, MaxWebAppGuard],
 })
 export class MaxModule {}

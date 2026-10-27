@@ -118,6 +118,7 @@ model Group {
   postDeliveries      PostDelivery[]
   templateTargets     PostTemplateTarget[]
   contestParticipants ContestParticipant[]
+  contestRequirements ContestRequiredGroup[]
 
   @@unique([platform, externalId])
   @@index([tags], type: Gin)
@@ -377,9 +378,25 @@ model Contest {
   publishResultsInPost Boolean       @default(true)
 
   post         Post?                @relation(fields: [postId], references: [id])
-  participants ContestParticipant[]
-  prizes       ContestPrize[]
-  drawLogs     ContestDrawLog[]
+  participants   ContestParticipant[]
+  prizes         ContestPrize[]
+  drawLogs       ContestDrawLog[]
+  requiredGroups ContestRequiredGroup[]
+}
+
+/// Условие участия: подписка на канал. Проверяется при нажатии «Участвовать»
+/// и ещё раз у выпавших победителей при розыгрыше — отписавшийся выбывает.
+/// Только MAX-группы: участие идёт через MAX-бота, а проверить подписку
+/// можно лишь там, где бот сам состоит (подключённая группа — всегда).
+model ContestRequiredGroup {
+  contestId String
+  groupId   String
+
+  contest Contest @relation(fields: [contestId], references: [id])
+  group   Group   @relation(fields: [groupId], references: [id])
+
+  @@id([contestId, groupId])
+  @@index([groupId])
 }
 
 /// Профиль человека с платформы: заводится при первом же участии и живёт
@@ -494,6 +511,10 @@ model AdminUser {
   maxUserId        String?      @unique
   extraPermissions Permission[] @default([])
   createdAt        DateTime     @default(now())
+  /// Отключён: не входит, сессии погашены, бот его не узнаёт и не пишет ему.
+  /// Строку не удаляем — на ней висят сессии и журнал розыгрышей («кто
+  /// провёл»). Null — активен.
+  disabledAt       DateTime?
 
   sessions AdminSession[]
   drawLogs ContestDrawLog[]

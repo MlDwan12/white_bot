@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client';
 import { PlatformUsersService } from '../platform-users/platform-users.service';
 import { ContestParticipationService } from './contest-participation.service';
+import { ContestSubscriptions } from './contest-subscriptions';
 
 const CONTEST_ID = '11111111-1111-4111-8111-111111111111';
 
@@ -43,20 +44,33 @@ function setup(contest: ReturnType<typeof contestRow> | null = contestRow()) {
     },
     contestPrize: { findMany: jest.fn().mockResolvedValue([]) },
     postDelivery: { findMany: jest.fn().mockResolvedValue([]) },
+    // Статус под блокировкой строки перед записью — по умолчанию приём идёт.
+    $queryRaw: jest.fn().mockResolvedValue([{ status: 'open' }]),
+    $executeRawUnsafe: jest.fn().mockResolvedValue(0),
+    $transaction: jest.fn(),
   };
+  prisma.$transaction.mockImplementation(
+    (fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma),
+  );
   const platformUsers = {
     upsert: jest.fn().mockResolvedValue({ id: 'pu-1' }),
     // По умолчанию — уже согласившийся человек: сам шлюз согласия
     // проверяется отдельными тестами ниже.
     hasConsented: jest.fn().mockResolvedValue(true),
   };
+  // По умолчанию условия подписки нет (или оно выполнено).
+  const subscriptions = {
+    missingFor: jest.fn().mockResolvedValue([]),
+    requiredChannels: jest.fn().mockResolvedValue([]),
+  };
   const logger = { setContext: jest.fn(), info: jest.fn(), warn: jest.fn() };
   const service = new ContestParticipationService(
     prisma as unknown as PrismaService,
     platformUsers as unknown as PlatformUsersService,
+    subscriptions as unknown as ContestSubscriptions,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma, platformUsers };
+  return { service, prisma, platformUsers, subscriptions };
 }
 
 const request = () => ({
@@ -106,6 +120,105 @@ describe('ContestParticipationService.join', () => {
     expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
   });
 
+  it('без подписки на каналы-условия не записывает и называет, на что подписаться', async () => {
+    const { service, prisma, platformUsers, subscriptions } = setup();
+    subscriptions.missingFor.mockResolvedValue([
+      { title: 'Новости', link: 'https://max.ru/join/abc' },
+    ]);
+
+    const outcome = await service.join(request());
+
+    expect(outcome.status).toBe('not_subscribed');
+    expect(outcome.message).toContain('• Новости');
+    expect(outcome.missingChannels).toEqual([
+      { title: 'Новости', link: 'https://max.ru/join/abc' },
+    ]);
+    // Пост под кнопкой перерисовывается как был — ответ на колбэк заменяет его.
+    expect(outcome.refresh).toBeDefined();
+    expect(platformUsers.upsert).not.toHaveBeenCalled();
+    expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
+  });
+
+  it('сбой проверки подписки — отказ «попробуйте позже», а не участие без проверки', async () => {
+    const { service, prisma, subscriptions } = setup();
+    subscriptions.missingFor.mockRejectedValue(new Error('MAX недоступен'));
+
+    const outcome = await service.join(request());
+
+    expect(outcome.status).toBe('subscription_check_failed');
+    expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
+  });
+
+  it('подписку проверяет только после согласия', async () => {
+    const { service, platformUsers, subscriptions } = setup();
+    platformUsers.hasConsented.mockResolvedValue(false);
+
+    await service.join(request());
+
+    expect(subscriptions.missingFor).not.toHaveBeenCalled();
+  });
+
+  it('пока идёт розыгрыш (строка конкурса занята), не пишет участника мимо пула', async () => {
+    const { service, prisma } = setup();
+    prisma.$queryRaw.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Raw query failed', {
+        code: 'P2010',
+        clientVersion: 'test',
+        meta: {
+          driverAdapterError: {
+            name: 'DriverAdapterError',
+            cause: { code: '55P03', kind: 'postgres' },
+          },
+        },
+      }),
+    );
+
+    const outcome = await service.join(request());
+
+    expect(outcome.status).toBe('not_open');
+    expect(outcome.message).toContain('Нажмите ещё раз');
+    expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
+  });
+
+  it('если розыгрыш успел закрыть приём до записи — тоже отказ, а не участие', async () => {
+    const { service, prisma } = setup();
+    prisma.$queryRaw.mockResolvedValue([{ status: 'drawn' }]);
+
+    const outcome = await service.join(request());
+
+    expect(outcome.status).toBe('not_open');
+    expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
+  });
+
+  it('«идёт розыгрыш» оставляет кнопку повтора только у конкурса с условием', async () => {
+    // Человек мог прийти кнопкой «Проверить подписку» — ответ заменяет то
+    // сообщение, и без клавиатуры «нажмите ещё раз» было бы нечем.
+    const withCondition = setup();
+    withCondition.prisma.$queryRaw.mockResolvedValue([{ status: 'drawn' }]);
+    withCondition.subscriptions.requiredChannels.mockResolvedValue([
+      { groupId: 'g', externalId: '-1', title: 'Канал' },
+    ]);
+    expect(
+      (await withCondition.service.join(request())).missingChannels,
+    ).toEqual([]);
+
+    // Без условия «Проверить подписку» — про несуществующую проверку.
+    const without = setup();
+    without.prisma.$queryRaw.mockResolvedValue([{ status: 'drawn' }]);
+    expect((await without.service.join(request())).missingChannels).toBe(
+      undefined,
+    );
+  });
+
+  it('сбой проверки подписки оставляет кнопку «Проверить подписку»', async () => {
+    const { service, subscriptions } = setup();
+    subscriptions.missingFor.mockRejectedValue(new Error('MAX недоступен'));
+
+    const outcome = await service.join(request());
+
+    expect(outcome.missingChannels).toEqual([]);
+  });
+
   it('treats a repeat press as "already joined" rather than an error', async () => {
     const { service, prisma } = setup();
     prisma.contestParticipant.create.mockRejectedValueOnce(uniqueViolation());
@@ -130,6 +243,7 @@ describe('ContestParticipationService.join', () => {
       text: 'Текст анонса',
       buttonText: 'Участвовать (3)',
       payload: `contest:join:${CONTEST_ID}`,
+      drawn: false,
     });
   });
 
@@ -196,6 +310,27 @@ describe('ContestParticipationService.join', () => {
     const { service, prisma } = setup(contestRow({ status: 'draft' }));
 
     expect((await service.join(request())).status).toBe('not_open');
+    expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
+  });
+
+  it('после даты завершения не записывает, даже если розыгрыш ещё не прошёл', async () => {
+    // Сверка не успела или конкурс ждёт админа (мало подписанных) — опоздавший
+    // не должен попасть в конкурс после объявленного конца.
+    const { service, prisma } = setup(
+      contestRow({ status: 'open', endsAt: new Date(Date.now() - 1000) }),
+    );
+
+    expect((await service.join(request())).status).toBe('not_open');
+    expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
+  });
+
+  it('конкурс, удалённый прямо во время нажатия, — «не найден», а не «идёт розыгрыш»', async () => {
+    const { service, prisma } = setup();
+    prisma.$queryRaw.mockResolvedValue([]);
+
+    const outcome = await service.join(request());
+
+    expect(outcome.status).toBe('unknown_contest');
     expect(prisma.contestParticipant.create).not.toHaveBeenCalled();
   });
 
@@ -268,7 +403,11 @@ describe('startedFromLink', () => {
     place: 1,
     label: 'Главный приз',
     notifyStatus: 'manual_required',
-    winnerParticipant: { platform: 'max', externalUserId: '42' },
+    winnerParticipant: {
+      platform: 'max',
+      externalUserId: '42',
+      source: 'button',
+    },
     ...overrides,
   });
 
@@ -291,6 +430,37 @@ describe('startedFromLink', () => {
       expect(reply.text).toContain('Вы участвуете в конкурсе «Конкурс»');
       expect(reply.text).toContain('Итоги пришлю сюда');
       expect(reply.joined).toBe(true);
+    });
+
+    it('без подписки отвечает списком каналов с кнопками «Подписаться» и «Проверить подписку»', async () => {
+      const { service, subscriptions } = setup(
+        contestRow({ status: 'open', prizes: [] }),
+      );
+      subscriptions.missingFor.mockResolvedValue([
+        { title: 'Новости', link: 'https://max.ru/join/abc' },
+        { title: 'Без ссылки', link: null },
+      ]);
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.joined).toBe(false);
+      expect(reply.text).toContain('• Без ссылки');
+      expect(reply.buttons).toEqual([
+        [
+          {
+            type: 'link',
+            text: 'Подписаться: Новости',
+            url: 'https://max.ru/join/abc',
+          },
+        ],
+        [
+          {
+            type: 'callback',
+            text: 'Проверить подписку',
+            payload: `contest:check:${CONTEST_ID}`,
+          },
+        ],
+      ]);
     });
 
     it('повторный старт не пишет второго участника и не перерисовывает посты', async () => {
@@ -415,6 +585,24 @@ describe('startedFromLink', () => {
       expect(reply.text).not.toContain('Поздравляем');
     });
 
+    it('ручной участник с цифровым ником, совпавшим с id, — не этот человек', async () => {
+      // `Иван @42` — ник «42», а нажал «Начать» человек с id 42.
+      const { service } = setupDrawn([
+        winner({
+          winnerParticipant: {
+            platform: 'max',
+            externalUserId: '42',
+            source: 'manual',
+          },
+        }),
+      ]);
+
+      const reply = await service.startedFromLink(CONTEST_ID, profile());
+
+      expect(reply.text).not.toContain('Поздравляем');
+      expect(reply.prizeIdsToMark).toEqual([]);
+    });
+
     it('уважает отключённое автоуведомление победителей', async () => {
       // Владелец конкурса запретил писать победителям в личку — ссылка на
       // бота не должна обходить это решение.
@@ -497,11 +685,31 @@ describe('announcementRefresh', () => {
     expect(prisma.contestParticipant.count).toHaveBeenCalled();
   });
 
-  it('после розыгрыша ничего не отдаёт — пост принадлежит уведомителю', async () => {
-    // Запоздавшая правка счётчика затёрла бы победителей, дописанных в пост.
-    const { service } = setup(contestRow({ status: 'drawn' }));
+  it('после розыгрыша отдаёт вид итогов, а не «Участвовать (N)»', async () => {
+    // Один вид на все перерисовки: запоздавшая правка счётчика и подмена
+    // после розыгрыша пишут одно и то же, и итоги не затираются.
+    const { service, prisma } = setup(
+      contestRow({ status: 'drawn', publishResultsInPost: true }),
+    );
+    prisma.contestPrize.findMany.mockResolvedValue([
+      {
+        place: 1,
+        label: 'Главный приз',
+        winnerParticipant: { displayName: 'Иван' },
+      },
+    ]);
+    prisma.postDelivery.findMany.mockResolvedValue([
+      { externalMessageId: 'mid.1' },
+    ]);
 
-    expect(await service.announcementRefresh(CONTEST_ID)).toBeNull();
+    const refresh = await service.announcementRefresh(CONTEST_ID);
+
+    expect(refresh).toMatchObject({
+      text: 'Текст анонса\n\nПобедители:\n1. Главный приз — Иван',
+      buttonText: 'Узнать результаты',
+      messageIds: ['mid.1'],
+    });
+    expect(prisma.contestParticipant.count).not.toHaveBeenCalled();
   });
 
   it('у конкурса без анонса или несуществующего — null', async () => {
@@ -513,6 +721,48 @@ describe('announcementRefresh', () => {
     expect(
       await setup(null).service.announcementRefresh(CONTEST_ID),
     ).toBeNull();
+  });
+});
+
+describe('contestButton', () => {
+  it('у поста без конкурса — null', async () => {
+    const { service } = setup();
+
+    expect(
+      await service.contestButton({
+        ...contestRow().post,
+        contest: null,
+      } as never),
+    ).toBeNull();
+  });
+
+  it('после розыгрыша правка поста получает итоги и «Узнать результаты»', async () => {
+    // Иначе правка текста опубликованного конкурса возвращала кнопку
+    // «Участвовать» и стирала победителей (найдено живой проверкой).
+    const { service, prisma } = setup();
+    prisma.contestPrize.findMany.mockResolvedValue([
+      {
+        place: 1,
+        label: 'Главный приз',
+        winnerParticipant: { displayName: 'Иван' },
+      },
+    ]);
+    const { post, ...contest } = contestRow({
+      status: 'drawn',
+      publishResultsInPost: true,
+    });
+
+    const button = await service.contestButton({
+      ...post,
+      text: 'Исправленный текст',
+      contest,
+    } as never);
+
+    expect(button).toEqual({
+      contestId: CONTEST_ID,
+      label: 'Узнать результаты',
+      text: 'Исправленный текст\n\nПобедители:\n1. Главный приз — Иван',
+    });
   });
 });
 

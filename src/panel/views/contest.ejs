@@ -10,21 +10,19 @@
       <% if (contest.endsAt) { %>
         · завершение <%= formatDate(contest.endsAt) %><% if (contest.status === 'open') { %> (разыграется автоматически)<% } %>
       <% } %>
-      <% if (contest.postId) { %>
-        · <a href="/panel/campaigns/<%= contest.postId %>">анонс-пост</a>
-      <% } else { %>
-        · без анонса, участники только вручную
-      <% } %>
     </div>
-    <% if (contest.description) { %>
-      <p class="text-secondary mt-2 mb-0"><%= contest.description %></p>
+    <% if (contest.requiredGroups.length > 0) { %>
+      <div class="small mt-1">
+        Условие: подписка на
+        <% contest.requiredGroups.forEach(function (r, i) { %><%= i > 0 ? ', ' : '' %>«<%= r.group.title %>»<% if (r.group.status !== 'active') { %> <span class="text-secondary">(не проверяется — группа не активна)</span><% } %><% }); %>
+      </div>
     <% } %>
   </div>
   <div class="d-flex gap-2">
     <% if (contest.status === 'draft') { %>
       <form method="post" action="/panel/contests/<%= contest.id %>/open" class="m-0">
         <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
-        <button class="btn btn-primary" type="submit">Открыть приём</button>
+        <button class="btn btn-primary" type="submit">Опубликовать</button>
       </form>
     <% } %>
     <% if (contest.status !== 'drawn') { %>
@@ -33,12 +31,129 @@
         <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
         <button class="btn btn-danger" type="submit">Разыграть</button>
       </form>
+      <form method="post" action="/panel/contests/<%= contest.id %>/delete" class="m-0"
+            onsubmit="return confirm('Удалить конкурс? Сообщения уберутся из всех каналов, участники и места сотрутся. Это необратимо.')">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        <button class="btn btn-outline-danger" type="submit">Удалить</button>
+      </form>
     <% } %>
   </div>
 </div>
 
 <div class="row g-3">
   <div class="col-lg-7">
+    <% if (contest.post) { %>
+      <%
+         /* Текст, картинка и каналы конкурса. Хранятся в служебном посте
+            публикации, но правятся только здесь: вид сообщения зависит от
+            статуса конкурса (до розыгрыша — «Участвовать (N)», после —
+            итоги), и правка мимо конкурса его бы ломала. Каналы меняются
+            только до публикации. */
+         var publishedPost = contest.post.status !== 'draft';
+      %>
+      <div class="card mb-3">
+        <div class="card-header"><h3 class="card-title">Публикация</h3></div>
+        <form method="post" action="/panel/contests/<%= contest.id %>/publication">
+          <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+          <div class="card-body">
+            <div class="mb-3">
+              <label class="form-label" for="publication-text">Текст конкурса</label>
+              <textarea class="form-control" id="publication-text" name="text" rows="5"
+                        required><%= contest.post.text %></textarea>
+              <% if (publishedPost) { %>
+                <small class="form-hint">
+                  Уже опубликован — сохранение обновит сообщения во всех каналах.
+                  <% if (contest.status === 'drawn' && contest.publishResultsInPost) { %>Список победителей допишется сам.<% } %>
+                </small>
+              <% } %>
+            </div>
+            <% if (publicationMedia.length > 0) { %>
+              <div class="mb-3">
+                <label class="form-label">Картинка</label>
+                <% publicationMedia.forEach(function (m) { %>
+                  <label class="form-check d-flex align-items-center">
+                    <input class="form-check-input" type="checkbox" name="attachmentIds"
+                           value="<%= m.id %>"
+                           <%= publicationAttachedIds.includes(m.id) ? 'checked' : '' %> />
+                    <span class="form-check-label d-flex align-items-center">
+                      <%- include('media-thumb', { m: m }) %>
+                      <%= m.filename %> <span class="text-secondary small ms-1"><%= mediaKindLabel(m.kind) %></span>
+                    </span>
+                  </label>
+                <% }); %>
+              </div>
+            <% } %>
+            <div class="mb-1">
+              <label class="form-label">Каналы</label>
+              <% if (publishedPost) { %>
+                <% contest.post.deliveries.forEach(function (d) { %>
+                  <div class="d-flex align-items-center gap-2 mb-1">
+                    <%= d.group.title %>
+                    <span class="tag tag-<%= deliveryColor(d) %>"><%= deliveryLabel(d) %></span>
+                    <% if (d.error) { %><span class="text-danger small"><%= d.error %></span><% } %>
+                  </div>
+                <% }); %>
+                <% var resumable = contest.post.deliveries.some(function (d) { return d.status === 'failed' || d.status === 'skipped_by_stop'; }); %>
+                <% if (resumable) { %>
+                  <%
+                     /* Отдельная форма через `form=`: вложенные формы HTML не
+                        допускает, а эта кнопка стоит внутри формы правки. */
+                  %>
+                  <button class="btn btn-sm mt-1" type="submit" form="publication-resume">Отправить оставшимся</button>
+                <% } %>
+              <% } else { %>
+                <% var chosen = contest.post.deliveries.map(function (d) { return d.groupId; }); %>
+                <% maxGroups.forEach(function (g) { %>
+                  <label class="form-check">
+                    <input class="form-check-input" type="checkbox" name="groupIds"
+                           value="<%= g.id %>" <%= chosen.includes(g.id) ? 'checked' : '' %> />
+                    <span class="form-check-label"><%= g.title %></span>
+                  </label>
+                <% }); %>
+                <%
+                   /* Каналы черновика вне списка выше (только активные MAX).
+                      VK у конкурсов до правила «только MAX» — активна, её
+                      можно оставить галочкой. Неактивную черновик хранить не
+                      может (рассылка в неё запрещена), и при сохранении она
+                      уйдёт — об этом говорим прямо, а не молча. */
+                %>
+                <% contest.post.deliveries.filter(function (d) { return d.group.status === 'active' && d.group.platform !== 'max'; }).forEach(function (d) { %>
+                  <label class="form-check">
+                    <input class="form-check-input" type="checkbox" name="groupIds"
+                           value="<%= d.groupId %>" checked />
+                    <span class="form-check-label"><%= d.group.title %>
+                      <span class="text-secondary">(VK — кнопки участия там не будет)</span></span>
+                  </label>
+                <% }); %>
+                <% contest.post.deliveries.filter(function (d) { return d.group.status !== 'active'; }).forEach(function (d) { %>
+                  <div class="text-warning small mb-1">
+                    «<%= d.group.title %>» — бот не активен; при сохранении канал уберётся из публикации.
+                  </div>
+                <% }); %>
+                <small class="form-hint">Хотя бы один. После публикации каналы не меняются.</small>
+              <% } %>
+            </div>
+          </div>
+          <div class="card-footer">
+            <button class="btn btn-primary" type="submit">Сохранить</button>
+          </div>
+        </form>
+        <form id="publication-resume" method="post" class="d-none"
+              action="/panel/contests/<%= contest.id %>/publication/resume">
+          <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+        </form>
+        <form method="post" action="/panel/contests/<%= contest.id %>/publication/media"
+              enctype="multipart/form-data" class="card-footer d-flex gap-2 align-items-center">
+          <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
+          <input class="form-control" type="file" name="file" required />
+          <button class="btn" type="submit">Загрузить</button>
+        </form>
+        <div class="card-footer text-secondary small pt-0">
+          Загруженный файл отметится в списке выше и прикрепится по «Сохранить».
+          Набранный, но не сохранённый текст при загрузке пропадёт — сохраните его сначала.
+        </div>
+      </div>
+    <% } %>
     <div class="card mb-3">
       <div class="card-header">
         <h3 class="card-title">Призовые места</h3>
@@ -124,7 +239,7 @@
           же по смыслу экран открыт, потому что замена отпавшего победителя —
           рядовая работа. Оба пути пишут в журнал розыгрыша. */
     %>
-    <% if (contest.prizes.length > 0 && contest.participants.length > 0) { %>
+    <% if (contest.prizes.length > 0 && (contest.participants.length > 0 || contest.status !== 'drawn')) { %>
       <% if (contest.status === 'drawn') { %>
         <div class="card mb-3">
           <div class="card-header"><h3 class="card-title">Замена победителя</h3></div>
@@ -168,7 +283,20 @@
               только оставшиеся. Отметка «выбран вручную» останется видна на
               странице и уйдёт в журнал розыгрыша.
             </p>
-            <% contest.prizes.forEach(function (prize) { %>
+            <% if (contest.participants.length === 0) { %>
+              <%
+                 /* Закрепить можно только участника. Раньше без участников
+                    блока не было вовсе, и было непонятно, куда он делся. */
+              %>
+              <p class="m-0">
+                Закрепить можно только участника, а их пока нет. Нужного
+                человека можно добавить заранее в блоке «Участники» справа —
+                строкой с именем и ником MAX, например <code>Иван @ivan_nick</code>,
+                — и он появится здесь. Уведомление о победе такой ручной
+                участник не получит: у него нет MAX id.
+              </p>
+            <% } %>
+            <% contest.participants.length > 0 && contest.prizes.forEach(function (prize) { %>
               <form method="post"
                     action="/panel/contests/<%= contest.id %>/prizes/<%= prize.id %>/force-winner"
                     class="mb-2 d-flex flex-wrap gap-2 align-items-end">
@@ -216,6 +344,18 @@
                             единственное доказательство, что он не подкручен. */
                       %>
                       <div class="text-secondary small">сид <%= log.seed %></div>
+                    <% } %>
+                    <%
+                       var disqualified = (log.resultSnapshot && log.resultSnapshot.disqualifiedParticipantIds) || [];
+                    %>
+                    <% if (disqualified.length > 0) { %>
+                      <div class="text-secondary small">
+                        выбыли, отписавшись от каналов-условий:
+                        <%= disqualified.map(function (id) {
+                              var p = contest.participants.find(function (x) { return x.id === id; });
+                              return p ? p.displayName : id;
+                            }).join(', ') %>
+                      </div>
                     <% } %>
                   </td>
                 </tr>
@@ -297,8 +437,7 @@
           опубликовано и нельзя трогать», а «идёт сейчас», и дату
           завершения, например, иногда нужно подвинуть, пока конкурс живой.
           После `drawn` условия менять поздно: розыгрыш уже состоялся по
-          старым. Публичный текст анонса эта форма не трогает — он правится
-          на карточке самого поста, по ссылке выше. */
+          старым. Текст и картинка конкурса — в блоке «Публикация» выше. */
     %>
     <% if (contest.status !== 'drawn') { %>
       <div class="card">
@@ -311,12 +450,6 @@
               <input class="form-control" id="contest-edit-title" name="title" required
                      value="<%= contestEditDraft.title %>" />
               <small class="form-hint">Видно только в панели.</small>
-            </div>
-            <div class="mb-3">
-              <label class="form-label" for="contest-edit-description">Описание</label>
-              <textarea class="form-control" id="contest-edit-description" name="description"
-                        rows="3"><%= contestEditDraft.description %></textarea>
-              <small class="form-hint">Тоже только для панели.</small>
             </div>
             <div class="mb-3">
               <label class="form-label" for="contest-edit-join">Текст кнопки участия</label>
@@ -362,6 +495,7 @@
                 </small>
               </div>
             </div>
+            <%- include('required-groups', { maxGroups: maxGroups, selected: contestEditDraft.requiredGroupIds, inactiveGroups: inactiveRequired }) %>
             <div class="mb-3">
               <label class="form-check">
                 <input class="form-check-input" type="checkbox" name="notifyWinners"
@@ -373,7 +507,7 @@
               <label class="form-check">
                 <input class="form-check-input" type="checkbox" name="publishResultsInPost"
                        <%= contestEditDraft.publishResultsInPost ? 'checked' : '' %> />
-                <span class="form-check-label">Публиковать итоги в анонс-посте</span>
+                <span class="form-check-label">Дописать победителей в текст конкурса</span>
               </label>
             </div>
           </div>

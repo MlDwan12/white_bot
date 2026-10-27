@@ -7,7 +7,9 @@ services:
       POSTGRES_PASSWORD: white_bot
       POSTGRES_DB: white_bot
     ports:
-      - "5433:5432"
+      # Публикация только на localhost: креды в environment ниже — дефолтные
+      # dev-значения, и на "0.0.0.0" порт был бы виден всей локальной сети.
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -20,7 +22,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -33,18 +35,37 @@ services:
     build:
       context: .
       target: dev
+
+    # PID 1 без init не разгребает зомби-процессы и может не прокинуть
+    # SIGTERM правильно дочерним процессам — актуально с воркером очереди.
+    init: true
+
     restart: unless-stopped
+
     env_file: .env
+
     environment:
       DATABASE_URL: postgresql://white_bot:white_bot@postgres:5432/white_bot
       REDIS_URL: redis://redis:6379
+
+    # Резолвер Docker Desktop VM периодически не резолвил registry.yarnpkg.com
+    # и другие внешние хосты во время сборки/работы (наблюдалось живьём
+    # 22.09.2026) — Cloudflare DNS в обход него чинит это для dev-машины.
+    # На сети, блокирующей исходящий DNS к произвольным внешним IP
+    # (корпоративный прокси, часть CI-раннеров), даст обратный эффект —
+    # тогда эту строку нужно убрать, а не добавлять ещё один резолвер.
+    dns:
+      - 1.1.1.1
+
     ports:
       - "3000:3000"
+
     volumes:
       - .:/app
       - /app/node_modules
       - /app/src/generated
       - /app/dist
+
     depends_on:
       postgres:
         condition: service_healthy

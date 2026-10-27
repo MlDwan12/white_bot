@@ -1,3 +1,4 @@
+import { isUUID } from 'class-validator';
 import {
   Body,
   Controller,
@@ -56,7 +57,9 @@ import { PlatformUsersService } from '../platform-users/platform-users.service';
 import { DirectMessageDispatchService } from '../direct-messages/direct-message-dispatch.service';
 import { DirectMessageRecipientSelector } from '../direct-messages/direct-message-recipients.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { AdminsService, type IssuedPassword } from '../admins/admins.service';
 import type {
+  AdminRole,
   AdminUser,
   MediaAsset,
   Permission,
@@ -161,6 +164,7 @@ interface NewContestFormBody {
   publishAt?: string;
   endsAt?: string;
   placesCount?: string;
+  requiredGroupIds?: string | string[];
 }
 
 interface NewContestDraft {
@@ -175,6 +179,7 @@ interface NewContestDraft {
   publishAt: string;
   endsAt: string;
   placesCount: string;
+  requiredGroupIds: string[];
 }
 
 /** Поля формы «Правка опубликованного» — как их присылает браузер. */
@@ -260,6 +265,7 @@ export class PanelController {
     private readonly media: MediaService,
     private readonly platformUsers: PlatformUsersService,
     private readonly directMessages: DirectMessageDispatchService,
+    private readonly admins: AdminsService,
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly logger: PinoLogger,
@@ -368,6 +374,18 @@ export class PanelController {
     @Query('reason') reason?: string,
     @Query('dmQuery') dmQuery?: string,
   ): Promise<void> {
+    // Пост-носитель конкурса — не отдельный пост: всё про него на карточке
+    // конкурса (в т.ч. по старым ссылкам «анонс-пост»).
+    const contest = isUUID(id)
+      ? await this.prisma.contest.findUnique({
+          where: { postId: id },
+          select: { id: true },
+        })
+      : null;
+    if (contest) {
+      res.redirect(`${PANEL_PREFIX}/contests/${contest.id}`);
+      return;
+    }
     // Через тот же `renderCampaign`, что и повтороный показ после загрузки
     // файла посреди правки: разошедшиеся копии полей — на первом же
     // добавленном.
@@ -1457,6 +1475,186 @@ export class PanelController {
     });
   }
 
+  // ----- админы -----------------------------------------------------------
+
+  @Get('admins')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('admins_manage')
+  async adminsPage(
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+    @Query('flash') flash?: string,
+    @Query('reason') reason?: string,
+  ): Promise<void> {
+    await this.renderAdmins(res, req, admin, { flash, reason });
+  }
+
+  @Post('admins')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('admins_manage')
+  async createAdmin(
+    @Body() body: { email?: string; role?: string; maxUserId?: string },
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    try {
+      const issued = await this.admins.create({
+        email: body.email ?? '',
+        role: body.role as AdminRole,
+        maxUserId: body.maxUserId,
+      });
+      await this.renderAdmins(res, req, admin, {
+        issued: { ...issued, reason: 'created' },
+      });
+    } catch (err: unknown) {
+      this.logger.warn({ err }, 'Не удалось добавить админа');
+      await this.renderAdmins(res, req, admin, {
+        status: 400,
+        error:
+          err instanceof AppException
+            ? err.message
+            : 'Не удалось добавить админа',
+        // Набранное не теряем: email и MAX id вводить заново незачем.
+        draft: body,
+      });
+    }
+  }
+
+  @Post('admins/:id/edit')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('admins_manage')
+  async editAdmin(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { role?: string; maxUserId?: string },
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.runAdminAction(res, 'admin-edited', () =>
+      this.admins.update(
+        id,
+        { role: body.role as AdminRole, maxUserId: body.maxUserId },
+        admin.id,
+      ),
+    );
+  }
+
+  @Post('admins/:id/disable')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('admins_manage')
+  async disableAdmin(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.runAdminAction(res, 'admin-disabled', () =>
+      this.admins.disable(id, admin.id),
+    );
+  }
+
+  @Post('admins/:id/enable')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('admins_manage')
+  async enableAdmin(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.runAdminAction(res, 'admin-enabled', () =>
+      this.admins.enable(id),
+    );
+  }
+
+  /**
+   * Сброс пароля отвечает страницей, а не редиректом: новый пароль
+   * показывается один раз, и в адресе (история браузера, логи прокси) ему не
+   * место.
+   */
+  @Post('admins/:id/reset-password')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('admins_manage')
+  async resetAdminPassword(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
+    @CurrentAdmin() admin: AdminUser,
+    @Res() res: Response,
+  ): Promise<void> {
+    try {
+      const issued = await this.admins.resetPassword(id);
+      await this.renderAdmins(res, req, admin, {
+        issued: { ...issued, reason: 'reset' },
+      });
+    } catch (err: unknown) {
+      this.logger.warn({ err, adminId: id }, 'Не удалось сбросить пароль');
+      this.redirectFlash(
+        res,
+        'admins',
+        'admin-failed',
+        err instanceof AppException ? err.message : undefined,
+      );
+    }
+  }
+
+  private async runAdminAction(
+    res: Response,
+    okFlash: string,
+    action: () => Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await action();
+      this.redirectFlash(res, 'admins', okFlash);
+    } catch (err: unknown) {
+      this.logger.warn({ err }, 'Действие над админом не выполнено');
+      this.redirectFlash(
+        res,
+        'admins',
+        'admin-failed',
+        err instanceof AppException ? err.message : undefined,
+      );
+    }
+  }
+
+  private async renderAdmins(
+    res: Response,
+    req: Request,
+    admin: AdminUser,
+    options: {
+      status?: number;
+      flash?: string;
+      reason?: string;
+      error?: string;
+      draft?: { email?: string; role?: string; maxUserId?: string };
+      issued?: IssuedPassword & { reason: 'created' | 'reset' };
+    } = {},
+  ): Promise<void> {
+    if (options.issued) {
+      // Страница несёт пароль в открытом виде: ни браузер, ни прокси не
+      // должны её сохранять.
+      res.setHeader('Cache-Control', 'no-store');
+    }
+    res.status(options.status ?? 200).render('layout', {
+      ...this.shell(
+        req,
+        'Админы',
+        admin,
+        'admins',
+        options.flash,
+        options.reason,
+      ),
+      page: 'admins',
+      admins: await this.admins.list(),
+      selfId: admin.id,
+      issued: options.issued ?? null,
+      error: options.error ?? null,
+      draft: {
+        email: options.draft?.email ?? '',
+        role: options.draft?.role ?? 'admin',
+        maxUserId: options.draft?.maxUserId ?? '',
+      },
+      formatDate,
+    });
+  }
+
   // ----- конкурсы ---------------------------------------------------------
 
   @Get('contests')
@@ -1542,7 +1740,7 @@ export class PanelController {
       if (!description) {
         throw new AppException(
           ErrorCode.VALIDATION_ERROR,
-          'Описание обязательно — это и есть текст анонса',
+          'Текст конкурса обязателен — его увидят подписчики',
         );
       }
       // Те же правила, что у даты отправки поста: `datetime-local` без
@@ -1553,10 +1751,14 @@ export class PanelController {
       const placesCount = draft.placesCount.trim()
         ? Number(draft.placesCount)
         : undefined;
-      if (placesCount !== undefined && !Number.isInteger(placesCount)) {
+      if (
+        placesCount !== undefined &&
+        (!Number.isInteger(placesCount) || placesCount < 0)
+      ) {
+        // До создания поста: отказ сервиса после него оставил бы пост-сироту.
         throw new AppException(
           ErrorCode.VALIDATION_ERROR,
-          'Количество мест — целое число',
+          'Количество мест — целое неотрицательное число',
         );
       }
       // Те же три проверки, что и в `ContestsService.createContest` —
@@ -1584,26 +1786,31 @@ export class PanelController {
         );
       }
 
-      // Ничего не отмечено — конкурс без анонса, участники только вручную
-      // (старое поведение). `publishAt` отдельным полем поста не становится:
+      // Каналы обязательны: конкурс всегда публикуется. `publishAt` отдельным
+      // полем поста не становится:
       // отправку анонса при открытии приёма уже делает `schedulePostIfDraft`
       // (ручное и авто-открытие, см. panel.controller/contests.service) —
       // дублировать её здесь через `scheduledAt` поста значило бы завести
       // два independent триггера одной и той же отправки.
-      let postId: string | undefined;
-      if (draft.groupIds.length > 0) {
-        const post = await this.posts.createPost({
-          text: description,
-          groupIds: draft.groupIds,
-          attachmentIds: draft.attachmentIds,
-        });
-        postId = post.id;
-      }
+      // До создания поста, по той же причине, что и проверки выше.
+      const requiredGroupIds = await this.contests.assertRequirableGroups(
+        draft.requiredGroupIds,
+      );
+      await this.contests.assertPublishChannels(draft.groupIds);
+
+      // Пост здесь — служебный носитель публикации (очередь, повторы,
+      // статусы по каналам). В «Постах» его нет: текст и картинка
+      // правятся на карточке конкурса.
+      const post = await this.posts.createPost({
+        text: description,
+        groupIds: draft.groupIds,
+        attachmentIds: draft.attachmentIds,
+      });
 
       const contest = await this.contests.createContest({
         title,
         description,
-        postId,
+        postId: post.id,
         joinButtonLabel: body.joinButtonLabel?.trim() || undefined,
         resultsButtonLabel: body.resultsButtonLabel?.trim() || undefined,
         notifyWinners: draft.notifyWinners,
@@ -1611,6 +1818,7 @@ export class PanelController {
         startsAt: publishAt,
         endsAt,
         placesCount,
+        requiredGroupIds,
       });
       res.redirect(
         `${PANEL_PREFIX}/contests/${contest.id}?flash=contest-created`,
@@ -1714,6 +1922,7 @@ export class PanelController {
       publishAt: '',
       endsAt: '',
       placesCount: '',
+      requiredGroupIds: [],
     };
   }
 
@@ -1732,6 +1941,7 @@ export class PanelController {
       publishAt: body.publishAt ?? '',
       endsAt: body.endsAt ?? '',
       placesCount: body.placesCount ?? '',
+      requiredGroupIds: asArray(body.requiredGroupIds),
     };
   }
 
@@ -1746,10 +1956,12 @@ export class PanelController {
       this.activeGroups(),
       this.mediaWithPinned(draft.attachmentIds),
     ]);
+    // Только MAX: у поста на стене VK нет кнопок, участвовать было бы не в чем.
+    const maxGroups = groups.filter((group) => group.platform === 'max');
     res.status(options.status ?? 200).render('layout', {
       ...this.shell(req, 'Новый конкурс', admin, 'contests', options.flash),
       page: 'new-contest',
-      groups,
+      maxGroups,
       media,
       draft,
       formatDate,
@@ -1768,8 +1980,19 @@ export class PanelController {
     @CurrentAdmin() admin: AdminUser,
     @Query('flash') flash?: string,
     @Query('reason') reason?: string,
+    // Только что загруженная картинка: отмечается в форме публикации сама.
+    @Query('attach') attach?: string,
   ) {
-    const contest = await this.contests.getContest(id);
+    const [contest, groups] = await Promise.all([
+      this.contests.getContest(id),
+      this.activeGroups(),
+    ]);
+    const attachedIds = [
+      ...new Set([
+        ...(contest.post?.attachments.map((a) => a.mediaAssetId) ?? []),
+        ...(attach && isUUID(attach) ? [attach] : []),
+      ]),
+    ];
     // Поле с подписями перенумеровывает места подряд и режет текст по
     // переносам строк. Для мест, заведённых через API «вразбежку» (1, 3, 5)
     // или с переносом в подписи, сохранение без единой правки молча
@@ -1798,7 +2021,6 @@ export class PanelController {
       // текущего состояния конкурса, как и остальные поля этой страницы.
       contestEditDraft: {
         title: contest.title,
-        description: contest.description,
         joinButtonLabel: contest.joinButtonLabel,
         resultsButtonLabel: contest.resultsButtonLabel,
         notifyWinners: contest.notifyWinners,
@@ -1809,7 +2031,20 @@ export class PanelController {
         endsAt: contest.endsAt
           ? utcToZoned(contest.endsAt, this.defaultTimezone())
           : '',
+        requiredGroupIds: contest.requiredGroups.map((r) => r.group.id),
       },
+      maxGroups: groups.filter((group) => group.platform === 'max'),
+      publicationMedia: await this.mediaWithPinned(attachedIds),
+      publicationAttachedIds: attachedIds,
+      mediaKindLabel,
+      deliveryColor,
+      deliveryLabel,
+      // Условия на неактивные группы: в список галочек (только активные) они
+      // не попадают, и без отдельного показа первое же сохранение формы
+      // молча сняло бы их.
+      inactiveRequired: contest.requiredGroups
+        .filter((r) => r.group.status !== 'active')
+        .map((r) => r.group),
       contestColor,
       contestLabel,
       notifyColor,
@@ -1833,13 +2068,13 @@ export class PanelController {
     @Body()
     body: {
       title?: string;
-      description?: string;
       joinButtonLabel?: string;
       resultsButtonLabel?: string;
       notifyWinners?: string;
       publishResultsInPost?: string;
       startsAt?: string;
       endsAt?: string;
+      requiredGroupIds?: string | string[];
     },
     @Res() res: Response,
   ): Promise<void> {
@@ -1857,7 +2092,6 @@ export class PanelController {
         }
         return this.contests.editContest(id, {
           title,
-          description: body.description?.trim() ?? '',
           joinButtonLabel: body.joinButtonLabel?.trim() || undefined,
           resultsButtonLabel: body.resultsButtonLabel?.trim() || undefined,
           // Та же логика отсутствующего поля, что и у создания.
@@ -1865,6 +2099,8 @@ export class PanelController {
           publishResultsInPost: body.publishResultsInPost !== undefined,
           startsAt: this.parseSchedule(body.startsAt),
           endsAt: this.parseSchedule(body.endsAt),
+          // Форма присылает весь список: ни одной галочки — условий нет.
+          requiredGroupIds: asArray(body.requiredGroupIds),
         });
       },
     );
@@ -1897,9 +2133,207 @@ export class PanelController {
             { err, contestId: id, postId: contest.postId },
             'Приём открыт, но анонс-пост отправить не удалось',
           );
+          // Не «опубликовано»: конкурс открыт, но в каналах его нет, и
+          // участвовать пока не через что. Сверка повторит отправку сама.
+          throw new AppException(
+            ErrorCode.REQUEST_ERROR,
+            `Приём открыт, но публикация не ушла: ${
+              err instanceof AppException ? err.message : 'ошибка отправки'
+            }. Повторная попытка — автоматически в течение минуты.`,
+          );
         }
       },
     );
+  }
+
+  /**
+   * Текст и картинка конкурса, а до публикации — и каналы. Лежат в посте
+   * публикации: черновик правится как черновик, опубликованное — правкой
+   * сообщений во всех каналах (вид по статусу конкурса: после розыгрыша
+   * итоги и «Узнать результаты» остаются на месте).
+   */
+  @Post('contests/:id/publication')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async editPublication(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body()
+    body: {
+      text?: string;
+      attachmentIds?: string | string[];
+      groupIds?: string | string[];
+    },
+    @Res() res: Response,
+  ): Promise<void> {
+    try {
+      const text = body.text?.trim();
+      if (!text) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Текст конкурса обязателен — его увидят подписчики',
+        );
+      }
+      const contest = await this.contests.getContest(id);
+      if (!contest.post) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'У этого конкурса нет публикации',
+        );
+      }
+      const attachmentIds = asArray(body.attachmentIds);
+      if (contest.post.status === 'draft') {
+        const groupIds = asArray(body.groupIds);
+        await this.contests.assertPublishChannels(
+          groupIds,
+          contest.post.deliveries.map((d) => d.groupId),
+        );
+        await this.posts.editDraft(contest.post.id, {
+          text,
+          groupIds,
+          attachmentIds,
+        });
+        await this.syncContestDescription(id, text);
+        res.redirect(
+          `${PANEL_PREFIX}/contests/${id}?flash=contest-published-edited`,
+        );
+        return;
+      }
+      const outcome = await this.moderation.editPublished(contest.post.id, {
+        text,
+        // У конкурса один текст. Переопределение для MAX (бывает у постов,
+        // привязанных старым способом) имеет приоритет над `text`, и без
+        // сброса правка отрапортовала бы успех, оставив в каналах старое.
+        vkTextOverride: null,
+        maxTextOverride: null,
+        attachmentIds,
+      });
+      await this.syncContestDescription(id, text);
+      res.redirect(
+        `${PANEL_PREFIX}/contests/${id}?flash=${outcomeFlash(outcome, 'edited')}`,
+      );
+    } catch (err: unknown) {
+      this.redirectContestFailure(res, id, err, 'Не удалось сохранить');
+    }
+  }
+
+  /**
+   * У конкурса один текст — текст публикации. `description` хранит его копию
+   * для REST-списка конкурсов (`listContests`); без синхронизации она навсегда
+   * осталась бы текстом времени создания.
+   */
+  private async syncContestDescription(
+    contestId: string,
+    text: string,
+  ): Promise<void> {
+    await this.prisma.contest.update({
+      where: { id: contestId },
+      data: { description: text },
+    });
+  }
+
+  /**
+   * Удаление конкурса — только пока он не разыгран (решение владельца:
+   * неопубликованный или ещё идущий). Проверки статуса и само удаление — в
+   * `ContestsService.deleteContest` под блокировкой строки; сообщения из
+   * каналов снимаются там же, колбэком.
+   *
+   * Неснятое сообщение удаление **не** останавливает: откат оставил бы
+   * открытый конкурс с анонсом, уже снятым из части каналов, а постоянный
+   * сбой (бота убрали, VK без прав на удаление, сообщение не удаляется)
+   * сделал бы конкурс неудаляемым навсегда. Такие каналы перечисляются в
+   * баннере — убрать руками; кнопка под оставшимся сообщением отвечает
+   * «конкурс не найден».
+   */
+  @Post('contests/:id/delete')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async deleteContest(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    try {
+      // Сначала база (под блокировкой, без MAX), потом каналы — см.
+      // `ContestsService.deleteContest`.
+      const { messages, uncertain } = await this.contests.deleteContest(id);
+      const failed = await this.moderation.deleteMessages(messages);
+      const leftBehind = [
+        ...uncertain.map((title) => `«${title}» — исход отправки неизвестен`),
+        ...failed.map((f) => `«${f.groupTitle}» — ${f.error}`),
+      ];
+      const reason =
+        leftBehind.length > 0
+          ? `&reason=${encodeURIComponent(
+              `Сообщение могло остаться — проверьте и удалите вручную: ${leftBehind.join('; ')}.`,
+            )}`
+          : '';
+      res.redirect(`${PANEL_PREFIX}/contests?flash=contest-deleted${reason}`);
+    } catch (err: unknown) {
+      this.redirectContestFailure(res, id, err, 'Не удалось удалить конкурс');
+    }
+  }
+
+  /**
+   * «Отправить оставшимся» для публикации конкурса — тот же `resumePost`,
+   * что у постов: страница поста-носителя теперь ведёт сюда, и без этой
+   * кнопки сбойный канал было бы не дослать.
+   */
+  @Post('contests/:id/publication/resume')
+  @UseGuards(AdminAuthGuard, CsrfGuard)
+  @RequirePermissions('contests_manage')
+  async resumePublication(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    await this.runContestAction(
+      res,
+      id,
+      `${PANEL_PREFIX}/contests/${id}?flash=resumed`,
+      async () => {
+        const contest = await this.contests.getContest(id);
+        if (!contest.post) {
+          throw new AppException(
+            ErrorCode.VALIDATION_ERROR,
+            'У этого конкурса нет публикации',
+          );
+        }
+        await this.posts.resumePost(contest.post.id);
+      },
+    );
+  }
+
+  /**
+   * Загрузка картинки для публикации конкурса. Файл только сохраняется и
+   * отмечается в форме — к конкурсу он привязывается по «Сохранить».
+   */
+  @Post('contests/:id/publication/media')
+  @UseGuards(AdminAuthGuard)
+  @RequirePermissions('contests_manage')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_FILE_BYTES },
+    }),
+    CsrfInterceptor,
+  )
+  async uploadPublicationMedia(
+    @Param('id', ParseUUIDPipe) id: string,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Res() res: Response,
+  ): Promise<void> {
+    if (!file) {
+      res.redirect(
+        `${PANEL_PREFIX}/contests/${id}?flash=contest-failed&reason=${encodeURIComponent('Файл не выбран')}`,
+      );
+      return;
+    }
+    try {
+      const asset = await this.uploadFormFile(file);
+      res.redirect(
+        `${PANEL_PREFIX}/contests/${id}?flash=uploaded&attach=${asset.id}`,
+      );
+    } catch (err: unknown) {
+      this.redirectContestFailure(res, id, err, 'Не удалось загрузить файл');
+    }
   }
 
   @Post('contests/:id/prizes')
@@ -2838,6 +3272,13 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
     message: 'Нечего было обновлять: пост нигде не опубликован',
   },
   'group-added': { kind: 'success', message: 'Сообщество подключено' },
+  'admin-edited': { kind: 'success', message: 'Админ сохранён' },
+  'admin-disabled': {
+    kind: 'success',
+    message: 'Админ отключён — войти он больше не может',
+  },
+  'admin-enabled': { kind: 'success', message: 'Админ снова может входить' },
+  'admin-failed': { kind: 'danger', message: 'Не удалось выполнить действие' },
   'group-failed': {
     kind: 'danger',
     message: 'Не удалось подключить сообщество',
@@ -2876,7 +3317,18 @@ export const FLASHES: Record<string, { kind: string; message: string }> = {
   },
   'contest-created': { kind: 'success', message: 'Конкурс создан' },
   'contest-edited': { kind: 'success', message: 'Конкурс обновлён' },
-  'contest-opened': { kind: 'success', message: 'Приём участников открыт' },
+  'contest-opened': {
+    kind: 'success',
+    message: 'Конкурс опубликован — приём участников открыт',
+  },
+  'contest-deleted': {
+    kind: 'success',
+    message: 'Конкурс удалён — из каналов и из панели',
+  },
+  'contest-published-edited': {
+    kind: 'success',
+    message: 'Текст и картинка конкурса сохранены',
+  },
   'contest-drawn': { kind: 'success', message: 'Розыгрыш проведён' },
   'prizes-saved': { kind: 'success', message: 'Призовые места сохранены' },
   'participants-added': { kind: 'success', message: 'Список обработан' },

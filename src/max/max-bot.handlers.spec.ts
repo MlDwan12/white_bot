@@ -2,6 +2,7 @@ import { Bot } from '@maxhub/max-bot-api';
 import { PinoLogger } from 'nestjs-pino';
 import { GroupsService, PublicGroup } from '../groups/groups.service';
 import { MaxAdminResolver } from './max-admin.resolver';
+import { AdminNotifier } from './admin-notifier';
 import { ContestParticipationService } from '../contests/contest-participation.service';
 import { PlatformUsersService } from '../platform-users/platform-users.service';
 import { MaxApiClient } from './max-api.client';
@@ -84,6 +85,7 @@ function setup() {
       .mockResolvedValue([{ id: 'admin-1', maxUserId: '777' }]),
   };
   const api = {
+    configured: true,
     getChat: jest.fn().mockResolvedValue({
       externalId: '500',
       title: 'Тестовый чат',
@@ -117,6 +119,7 @@ function setup() {
       prizeIdsToMark: [],
       joined: false,
     }),
+    isDrawn: jest.fn().mockResolvedValue(false),
     announcementRefresh: jest.fn().mockResolvedValue({
       text: 'Анонс',
       buttonText: 'Участвовать (5)',
@@ -141,6 +144,13 @@ function setup() {
     contests as unknown as ContestParticipationService,
     platformUsers as unknown as PlatformUsersService,
     api as unknown as MaxApiClient,
+    // Настоящий рассыльщик поверх тех же моков: тесты уведомлений о новой
+    // группе проверяют, что реально ушло админам, а не факт вызова обёртки.
+    new AdminNotifier(
+      admins as unknown as MaxAdminResolver,
+      api as unknown as MaxApiClient,
+      logger as unknown as PinoLogger,
+    ),
     logger as unknown as PinoLogger,
   );
   handlers.register();
@@ -166,6 +176,7 @@ describe('MaxBotHandlers', () => {
       {} as ContestParticipationService,
       {} as PlatformUsersService,
       {} as MaxApiClient,
+      {} as AdminNotifier,
       logger,
     );
     expect(() => handlers.register()).not.toThrow();
@@ -347,7 +358,7 @@ describe('MaxBotHandlers', () => {
 
       expect(groups.confirmMaxGroup).not.toHaveBeenCalled();
       // Still acknowledged, or the stranger's client spins forever.
-      expect(api.answerCallback).toHaveBeenCalledWith('cb-1');
+      expect(api.answerCallback).toHaveBeenCalledWith('cb-1', undefined);
     });
 
     it('acknowledges the click even when the decision can no longer be applied', async () => {
@@ -537,7 +548,9 @@ describe('MaxBotHandlers', () => {
       release();
       await first;
 
+      // Два прохода; сверка после последнего — лёгкая, только статус.
       expect(contests.announcementRefresh).toHaveBeenCalledTimes(2);
+      expect(api.editMessage).toHaveBeenCalledTimes(2);
       const lastCall = api.editMessage.mock.calls.at(-1) as [
         string,
         string,
@@ -545,6 +558,47 @@ describe('MaxBotHandlers', () => {
       ];
       // Последней ушла свежая версия — счётчик не откатился на 4.
       expect(lastCall[2].buttons[0][0].text).toBe('Участвовать (5)');
+    });
+
+    it('если розыгрыш прошёл во время перерисовки, возвращает итоги', async () => {
+      // Счётчик собран до розыгрыша, а его правка дошла после подмены
+      // кнопки: без сверки пост навсегда остался бы «Участвовать (N)» без
+      // победителей.
+      const { harness, api, contests } = setup();
+      contests.startedFromLink.mockResolvedValue({
+        text: 'ok',
+        prizeIdsToMark: [],
+        joined: true,
+      });
+      const results = {
+        text: 'Анонс\n\nПобедители:\n1. Место 1 — Иван',
+        buttonText: 'Узнать результаты',
+        payload: 'p',
+        drawn: true,
+        messageIds: ['mid.1'],
+      };
+      contests.announcementRefresh
+        .mockResolvedValueOnce({
+          text: 'Анонс',
+          buttonText: 'Участвовать (4)',
+          payload: 'p',
+          drawn: false,
+          messageIds: ['mid.1'],
+        })
+        .mockResolvedValue(results);
+      // Розыгрыш прошёл, пока шла первая правка.
+      contests.isDrawn.mockResolvedValue(true);
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      expect(api.editMessage).toHaveBeenCalledTimes(2);
+      const [, text, options] = api.editMessage.mock.calls.at(-1) as [
+        string,
+        string,
+        { buttons: { text: string }[][] },
+      ];
+      expect(text).toBe(results.text);
+      expect(options.buttons[0][0].text).toBe('Узнать результаты');
     });
 
     it('помечает места уведомлёнными после успешной отправки', async () => {
@@ -757,6 +811,70 @@ describe('MaxBotHandlers', () => {
       expect(logger.error).toHaveBeenCalled();
       expect(api.answerCallback).toHaveBeenCalledWith('cb-consent', undefined);
       expect(contests.startedFromLink).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('кнопка «Проверить подписку»', () => {
+    const CONTEST = '11111111-1111-4111-8111-111111111111';
+    const press = (
+      harness: ReturnType<typeof setup>['harness'],
+    ): Promise<void> =>
+      harness.fireAction(`contest:check:${CONTEST}`, {
+        user: { user_id: 42, first_name: 'Иван' },
+        callback: { callback_id: 'cb-check' },
+        chatId: 900,
+      });
+
+    it('подписался — сообщение со списком превращается в «вы участвуете», счётчик обновляется', async () => {
+      const { harness, api, contests } = setup();
+      contests.startedFromLink.mockResolvedValue({
+        text: 'Вы участвуете в конкурсе «Конкурс»! Итоги пришлю сюда.',
+        prizeIdsToMark: [],
+        joined: true,
+      });
+
+      await press(harness);
+
+      expect(contests.startedFromLink).toHaveBeenCalledWith(
+        CONTEST,
+        expect.objectContaining({ externalUserId: '42' }),
+      );
+      expect(api.answerCallback).toHaveBeenCalledWith('cb-check', {
+        text: 'Вы участвуете в конкурсе «Конкурс»! Итоги пришлю сюда.',
+        buttons: undefined,
+      });
+      expect(contests.announcementRefresh).toHaveBeenCalledWith(CONTEST);
+    });
+
+    it('ещё не подписан — остаётся список с той же клавиатурой, анонсы не трогаем', async () => {
+      const { harness, api, contests } = setup();
+      const buttons = [
+        [{ type: 'callback', text: 'Проверить подписку', payload: 'x' }],
+      ];
+      contests.startedFromLink.mockResolvedValue({
+        text: 'Чтобы участвовать, подпишитесь',
+        prizeIdsToMark: [],
+        joined: false,
+        buttons,
+      });
+
+      await press(harness);
+
+      expect(api.answerCallback).toHaveBeenCalledWith('cb-check', {
+        text: 'Чтобы участвовать, подпишитесь',
+        buttons,
+      });
+      expect(contests.announcementRefresh).not.toHaveBeenCalled();
+    });
+
+    it('сбой сервиса — пустой ответ на клик, кнопку можно нажать ещё раз', async () => {
+      const { harness, api, contests, logger } = setup();
+      contests.startedFromLink.mockRejectedValue(new Error('база недоступна'));
+
+      await expect(press(harness)).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalled();
+      expect(api.answerCallback).toHaveBeenCalledWith('cb-check', undefined);
     });
   });
 

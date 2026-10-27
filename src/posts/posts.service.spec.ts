@@ -63,7 +63,13 @@ function buildService() {
       groupBy: jest.fn().mockResolvedValue([]),
     },
     group: { findMany: jest.fn() },
-    mediaAsset: { count: jest.fn().mockResolvedValue(0) },
+    mediaAsset: {
+      count: jest.fn().mockResolvedValue(0),
+      // Вид файла решает ключ кэша VK (видео — `<groupId>:video`).
+      findMany: jest.fn(({ where }: { where: { id: { in: string[] } } }) =>
+        Promise.resolve(where.id.in.map((id) => ({ id, kind: 'image' }))),
+      ),
+    },
     postAttachment: {
       findMany: jest.fn().mockResolvedValue([]),
       deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
@@ -291,6 +297,25 @@ describe('PostsService', () => {
       // lost for good because the template's window is already claimed.
       await expect(
         service.publishableVkGroups(['m1', 'm2'], ['g1', 'g2', 'g3']),
+      ).resolves.toEqual(['g1']);
+    });
+
+    it('ищет кэш видео под ключом `<groupId>:video`, как загрузчик', async () => {
+      // Иначе уже загруженное видео требовало бы токен, а видео с прежним
+      // документом под голым ключом проходило бы без токена и падало в
+      // середине рассылки.
+      const { service, vkUploaderToken, prisma } = buildService();
+      vkUploaderToken.isUsable.mockResolvedValue(false);
+      prisma.mediaAsset.findMany.mockResolvedValue([
+        { id: 'v1', kind: 'video' },
+      ] as never);
+      prisma.mediaPlatformUpload.findMany.mockResolvedValue([
+        { scope: 'g1:video', mediaAssetId: 'v1' },
+        { scope: 'g2', mediaAssetId: 'v1' },
+      ]);
+
+      await expect(
+        service.publishableVkGroups(['v1'], ['g1', 'g2']),
       ).resolves.toEqual(['g1']);
     });
 
@@ -533,7 +558,9 @@ describe('PostsService', () => {
         { mediaAssetId: 'm1' },
       ]);
       // 1 asset × 1 group, already cached — nothing left to upload.
-      prisma.mediaPlatformUpload.count.mockResolvedValue(1);
+      prisma.mediaPlatformUpload.findMany.mockResolvedValue([
+        { scope: 'g1', mediaAssetId: 'm1' },
+      ]);
       vkUploaderToken.isUsable.mockResolvedValue(false);
 
       // This is the everyday case: a campaign resumed a day later, when the

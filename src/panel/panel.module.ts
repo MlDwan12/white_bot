@@ -8,6 +8,7 @@ import { ContestsModule } from '../contests/contests.module';
 import { VkModule } from '../vk/vk.module';
 import { PlatformUsersModule } from '../platform-users/platform-users.module';
 import { DirectMessagesModule } from '../direct-messages/direct-messages.module';
+import { AdminsModule } from '../admins/admins.module';
 import { PanelController } from './panel.controller';
 import { SilentRefreshMiddleware } from './silent-refresh.middleware';
 
@@ -22,6 +23,7 @@ import { SilentRefreshMiddleware } from './silent-refresh.middleware';
     VkModule,
     PlatformUsersModule,
     DirectMessagesModule,
+    AdminsModule,
   ],
   controllers: [PanelController],
   providers: [SilentRefreshMiddleware],

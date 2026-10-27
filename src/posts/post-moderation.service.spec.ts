@@ -3,6 +3,8 @@ import { ErrorCode } from '../common/error-code.enum';
 import { PrismaService } from '../prisma/prisma.service';
 import { PostSender } from './post-sender';
 import { PostsService } from './posts.service';
+import { ContestParticipationService } from '../contests/contest-participation.service';
+import { MaxApiError } from '../max/max-api.error';
 import {
   PostModerationService,
   autoDeleteDueAt,
@@ -74,13 +76,16 @@ function setup(
     error: jest.fn(),
   } as unknown as PinoLogger;
 
+  const participation = { contestButton: jest.fn().mockResolvedValue(null) };
+
   const service = new PostModerationService(
     prisma as unknown as PrismaService,
     sender as unknown as PostSender,
     posts as unknown as PostsService,
+    participation as unknown as ContestParticipationService,
     logger,
   );
-  return { service, prisma, sender, posts };
+  return { service, prisma, sender, posts, participation };
 }
 
 /** Читает `data` последнего обновления доставки. */
@@ -113,6 +118,32 @@ describe('PostModerationService.deletePublished', () => {
     );
     expect(outcome.succeeded).toBe(1);
     expect(lastUpdate(prisma).deletedAt).toBeInstanceOf(Date);
+  });
+
+  it('deleteMessages: сбой в одном канале не мешает остальным и возвращается списком', async () => {
+    const { service, sender } = setup();
+    sender.delete
+      .mockRejectedValueOnce(new MaxApiError(400, 'action.refused', 'отказ'))
+      .mockResolvedValueOnce(undefined);
+
+    const failed = await service.deleteMessages([
+      { group: { id: 'g1', title: 'A' } as never, externalMessageId: 'mid.1' },
+      { group: { id: 'g2', title: 'B' } as never, externalMessageId: 'mid.2' },
+    ]);
+
+    expect(sender.delete).toHaveBeenCalledTimes(2);
+    expect(failed).toEqual([{ groupTitle: 'A', error: 'отказ' }]);
+  });
+
+  it('404 MAX — неудача, а не «уже удалено»: так MAX отвечает и про пропавший чат', async () => {
+    const { service, sender } = setup();
+    sender.delete.mockRejectedValue(
+      new MaxApiError(404, 'chat.not-found', 'Chat not found'),
+    );
+
+    const outcome = await service.deletePublished(POST_ID);
+
+    expect(outcome.failed).toHaveLength(1);
   });
 
   it('clears the auto-delete deadline once deleted', async () => {
@@ -222,8 +253,8 @@ describe('PostModerationService.editPublished', () => {
   });
 
   it('keeps the contest button alive when editing the announcement', async () => {
-    const { service, prisma, sender } = setup();
-    prisma.post.update.mockResolvedValue({
+    const { service, prisma, sender, participation } = setup();
+    const updated = {
       id: POST_ID,
       text: 'исправленная опечатка',
       vkTextOverride: null,
@@ -231,16 +262,24 @@ describe('PostModerationService.editPublished', () => {
       autoDeleteAt: null,
       autoDeleteAfterMinutes: null,
       attachments: [],
-      contest: { id: 'c1', joinButtonLabel: 'Участвовать' },
-    });
-    prisma.contestParticipant.count.mockResolvedValue(12);
+      contest: { id: 'c1', status: 'drawn' },
+    };
+    prisma.post.update.mockResolvedValue(updated);
+    const view = {
+      contestId: 'c1',
+      label: 'Узнать результаты',
+      text: 'исправленная опечатка\n\nПобедители:\n1. Место 1 — Ivan',
+    };
+    participation.contestButton.mockResolvedValue(view);
 
     await service.editPublished(POST_ID, { text: 'исправленная опечатка' });
 
-    // В MAX клавиатура — такое же вложение: правка без неё снесла бы кнопку
-    // «Участвовать» во всех группах, и записаться стало бы негде.
+    // В MAX клавиатура — такое же вложение: правка без неё снесла бы кнопку.
+    // И вид берётся по статусу конкурса: правка после розыгрыша не должна
+    // возвращать «Участвовать» и стирать победителей.
+    expect(participation.contestButton).toHaveBeenCalledWith(updated);
     const [, , , , button] = sender.edit.mock.calls[0] as unknown[];
-    expect(button).toEqual({ contestId: 'c1', label: 'Участвовать (12)' });
+    expect(button).toEqual(view);
   });
 
   it('leaves attachments untouched when attachmentIds is not given', async () => {

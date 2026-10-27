@@ -1,0 +1,35 @@
+<%# Условие участия «подписаться на каналы». Общий для создания и правки
+    конкурса: `maxGroups` — активные MAX-группы, `selected` — отмеченные id,
+    `inactiveGroups` — уже стоящие условия на неактивные группы (показаны
+    отмеченными, чтобы сохранение формы их не снимало).
+    Только MAX: подписку проверяет MAX-бот, и лишь там, где он сам состоит. %>
+<div class="mb-3">
+  <label class="form-label">На что подписаться</label>
+  <% if (maxGroups.length === 0) { %>
+    <div class="text-secondary">Нет подключённых MAX-каналов.</div>
+  <% } else { %>
+    <% maxGroups.forEach(function (g) { %>
+      <label class="form-check">
+        <input class="form-check-input" type="checkbox" name="requiredGroupIds"
+               value="<%= g.id %>"
+               <%= selected.includes(g.id) ? 'checked' : '' %> />
+        <span class="form-check-label"><%= g.title %></span>
+      </label>
+    <% }); %>
+  <% } %>
+  <% inactiveGroups.forEach(function (g) { %>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" name="requiredGroupIds"
+             value="<%= g.id %>" checked />
+      <span class="form-check-label">
+        <%= g.title %>
+        <span class="text-secondary small">— группа не активна, пока не проверяется</span>
+      </span>
+    </label>
+  <% }); %>
+  <small class="form-hint">
+    Участвовать смогут только подписчики отмеченных каналов. При розыгрыше
+    подписка проверяется ещё раз: отписавшийся победитель выбывает, и место
+    разыгрывается заново. Ничего не отмечено — условия нет.
+  </small>
+</div>

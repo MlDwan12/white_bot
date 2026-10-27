@@ -1,5 +1,5 @@
-import { VkApiClient } from './vk-api.client';
-import { VkApiError } from './vk-api.error';
+import { VkApiClient, uploadFileName } from './vk-api.client';
+import { VK_UPLOAD_REJECTED, VkApiError } from './vk-api.error';
 
 function mockFetchOnce(response: Partial<Response>) {
   global.fetch = jest.fn().mockResolvedValue(response) as typeof fetch;
@@ -157,6 +157,77 @@ describe('VkApiClient', () => {
       expect(global.fetch).toHaveBeenCalledTimes(3);
     });
 
+    it('uploads a video through video.save -> upload, as a playable video attachment', async () => {
+      mockFetchSequence(
+        jsonResponse({
+          response: {
+            upload_url: 'https://upload.vk/video',
+            video_id: 55,
+            owner_id: -123,
+          },
+        }),
+        jsonResponse({ size: 10, video_id: 55, video_hash: 'x' }),
+      );
+      const client = new VkApiClient();
+
+      const ref = await client.uploadAttachment('token', '123', {
+        ...testAttachment('doc'),
+        kind: 'video',
+        filename: 'Запись экрана.webm',
+      });
+
+      expect(ref).toBe('video-123_55');
+      const [url, init] = (global.fetch as jest.Mock).mock.calls[0] as [
+        string,
+        { body: URLSearchParams },
+      ];
+      expect(url).toContain('video.save');
+      // Название видеозаписи видят зрители — без расширения; отдельного поста
+      // о новом видео не публикуем.
+      expect(init.body.get('name')).toBe('Запись экрана');
+      expect(init.body.get('wallpost')).toBe('0');
+    });
+
+    it('blames the uploader token, not the community, when it lacks the video right', async () => {
+      mockFetchSequence(
+        jsonResponse({
+          error: { error_code: 15, error_msg: 'Access denied' },
+        }),
+      );
+      const client = new VkApiClient();
+
+      await expect(
+        client.uploadAttachment('token', '123', {
+          ...testAttachment('doc'),
+          kind: 'video',
+        }),
+      ).rejects.toMatchObject({
+        code: VK_UPLOAD_REJECTED,
+        message: expect.stringContaining('переподключите') as string,
+      });
+    });
+
+    it('surfaces a rejected video upload instead of attaching a dead reference', async () => {
+      mockFetchSequence(
+        jsonResponse({
+          response: {
+            upload_url: 'https://upload.vk/video',
+            video_id: 55,
+            owner_id: -123,
+          },
+        }),
+        jsonResponse({}),
+      );
+      const client = new VkApiClient();
+
+      await expect(
+        client.uploadAttachment('token', '123', {
+          ...testAttachment('doc'),
+          kind: 'video',
+        }),
+      ).rejects.toMatchObject({ code: VK_UPLOAD_REJECTED });
+    });
+
     it('uploads a document through the getWallUploadServer -> upload -> docs.save flow', async () => {
       mockFetchSequence(
         jsonResponse({ response: { upload_url: 'https://upload.vk/doc' } }),
@@ -186,6 +257,53 @@ describe('VkApiClient', () => {
       ).rejects.toThrow(VkApiError);
     });
 
+    it("surfaces the upload server's own error instead of calling saveWallPhoto with nothing", async () => {
+      mockFetchSequence(
+        jsonResponse({ response: { upload_url: 'https://upload.vk/photo' } }),
+        jsonResponse({
+          error: 'ERR_UPLOAD_BAD_IMAGE_SIZE',
+          error_descr: 'image is too small',
+        }),
+      );
+      const client = new VkApiClient();
+
+      await expect(
+        client.uploadAttachment('token', '123', testAttachment('photo')),
+      ).rejects.toMatchObject({
+        code: VK_UPLOAD_REJECTED,
+        message:
+          'VK отклонил загрузку файла: ERR_UPLOAD_BAD_IMAGE_SIZE: image is too small',
+      });
+      // saveWallPhoto так и не вызван — иначе VK ответил бы «photo is undefined».
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects an upload that came back with an empty photo list', async () => {
+      mockFetchSequence(
+        jsonResponse({ response: { upload_url: 'https://upload.vk/photo' } }),
+        jsonResponse({ server: 1, photo: '[]', hash: 'h' }),
+      );
+      const client = new VkApiClient();
+
+      await expect(
+        client.uploadAttachment('token', '123', testAttachment('photo')),
+      ).rejects.toMatchObject({ code: VK_UPLOAD_REJECTED });
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects a document upload that came back without a file, before docs.save', async () => {
+      mockFetchSequence(
+        jsonResponse({ response: { upload_url: 'https://upload.vk/doc' } }),
+        jsonResponse({}),
+      );
+      const client = new VkApiClient();
+
+      await expect(
+        client.uploadAttachment('token', '123', testAttachment('doc')),
+      ).rejects.toMatchObject({ code: VK_UPLOAD_REJECTED });
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    });
+
     it('throws when VK reports no saved photo', async () => {
       mockFetchSequence(
         jsonResponse({ response: { upload_url: 'https://upload.vk/photo' } }),
@@ -211,5 +329,37 @@ describe('VkApiClient', () => {
         client.uploadAttachment('token', '123', testAttachment('doc')),
       ).rejects.toThrow(VkApiError);
     });
+  });
+
+  it('sends VK an ASCII-only file name, since its upload server drops Cyrillic ones silently', async () => {
+    mockFetchSequence(
+      jsonResponse({ response: { upload_url: 'https://upload.vk/photo' } }),
+      jsonResponse({ server: 1, photo: 'raw', hash: 'h' }),
+      jsonResponse({ response: [{ id: 1, owner_id: -123 }] }),
+    );
+    const client = new VkApiClient();
+
+    await client.uploadAttachment('token', '123', {
+      ...testAttachment('photo'),
+      filename: 'Снимок экрана от 2026-09-23 09-16-38.PNG',
+    });
+
+    const [, init] = (global.fetch as jest.Mock).mock.calls[1] as [
+      string,
+      { body: FormData },
+    ];
+    const body = init.body;
+    expect((body.get('photo') as File).name).toBe('file.png');
+  });
+});
+
+describe('uploadFileName', () => {
+  it.each([
+    ['Снимок экрана.png', 'file.png'],
+    ['отчёт.PDF', 'file.pdf'],
+    ['без расширения', 'file'],
+    ['archive.tar.gz', 'file.gz'],
+  ])('%s → %s', (original, expected) => {
+    expect(uploadFileName(original)).toBe(expected);
   });
 });

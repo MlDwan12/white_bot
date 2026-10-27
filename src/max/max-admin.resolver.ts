@@ -18,8 +18,10 @@ export class MaxAdminResolver {
 
   /** Null for anyone we don't know — callers must stay silent rather than reply. */
   async findByMaxUserId(maxUserId: number): Promise<AdminUser | null> {
-    return this.prisma.adminUser.findUnique({
-      where: { maxUserId: String(maxUserId) },
+    // Отключённый админ для бота — незнакомец: подтверждать группы из чата
+    // он не должен.
+    return this.prisma.adminUser.findFirst({
+      where: { maxUserId: String(maxUserId), disabledAt: null },
     });
   }
 
@@ -31,7 +33,7 @@ export class MaxAdminResolver {
    */
   async listNotifiableAdmins(): Promise<(AdminUser & { maxUserId: string })[]> {
     const admins = await this.prisma.adminUser.findMany({
-      where: { maxUserId: { not: null } },
+      where: { maxUserId: { not: null }, disabledAt: null },
       orderBy: { createdAt: 'asc' },
     });
     return admins as (AdminUser & { maxUserId: string })[];

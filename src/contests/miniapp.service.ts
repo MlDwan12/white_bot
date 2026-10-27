@@ -97,10 +97,29 @@ export class MiniAppService {
           ErrorCode.VALIDATION_ERROR,
           'Нужно сначала открыть диалог с ботом и подтвердить согласие на обработку персональных данных',
         );
-      default:
-        // `joined` и `already_joined`: человек в конкурсе, и правильный
-        // ответ — показать актуальное состояние, а не отказ.
+      case 'not_subscribed':
+        // Не текст бота: он отсылает к кнопке «Проверить подписку», которой
+        // здесь нет. Каналы — со ссылками, повтор — той же кнопкой участия.
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          `Чтобы участвовать, подпишитесь: ${(outcome.missingChannels ?? [])
+            .map((c) => (c.link ? `${c.title} (${c.link})` : c.title))
+            .join(', ')} — и нажмите «Участвовать» ещё раз.`,
+        );
+      case 'subscription_check_failed':
+        throw new AppException(ErrorCode.VALIDATION_ERROR, outcome.message);
+      case 'joined':
+      case 'already_joined':
+        // Человек в конкурсе, и правильный ответ — показать актуальное
+        // состояние, а не отказ.
         break;
+      default: {
+        // Новый статус отказа обязан получить свою ветку выше: молча
+        // провалиться сюда значило бы показать «вы участвуете» тому, кого в
+        // конкурсе нет. Компилятор ловит это по `never`.
+        const unhandled: never = outcome.status;
+        throw new Error(`Необработанный исход участия: ${String(unhandled)}`);
+      }
     }
 
     return this.getContest(contestId, viewer);
@@ -121,7 +140,10 @@ export class MiniAppService {
       include: {
         post: {
           include: {
-            deliveries: { where: { status: 'sent' }, select: { id: true } },
+            deliveries: {
+              where: { status: 'sent', deletedAt: null },
+              select: { id: true },
+            },
           },
         },
         prizes: { select: { id: true } },

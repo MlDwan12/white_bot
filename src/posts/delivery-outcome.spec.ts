@@ -1,4 +1,4 @@
-import { VkApiError } from '../vk/vk-api.error';
+import { VK_UPLOAD_REJECTED, VkApiError } from '../vk/vk-api.error';
 import { MaxApiError } from '../max/max-api.error';
 import { classifyDeliveryError } from './delivery-outcome';
 
@@ -57,6 +57,14 @@ describe('classifyDeliveryError', () => {
       ).not.toHaveProperty('groupProblem');
     });
 
+    it('treats a rejected file upload as final — wall.post was never reached', () => {
+      expect(
+        classifyDeliveryError(
+          new VkApiError(VK_UPLOAD_REJECTED, 'VK отклонил загрузку файла'),
+        ),
+      ).toMatchObject({ kind: 'permanent' });
+    });
+
     it('treats an unrecognised VK code as a rejection, not as retryable', () => {
       expect(
         classifyDeliveryError(new VkApiError(100, 'Bad parameter')),
@@ -98,6 +106,18 @@ describe('classifyDeliveryError', () => {
       expect(
         classifyDeliveryError(new MaxApiError(status, 'x', 'Boom')),
       ).toMatchObject({ kind: 'ambiguous' });
+    });
+
+    it('повторяет отправку, если вложение ещё обрабатывается — сообщение не создано', () => {
+      expect(
+        classifyDeliveryError(
+          new MaxApiError(
+            400,
+            'unknown',
+            'Key: errors.process.attachment.video.not.processed',
+          ),
+        ),
+      ).toMatchObject({ kind: 'retryable' });
     });
 
     it('does not retry a plain rejection', () => {

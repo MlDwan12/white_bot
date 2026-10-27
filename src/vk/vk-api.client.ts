@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { VkApiError } from './vk-api.error';
+import { VK_UPLOAD_REJECTED, VkApiError } from './vk-api.error';
 
 // Fixed explicitly rather than left to VK's default so a platform-side
 // default bump can't silently change response shapes under us.
@@ -22,10 +22,24 @@ export interface VkGroupInfo {
 }
 
 export interface VkAttachmentInput {
-  kind: 'photo' | 'doc';
+  kind: 'photo' | 'doc' | 'video';
   filename: string;
   mimeType: string;
   buffer: Buffer;
+}
+
+/**
+ * Имя файла для multipart-загрузки в VK — только ASCII. Сервер загрузки VK
+ * не справляется с кириллицей и пробелами в `filename` заголовка части:
+ * файл он не видит и отвечает `photo: "[]"` без единого слова об ошибке
+ * (прод, 23.09.2026: «Снимок экрана от … .png» падал, а на dev грузились
+ * латинские имена). Людям это имя не показывается: у фото его нет вовсе, у
+ * документа название передаётся отдельно (`title` в `docs.save`).
+ * Расширение сохраняется — по нему VK определяет тип документа.
+ */
+export function uploadFileName(original: string): string {
+  const ext = /\.[A-Za-z0-9]{1,8}$/.exec(original)?.[0] ?? '';
+  return `file${ext.toLowerCase()}`;
 }
 
 async function parseVkResponse<T>(res: globalThis.Response): Promise<T> {
@@ -108,11 +122,6 @@ export class VkApiClient {
     return { externalId: String(group.id), title: group.name };
   }
 
-  /** Posts the connection-check message to the community's own wall. */
-  async postTestMessage(token: string, externalId: string): Promise<void> {
-    await this.wallPost(token, externalId, '✅ Бот подключён');
-  }
-
   async wallPost(
     token: string,
     externalId: string,
@@ -183,9 +192,64 @@ export class VkApiClient {
     externalId: string,
     input: VkAttachmentInput,
   ): Promise<string> {
-    return input.kind === 'photo'
-      ? this.uploadPhoto(token, externalId, input)
-      : this.uploadDoc(token, externalId, input);
+    switch (input.kind) {
+      case 'photo':
+        return this.uploadPhoto(token, externalId, input);
+      case 'video':
+        return this.uploadVideo(token, externalId, input);
+      default:
+        return this.uploadDoc(token, externalId, input);
+    }
+  }
+
+  /**
+   * Видео — отдельный механизм VK, не документ: `video.save` заводит
+   * видеозапись в сообществе и отдаёт адрес загрузки, после загрузки она
+   * прикрепляется как `video<owner>_<id>` и показывается плеером. Документом
+   * `.webm`/`.mp4` уходил файлом, который стена VK не показывает.
+   *
+   * Нужно право `video` у личного токена. `wallpost: 0` — не публиковать
+   * отдельный пост о новом видео: оно выйдет вложением нашего. Название
+   * видеозаписи видят зрители, поэтому без расширения файла. VK обрабатывает
+   * видео после загрузки ещё какое-то время — пост при этом уже выходит.
+   */
+  private async uploadVideo(
+    token: string,
+    externalId: string,
+    input: VkAttachmentInput,
+  ): Promise<string> {
+    let saved: { upload_url: string; video_id: number; owner_id: number };
+    try {
+      saved = await this.call('video.save', token, {
+        group_id: externalId,
+        name: input.filename.replace(/\.[^.]+$/, '') || 'Видео',
+        wallpost: '0',
+      });
+    } catch (err: unknown) {
+      // Отказ в доступе здесь — почти наверняка личный токен, выданный до
+      // появления права `video` (23.09.2026). Код 15/7 доставка приняла бы
+      // за сломанный токен **сообщества** и пометила бы группу — а виноват
+      // токен загрузчика, и лечится он переподключением в «Группах».
+      if (err instanceof VkApiError && (err.code === 15 || err.code === 7)) {
+        throw new VkApiError(
+          VK_UPLOAD_REJECTED,
+          'Личному токену VK не хватает права на видео — переподключите его в «Группах»',
+        );
+      }
+      throw err;
+    }
+    const uploaded = await this.postFile<{ video_id?: number }>(
+      saved.upload_url,
+      'video_file',
+      input,
+    );
+    if (!uploaded.video_id) {
+      throw new VkApiError(
+        VK_UPLOAD_REJECTED,
+        `VK не принял видео при загрузке (ответ: ${JSON.stringify(uploaded).slice(0, 200)})`,
+      );
+    }
+    return `video${saved.owner_id}_${saved.video_id}`;
   }
 
   private async uploadPhoto(
@@ -203,6 +267,19 @@ export class VkApiClient {
       photo: string;
       hash: string;
     }>(upload_url, 'photo', input);
+    // Отказ сервер загрузки выражает не HTTP-статусом, а пустым `photo`
+    // (`"[]"`) или его отсутствием. Без этой проверки `photos.saveWallPhoto`
+    // получал `undefined` и отвечал «photo is undefined» — следствием, а не
+    // причиной.
+    if (!uploaded.photo || uploaded.photo === '[]') {
+      // Сам ответ — в текст ошибки: VK объясняет отказ не всегда, и тогда
+      // это единственная зацепка в статусе доставки. Секретов в нём нет
+      // (server/photo/hash — одноразовые данные загрузки).
+      throw new VkApiError(
+        VK_UPLOAD_REJECTED,
+        `VK не принял картинку при загрузке (ответ: ${JSON.stringify(uploaded).slice(0, 200)})`,
+      );
+    }
     const saved = await this.call<{ id: number; owner_id: number }[]>(
       'photos.saveWallPhoto',
       token,
@@ -230,11 +307,19 @@ export class VkApiClient {
       token,
       { group_id: externalId },
     );
-    const uploaded = await this.postFile<{ file: string }>(
+    const uploaded = await this.postFile<{ file?: string }>(
       upload_url,
       'file',
       input,
     );
+    // Тот же случай, что и у фото: без проверки `docs.save` получил бы
+    // `undefined` и ответил следствием вместо причины.
+    if (!uploaded.file) {
+      throw new VkApiError(
+        VK_UPLOAD_REJECTED,
+        'VK не принял документ при загрузке',
+      );
+    }
     const saved = await this.call<{
       doc?: { id: number; owner_id: number };
     }>('docs.save', token, { file: uploaded.file, title: input.filename });
@@ -259,7 +344,7 @@ export class VkApiClient {
       new Blob([input.buffer as unknown as ArrayBuffer], {
         type: input.mimeType,
       }),
-      input.filename,
+      uploadFileName(input.filename),
     );
     const res = await fetch(uploadUrl, {
       method: 'POST',
@@ -282,6 +367,22 @@ export class VkApiClient {
       throw new VkApiError(
         0,
         'Неожиданный формат ответа при загрузке файла в VK',
+      );
+    }
+    // Сервер загрузки сообщает об отказе полем `error` (иногда с
+    // `error_descr`) при HTTP 200 — это и есть настоящая причина, её надо
+    // донести до статуса доставки, а не потерять на следующем шаге.
+    const { error, error_descr } = body as {
+      error?: unknown;
+      error_descr?: unknown;
+    };
+    if (error) {
+      const detail = [error, error_descr]
+        .filter((part) => typeof part === 'string' && part)
+        .join(': ');
+      throw new VkApiError(
+        VK_UPLOAD_REJECTED,
+        `VK отклонил загрузку файла: ${detail || JSON.stringify(error)}`,
       );
     }
     return body as T;

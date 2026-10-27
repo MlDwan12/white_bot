@@ -34,8 +34,10 @@ const SCHEDULE_HORIZON_MS = 15 * 60_000;
 
 /**
  * A delivery still `sending` after this long belongs to a worker that died:
- * a real call is bounded by the clients' own 10s timeouts, so minutes here
- * mean nobody is coming back for it.
+ * a real call is bounded by the clients' own 10s timeouts, an attachment
+ * upload by 60s, and waiting for MAX to process a fresh video by another 60s
+ * (once per video — then it's cached), so minutes here mean nobody is coming
+ * back for it.
  */
 const STUCK_SENDING_MS = 5 * 60_000;
 
@@ -62,6 +64,7 @@ export class PostReconcilerService
   private timer?: NodeJS.Timeout;
   private initialTimer?: NodeJS.Timeout;
   private stopping = false;
+  private sweeping = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -109,9 +112,23 @@ export class PostReconcilerService
   }
 
   async runSweep(now: Date = new Date()): Promise<void> {
-    if (this.stopping) {
+    // Redis-лок живёт 30 с и не продлевается, а проход теперь бывает дольше
+    // (розыгрыш с проверкой подписки держит транзакцию до минуты): без этого
+    // следующий тик таймера запустил бы вторую сверку поверх первой.
+    // ponytail: защищает один процесс; при нескольких инстансах лок нужно
+    // продлевать по ходу прохода.
+    if (this.stopping || this.sweeping) {
       return;
     }
+    this.sweeping = true;
+    try {
+      await this.sweep(now);
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  private async sweep(now: Date): Promise<void> {
     try {
       // Inside the try on purpose: this is fired from a timer with no caller
       // to catch it, and the app installs no `unhandledRejection` handler — a

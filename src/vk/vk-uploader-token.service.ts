@@ -18,9 +18,11 @@ import { VkApiError } from './vk-api.error';
 const SINGLETON_ID = 'singleton';
 const OAUTH_BASE = 'https://oauth.vk.ru';
 const VK_API_VERSION = '5.199';
-// Phase 1 content (PLAN.md "Фазировка типов контента"): text (community
-// token, no scope needed) + photo/document wall attachments (this token).
-const SCOPE = 'wall,photos,docs';
+// Text goes with the community token (no scope needed); photo, document and
+// video wall attachments with this one. `video` added 23.09.2026 — a token
+// issued before that lacks it, and `video.save` refuses until the admin
+// re-authorises (the token lives a day anyway).
+const SCOPE = 'wall,photos,docs,video';
 // The only redirect_uri VK accepts for this app — see env.validation.ts.
 const REDIRECT_URI = 'https://oauth.vk.com/blank.html';
 // Refuse a token this close to expiry rather than risk it dying mid-upload.

@@ -6,6 +6,7 @@ import { TokenEncryptionService } from '../common/crypto/token-encryption.servic
 import { PrismaService } from '../prisma/prisma.service';
 import { Group, GroupKind, Prisma } from '../generated/prisma/client';
 import { VkApiClient } from '../vk/vk-api.client';
+import { AdminNotifier } from '../max/admin-notifier';
 import { CreateVkGroupDto } from './dto/create-vk-group.dto';
 import { maskToken } from './mask-token';
 import { VK_TOKEN_PROVIDER } from './token-provider/vk-token.provider';
@@ -15,6 +16,13 @@ import type { VkTokenProvider } from './token-provider/vk-token.provider';
 function isUniqueConstraintViolation(err: unknown): boolean {
   return (
     err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002'
+  );
+}
+
+/** Row still referenced elsewhere (FK `ON DELETE RESTRICT`). */
+function isForeignKeyViolation(err: unknown): boolean {
+  return (
+    err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2003'
   );
 }
 
@@ -36,6 +44,7 @@ export class GroupsService {
     private readonly prisma: PrismaService,
     private readonly vkApiClient: VkApiClient,
     private readonly tokenEncryption: TokenEncryptionService,
+    private readonly notifier: AdminNotifier,
     private readonly logger: PinoLogger,
     @Inject(VK_TOKEN_PROVIDER)
     private readonly vkTokenProvider: VkTokenProvider,
@@ -43,18 +52,20 @@ export class GroupsService {
     this.logger.setContext(GroupsService.name);
   }
 
-  async createVkGroup(
-    dto: CreateVkGroupDto,
-  ): Promise<PublicGroup & { testMessageSent: boolean }> {
+  async createVkGroup(dto: CreateVkGroupDto): Promise<PublicGroup> {
     const pastedToken = this.vkTokenProvider.resolveToken({
       pastedToken: dto.token,
     });
 
     const info = await this.resolveVkGroupInfoOrThrow(pastedToken);
-    const testMessageSent = await this.tryPostVkTestMessage(
-      pastedToken,
-      info.externalId,
-    );
+    // Эта же форма обновляет токен у уже подключённого сообщества — тогда
+    // «подключено» было бы неправдой.
+    const previous = await this.prisma.group.findUnique({
+      where: {
+        platform_externalId: { platform: 'vk', externalId: info.externalId },
+      },
+      select: { status: true },
+    });
 
     const accessTokenEncrypted = this.tokenEncryption.encrypt(pastedToken);
     const tokenMask = maskToken(pastedToken);
@@ -65,7 +76,17 @@ export class GroupsService {
       dto.tags,
     );
 
-    return { ...this.toPublicGroup(group), testMessageSent };
+    // Подтверждение — только админам, в лс: тестовый пост на стене
+    // сообщества увидели бы все подписчики. Не ждём: рассылка идёт по
+    // админам по очереди, и тормозящий MAX задерживал бы ответ панели, а
+    // `notifyAll` сам не бросает.
+    void this.notifier.notifyAll(
+      previous?.status === 'active'
+        ? `Токен VK-сообщества «${group.title}» обновлён.`
+        : `VK-сообщество «${group.title}» подключено.`,
+    );
+
+    return this.toPublicGroup(group);
   }
 
   /**
@@ -311,10 +332,24 @@ export class GroupsService {
   async rejectMaxGroup(id: string): Promise<void> {
     const existing = await this.findByIdOrThrow(id);
     this.assertPendingMax(existing);
-    // A rejected draft never had a real connection or delivery history, so
+    // A fresh draft never had a real connection or delivery history, so
     // there's nothing worth a soft-delete audit trail for — unlike an
-    // active group being deactivated.
-    await this.prisma.group.delete({ where: { id } });
+    // active group being deactivated. A draft can also be a *returning*
+    // group (bot re-added after removal) that still carries history —
+    // deliveries, a contest's subscription condition — and those rows pin
+    // it: the delete then fails on a foreign key, and the rejection falls
+    // back to the same soft-delete a deactivation uses.
+    try {
+      await this.prisma.group.delete({ where: { id } });
+    } catch (err: unknown) {
+      if (!isForeignKeyViolation(err)) {
+        throw err;
+      }
+      await this.prisma.group.update({
+        where: { id },
+        data: { status: 'removed' },
+      });
+    }
   }
 
   private assertPendingMax(group: Group): void {
@@ -335,23 +370,6 @@ export class GroupsService {
         ErrorCode.VALIDATION_ERROR,
         `Не удалось проверить токен VK: ${message}`,
       );
-    }
-  }
-
-  /** Best-effort: a failed test post shouldn't block connecting a group whose token already checked out via groups.getById. */
-  private async tryPostVkTestMessage(
-    pastedToken: string,
-    externalId: string,
-  ): Promise<boolean> {
-    try {
-      await this.vkApiClient.postTestMessage(pastedToken, externalId);
-      return true;
-    } catch (err: unknown) {
-      this.logger.warn(
-        { err, externalId },
-        'Тестовое сообщение при подключении VK-группы не отправлено',
-      );
-      return false;
     }
   }
 
