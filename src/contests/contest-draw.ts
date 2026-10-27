@@ -140,10 +140,13 @@ export function drawWinners({
   const pool = [...participants].filter((id) => !forcedSeen.has(id)).sort();
   const openPrizes = prizes.filter((p) => !p.forcedWinnerParticipantId);
 
-  if (pool.length < openPrizes.length) {
+  // Участников меньше, чем мест, — разыгрываем между теми, кто есть:
+  // места по возрастанию, лишние остаются пустыми. Отказ — только когда
+  // разыгрывать некого вовсе (решение пользователя, 27.10.2026).
+  if (pool.length === 0 && openPrizes.length === prizes.length) {
     throw new ContestDrawError(
       'NOT_ENOUGH_PARTICIPANTS',
-      `Участников (${pool.length}) меньше, чем разыгрываемых мест (${openPrizes.length})`,
+      'Нет ни одного участника',
     );
   }
 
@@ -152,23 +155,31 @@ export function drawWinners({
   // независимо от того, в каком порядке места пришли из базы.
   const ordered = [...prizes].sort((a, b) => a.place - b.place);
 
-  return ordered.map((prize) => {
+  return ordered.flatMap((prize): DrawAssignment[] => {
     const forced = prize.forcedWinnerParticipantId;
     if (forced) {
-      return {
-        prizeId: prize.id,
-        place: prize.place,
-        participantId: forced,
-        isForced: true,
-      };
+      return [
+        {
+          prizeId: prize.id,
+          place: prize.place,
+          participantId: forced,
+          isForced: true,
+        },
+      ];
+    }
+    if (pool.length === 0) {
+      // Пул кончился — место остаётся без победителя.
+      return [];
     }
     const index = random.nextInt(pool.length);
     const [winner] = pool.splice(index, 1);
-    return {
-      prizeId: prize.id,
-      place: prize.place,
-      participantId: winner,
-      isForced: false,
-    };
+    return [
+      {
+        prizeId: prize.id,
+        place: prize.place,
+        participantId: winner,
+        isForced: false,
+      },
+    ];
   });
 }

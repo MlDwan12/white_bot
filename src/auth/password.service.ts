@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { randomBytes } from 'node:crypto';
 import { hash, verify } from '@node-rs/argon2';
 
 /**
@@ -20,6 +21,15 @@ const OPTIONS = {
   timeCost: 2,
   parallelism: 1,
 };
+
+/**
+ * Пароль не задаётся руками, а генерируется: набранный человеком почти
+ * наверняка слабее и уже где-то используется. Одно место — для панели и для
+ * `seed-admin`.
+ */
+export function generatePassword(): string {
+  return randomBytes(18).toString('base64url');
+}
 
 @Injectable()
 export class PasswordService {

@@ -12,6 +12,7 @@ import { PostsService } from './posts.service';
 import { PostTemplatesService } from './post-templates.service';
 import { PostModerationService } from './post-moderation.service';
 import { ContestsService } from '../contests/contests.service';
+import { AuditService } from '../audit/audit.service';
 
 const SWEEP_INTERVAL_MS = 60_000;
 
@@ -72,6 +73,7 @@ export class PostReconcilerService
     private readonly templates: PostTemplatesService,
     private readonly moderation: PostModerationService,
     private readonly contests: ContestsService,
+    private readonly audit: AuditService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly logger: PinoLogger,
   ) {
@@ -187,9 +189,28 @@ export class PostReconcilerService
             );
           }
         }
-        await this.contests.drawDueContests(now);
+        await this.contests.warnEmptyEndingContests(now);
+        // Без ожидания: розыгрыш с условием подписки ходит в MAX и держал бы
+        // остальную сверку до минуты. Повтор, пока идёт прошлый проход, —
+        // пустой (см. `drawDueContests`).
+        void this.contests
+          .drawDueContests(now)
+          .catch((err: unknown) =>
+            this.logger.error(
+              { err },
+              'Не удалось провести розыгрыши по датам',
+            ),
+          );
       } catch (err: unknown) {
         this.logger.error({ err }, 'Не удалось обработать конкурсы по датам');
+      }
+      // Журнал действий — по сроку хранения (AUDIT_RETENTION_DAYS). Удаление
+      // по индексу `at`, на пустом диапазоне ничего не стоит — поэтому каждый
+      // проход, а не отдельный суточный таймер.
+      try {
+        await this.audit.purgeExpired(now);
+      } catch (err: unknown) {
+        this.logger.error({ err }, 'Не удалось очистить старые записи журнала');
       }
     } catch (err: unknown) {
       // Never rethrow: this runs on a timer with nobody to catch it, and one

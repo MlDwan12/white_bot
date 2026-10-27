@@ -3,6 +3,7 @@ import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { LoggerModule } from 'nestjs-pino';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { AuditApiModule, AuditModule } from './audit/audit.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { envValidationSchema } from './config/env.validation';
@@ -33,6 +34,7 @@ import { buildPinoConfig } from './logger/pino-logger.config';
       useFactory: buildPinoConfig,
     }),
     PrismaModule,
+    AuditModule,
     VkModule,
     GroupsModule,
     QueueModule,
@@ -43,6 +45,7 @@ import { buildPinoConfig } from './logger/pino-logger.config';
     DirectMessagesModule,
     AuthModule,
     PanelModule,
+    AuditApiModule,
     // Ограничитель нужен прежде всего форме входа: argon2 намеренно
     // медленный, и без него вход — это и перебор паролей, и нагрузка.
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),

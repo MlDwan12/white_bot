@@ -57,12 +57,12 @@
                   </form>
                 </td>
                 <td class="text-end text-nowrap">
+                  <% if (a.id !== selfId) { %>
                   <form method="post" action="/panel/admins/<%= a.id %>/reset-password" class="d-inline m-0"
                         onsubmit="return confirm('Выдать новый пароль? Старый перестанет работать, все входы этого админа завершатся.')">
                     <input type="hidden" name="_csrf" value="<%= csrfToken %>" />
                     <button class="btn btn-sm" type="submit">Новый пароль</button>
                   </form>
-                  <% if (a.id !== selfId) { %>
                     <% if (a.disabledAt) { %>
                       <form method="post" action="/panel/admins/<%= a.id %>/enable" class="d-inline m-0">
                         <input type="hidden" name="_csrf" value="<%= csrfToken %>" />

@@ -121,14 +121,35 @@ describe('drawWinners', () => {
     expect(result.slice(1).every((r) => !r.isForced)).toBe(true);
   });
 
-  it('refuses a draw with fewer participants than open places', () => {
+  it('участников меньше, чем мест, — разыгрывает между теми, кто есть: верхние места, остальные пустые', () => {
+    const result = drawWinners({
+      participantIds: participants(2),
+      prizes: [prize(3), prize(1), prize(2)],
+      seed: SEED_A,
+    });
+
+    expect(result.map((r) => r.place)).toEqual([1, 2]);
+    expect(new Set(result.map((r) => r.participantId)).size).toBe(2);
+  });
+
+  it('ни одного участника — отказ (конкурс отменит сверка)', () => {
     expect(() =>
+      drawWinners({
+        participantIds: [],
+        prizes: [prize(1), prize(2)],
+        seed: SEED_A,
+      }),
+    ).toThrow(ContestDrawError);
+  });
+
+  it('частичный розыгрыш воспроизводим по сиду', () => {
+    const run = () =>
       drawWinners({
         participantIds: participants(2),
         prizes: [prize(1), prize(2), prize(3)],
         seed: SEED_A,
-      }),
-    ).toThrow(ContestDrawError);
+      });
+    expect(run()).toEqual(run());
   });
 
   it('counts forced places as filled when checking participant count', () => {

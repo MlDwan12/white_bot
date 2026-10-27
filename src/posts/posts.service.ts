@@ -1,4 +1,5 @@
 import { vkUploadScope } from './attachment-uploader';
+import { AuditService, changed, postSnippet } from '../audit/audit.service';
 import { Injectable } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -79,6 +80,7 @@ export class PostsService {
     private readonly prisma: PrismaService,
     @InjectQueue(POST_DELIVERY_QUEUE) private readonly queue: Queue,
     private readonly vkUploaderToken: VkUploaderTokenService,
+    private readonly audit: AuditService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(PostsService.name);
@@ -255,6 +257,19 @@ export class PostsService {
     // lost would fire against a post still marked `draft`. (Observed for real
     // in Step 6a: a failing `add` left this post recoverable, and the
     // reconciler delivered it on the next start.)
+    // В журнал — сразу после фиксации статуса: если постановка в очередь
+    // упадёт, пост всё равно уйдёт (его подхватит сверка), и запись о том,
+    // кто его отправил, терять нельзя.
+    await this.audit.record({
+      action: 'post.send',
+      entityType: 'post',
+      entityId: id,
+      summary:
+        updated.scheduledAt && updated.scheduledAt > now
+          ? `Запланировал пост «${postSnippet(updated.text)}»`
+          : `Отправил пост «${postSnippet(updated.text)}»`,
+      details: { scheduledAt: updated.scheduledAt?.toISOString() ?? null },
+    });
     await this.enqueueDispatch(updated, now);
     return updated;
   }
@@ -306,11 +321,21 @@ export class PostsService {
     const attachmentIds = input.attachmentIds ?? [];
     await this.assertAttachmentsUsable(attachmentIds);
 
-    const existingDeliveries = await this.prisma.postDelivery.findMany({
-      where: { postId: id },
-      select: { groupId: true },
-    });
+    const [existingDeliveries, existingAttachments] = await Promise.all([
+      this.prisma.postDelivery.findMany({
+        where: { postId: id },
+        select: { groupId: true },
+      }),
+      this.prisma.postAttachment.findMany({
+        where: { postId: id },
+        orderBy: { position: 'asc' },
+        select: { mediaAssetId: true },
+      }),
+    ]);
     const existingGroupIds = existingDeliveries.map((d) => d.groupId);
+    const existingAttachmentIds = existingAttachments.map(
+      (a) => a.mediaAssetId,
+    );
     const toRemove = existingGroupIds.filter((g) => !groupIds.includes(g));
     const toAdd = groupIds.filter((g) => !existingGroupIds.includes(g));
 
@@ -342,6 +367,32 @@ export class PostsService {
       }),
     ]);
 
+    const before = {
+      text: post.text,
+      vkTextOverride: post.vkTextOverride,
+      maxTextOverride: post.maxTextOverride,
+      scheduledAt: post.scheduledAt?.toISOString() ?? null,
+      groupIds: [...existingGroupIds].sort(),
+      attachmentIds: existingAttachmentIds,
+    };
+    const after = {
+      text: input.text,
+      vkTextOverride: input.vkTextOverride || null,
+      maxTextOverride: input.maxTextOverride || null,
+      scheduledAt: input.scheduledAt?.toISOString() ?? null,
+      groupIds: [...groupIds].sort(),
+      attachmentIds,
+    };
+    // Сохранение формы без правки — не действие.
+    if (changed(before, after)) {
+      await this.audit.record({
+        action: 'post.edit_draft',
+        entityType: 'post',
+        entityId: id,
+        summary: `Изменил черновик поста «${postSnippet(input.text)}»`,
+        details: { before, after },
+      });
+    }
     return this.findOrThrow(id);
   }
 
@@ -393,7 +444,16 @@ export class PostsService {
    * job that runs before the queue is drained finds a non-pending row and
    * skips. Removing the queued jobs as well only makes it quicker.
    */
-  async stopPost(id: string): Promise<Post> {
+  async stopPost(
+    id: string,
+    /**
+     * Зачем остановлено: вручную или ради правки опубликованного посреди
+     * рассылки. Стоп пишется в журнал всегда — после него оставшиеся
+     * доставки ждут ручного «отправить оставшимся», и кто его вызвал, должно
+     * быть видно, даже если сама правка потом сорвалась.
+     */
+    reason: 'manual' | 'edit' = 'manual',
+  ): Promise<Post> {
     const post = await this.findOrThrow(id);
     if (post.status !== 'sending' && post.status !== 'scheduled') {
       throw new AppException(
@@ -413,6 +473,16 @@ export class PostsService {
       }),
     ]);
 
+    await this.audit.record({
+      action: 'post.stop',
+      entityType: 'post',
+      entityId: id,
+      summary:
+        reason === 'edit'
+          ? `Остановил рассылку поста «${postSnippet(post.text)}» для правки опубликованного — оставшимся дослать вручную`
+          : `Остановил рассылку поста «${postSnippet(post.text)}»`,
+      details: { reason },
+    });
     await this.removeQueuedJobsForPost(id);
     return this.finalizeIfComplete(id);
   }
@@ -457,6 +527,12 @@ export class PostsService {
       }),
     ]);
 
+    await this.audit.record({
+      action: 'post.resume',
+      entityType: 'post',
+      entityId: id,
+      summary: `Дослал пост «${postSnippet(post.text)}» в оставшиеся каналы: ${resumable.length}`,
+    });
     await this.enqueueDispatch({ ...post, scheduledAt: null });
     return this.findOrThrow(id);
   }

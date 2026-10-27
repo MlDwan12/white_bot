@@ -1,10 +1,10 @@
-import { randomBytes } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
+import { AuditService, changed } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AdminRole, AdminUser, Prisma } from '../generated/prisma/client';
-import { PasswordService } from '../auth/password.service';
+import { generatePassword, PasswordService } from '../auth/password.service';
 import { SessionService } from '../auth/session.service';
 import { isValidAdminEmail, normalizeAdminEmail } from '../auth/admin-email';
 
@@ -16,6 +16,8 @@ export interface AdminSummary {
   maxUserId: string | null;
   createdAt: Date;
   disabledAt: Date | null;
+  /** Последний вход или обновление сессии — для экрана «Админы». */
+  lastSeenAt: Date | null;
 }
 
 export interface IssuedPassword {
@@ -41,6 +43,7 @@ export class AdminsService {
     private readonly prisma: PrismaService,
     private readonly passwords: PasswordService,
     private readonly sessions: SessionService,
+    private readonly audit: AuditService,
   ) {}
 
   async list(): Promise<AdminSummary[]> {
@@ -75,6 +78,12 @@ export class AdminsService {
           passwordHash: await this.passwords.hash(password),
           extraPermissions: [],
         },
+      });
+      await this.audit.record({
+        action: 'admin.create',
+        entityType: 'admin',
+        entityId: admin.id,
+        summary: `Добавил админа ${admin.email} (${roleLabel(admin.role)})`,
       });
       return { admin: toSummary(admin), password };
     } catch (err: unknown) {
@@ -111,6 +120,24 @@ export class AdminsService {
           data: { role, maxUserId },
         });
       });
+      // Сохранение без правки — не действие.
+      if (
+        changed(
+          { role: target.role, maxUserId: target.maxUserId },
+          { role: admin.role, maxUserId: admin.maxUserId },
+        )
+      ) {
+        await this.audit.record({
+          action: 'admin.edit',
+          entityType: 'admin',
+          entityId: id,
+          summary: `Изменил админа ${admin.email}: ${roleLabel(admin.role)}${admin.maxUserId ? ', MAX привязан' : ''}`,
+          details: {
+            before: { role: target.role, maxUserId: target.maxUserId },
+            after: { role: admin.role, maxUserId: admin.maxUserId },
+          },
+        });
+      }
       return toSummary(admin);
     } catch (err: unknown) {
       throw uniqueToValidation(err);
@@ -118,14 +145,37 @@ export class AdminsService {
   }
 
   /** Новый пароль вместо забытого; старые сессии гаснут — старым паролем уже никто не сидит. */
-  async resetPassword(id: string): Promise<IssuedPassword> {
+  async resetPassword(id: string, actorId: string): Promise<IssuedPassword> {
     await this.require(id);
+    // Себе — нельзя: сброс гасит все входы и токены, и сбросивший вылетел бы
+    // из панели, не увидев новый пароль (единственный developer — насовсем).
+    if (id === actorId) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Себе пароль сбрасывает другой developer',
+      );
+    }
     const password = generatePassword();
     const admin = await this.prisma.adminUser.update({
       where: { id },
-      data: { passwordHash: await this.passwords.hash(password) },
+      data: {
+        passwordHash: await this.passwords.hash(password),
+        // Выданные до сброса access-токены перестают приниматься сразу.
+        passwordChangedAt: new Date(),
+      },
     });
-    await this.sessions.revokeAll(id);
+    // Сессии гаснут сразу, без ожидания записи журнала; журнал — в finally,
+    // чтобы сбой гашения его не терял.
+    try {
+      await this.sessions.revokeAll(id);
+    } finally {
+      await this.audit.record({
+        action: 'admin.reset_password',
+        entityType: 'admin',
+        entityId: id,
+        summary: `Выдал новый пароль ${admin.email}`,
+      });
+    }
     return { admin: toSummary(admin), password };
   }
 
@@ -145,24 +195,54 @@ export class AdminsService {
     if (target.disabledAt) {
       return toSummary(target);
     }
-    const admin = await this.prisma.$transaction(async (tx) => {
+    // Условием «ещё не отключён»: двойной клик иначе дал бы две записи в
+    // журнале — проверка выше прочитана до записи.
+    const didDisable = await this.prisma.$transaction(async (tx) => {
       if (target.role === 'developer') {
         await this.assertAnotherActiveDeveloper(tx, target.id);
       }
-      return tx.adminUser.update({
-        where: { id },
+      const { count } = await tx.adminUser.updateMany({
+        where: { id, disabledAt: null },
         data: { disabledAt: new Date() },
       });
+      return count > 0;
     });
-    await this.sessions.revokeAll(id);
+    const admin = await this.require(id);
+    if (!didDisable) {
+      return toSummary(admin);
+    }
+    try {
+      await this.sessions.revokeAll(id);
+    } finally {
+      await this.audit.record({
+        action: 'admin.disable',
+        entityType: 'admin',
+        entityId: id,
+        summary: `Отключил админа ${admin.email}`,
+      });
+    }
     return toSummary(admin);
   }
 
   async enable(id: string): Promise<AdminSummary> {
-    await this.require(id);
-    const admin = await this.prisma.adminUser.update({
-      where: { id },
+    const target = await this.require(id);
+    // Включение включённого — не действие (как у `disable`).
+    if (!target.disabledAt) {
+      return toSummary(target);
+    }
+    const { count } = await this.prisma.adminUser.updateMany({
+      where: { id, disabledAt: { not: null } },
       data: { disabledAt: null },
+    });
+    const admin = await this.require(id);
+    if (count === 0) {
+      return toSummary(admin);
+    }
+    await this.audit.record({
+      action: 'admin.enable',
+      entityType: 'admin',
+      entityId: id,
+      summary: `Включил админа ${admin.email}`,
     });
     return toSummary(admin);
   }
@@ -208,16 +288,8 @@ function toSummary(admin: AdminUser): AdminSummary {
     maxUserId: admin.maxUserId,
     createdAt: admin.createdAt,
     disabledAt: admin.disabledAt,
+    lastSeenAt: admin.lastSeenAt,
   };
-}
-
-/**
- * Пароль не задаётся руками, а генерируется: набранный человеком почти
- * наверняка слабее и уже где-то используется. Та же длина, что у
- * `seed-admin`.
- */
-function generatePassword(): string {
-  return randomBytes(18).toString('base64url');
 }
 
 function parseRole(role: unknown): AdminRole {
@@ -260,4 +332,8 @@ function uniqueToValidation(err: unknown): unknown {
     );
   }
   return err;
+}
+
+function roleLabel(role: AdminRole): string {
+  return role === 'developer' ? 'разработчик' : 'админ';
 }

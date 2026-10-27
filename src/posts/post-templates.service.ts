@@ -4,8 +4,9 @@ import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { PrismaService } from '../prisma/prisma.service';
-import { GroupStatus, Post } from '../generated/prisma/client';
+import { GroupStatus, Post, Prisma } from '../generated/prisma/client';
 import { PostsService } from './posts.service';
+import { AuditService, changed, postSnippet } from '../audit/audit.service';
 import { assertValidRecurrence, nextRunAfter } from './recurrence';
 
 /** Occurrences returned by one `listOccurrences` call. */
@@ -125,6 +126,7 @@ export class PostTemplatesService {
     private readonly prisma: PrismaService,
     private readonly posts: PostsService,
     config: ConfigService,
+    private readonly audit: AuditService,
     private readonly logger: PinoLogger,
   ) {
     this.defaultTimezone = config.getOrThrow<string>('DEFAULT_TIMEZONE');
@@ -144,7 +146,7 @@ export class PostTemplatesService {
     // template that breaks the limit breaks every future occurrence.
     await this.posts.assertAttachmentsUsable(attachmentIds);
 
-    return this.prisma.post.create({
+    const created = await this.prisma.post.create({
       data: {
         text: input.text,
         vkTextOverride: input.vkTextOverride,
@@ -164,6 +166,13 @@ export class PostTemplatesService {
         },
       },
     });
+    await this.audit.record({
+      action: 'template.create',
+      entityType: 'template',
+      entityId: created.id,
+      summary: `Создал повторяющийся пост «${postSnippet(created.text)}» (${created.recurrenceRule})`,
+    });
+    return created;
   }
 
   /** Edits affect future firings only; already published occurrences are untouched. */
@@ -237,10 +246,64 @@ export class PostTemplatesService {
       },
     });
 
-    if (!groupIds && !attachmentIds) {
-      return updateTemplateRow;
-    }
+    // Прежние списки — для журнала, только если их меняют.
+    const [previousGroupIds, previousAttachmentIds] = await Promise.all([
+      groupIds
+        ? this.prisma.postTemplateTarget
+            .findMany({ where: { postId: id }, select: { groupId: true } })
+            .then((rows) => rows.map((r) => r.groupId))
+        : undefined,
+      attachmentIds
+        ? this.prisma.postAttachment
+            .findMany({
+              where: { postId: id },
+              orderBy: { position: 'asc' },
+              select: { mediaAssetId: true },
+            })
+            .then((rows) => rows.map((r) => r.mediaAssetId))
+        : undefined,
+    ]);
 
+    const updated =
+      !groupIds && !attachmentIds
+        ? await updateTemplateRow
+        : await this.replaceTemplateLists(
+            id,
+            updateTemplateRow,
+            groupIds,
+            attachmentIds,
+          );
+
+    const before = {
+      ...templateFields(template, this.defaultTimezone),
+      ...(groupIds ? { groupIds: [...previousGroupIds!].sort() } : {}),
+      ...(attachmentIds ? { attachmentIds: previousAttachmentIds } : {}),
+    };
+    const after = {
+      ...templateFields(updated, this.defaultTimezone),
+      ...(groupIds ? { groupIds: [...groupIds].sort() } : {}),
+      ...(attachmentIds ? { attachmentIds } : {}),
+    };
+    // Сохранение формы без правки — не действие. Раньше правка без списков
+    // выходила отсюда раньше и в журнал не попадала вовсе.
+    if (changed(before, after)) {
+      await this.audit.record({
+        action: 'template.edit',
+        entityType: 'template',
+        entityId: id,
+        summary: `Изменил повторяющийся пост «${postSnippet(updated.text)}»`,
+        details: { before, after },
+      });
+    }
+    return updated;
+  }
+
+  private async replaceTemplateLists(
+    id: string,
+    updateTemplateRow: Prisma.PrismaPromise<Post>,
+    groupIds: string[] | undefined,
+    attachmentIds: string[] | undefined,
+  ): Promise<Post> {
     // Targets and attachments are replaced wholesale (they are what the admin
     // sees and edits, and the rows carry no state worth diffing) — but in the
     // *same* transaction as the template row. Committed separately, a failing
@@ -295,7 +358,7 @@ export class PostTemplatesService {
     const resuming =
       !paused && (template.templatePaused || !template.nextRunAt);
     const timezone = template.timezone ?? this.defaultTimezone;
-    return this.prisma.post.update({
+    const updated = await this.prisma.post.update({
       where: { id },
       data: {
         templatePaused: paused,
@@ -311,6 +374,16 @@ export class PostTemplatesService {
           : {}),
       },
     });
+    // Повторное нажатие той же кнопки — не действие.
+    if (paused !== template.templatePaused || resuming) {
+      await this.audit.record({
+        action: paused ? 'template.pause' : 'template.resume',
+        entityType: 'template',
+        entityId: id,
+        summary: `${paused ? 'Поставил на паузу' : 'Возобновил'} повторяющийся пост «${postSnippet(updated.text)}»`,
+      });
+    }
+    return updated;
   }
 
   /** Fires every template whose time has come. Called by the reconciler. */
@@ -748,4 +821,15 @@ export class PostTemplatesService {
     }
     return template;
   }
+}
+
+/** Поля шаблона для «было → стало» в журнале. */
+function templateFields(template: Post, defaultTimezone: string) {
+  return {
+    text: template.text,
+    vkTextOverride: template.vkTextOverride,
+    maxTextOverride: template.maxTextOverride,
+    recurrenceRule: template.recurrenceRule,
+    timezone: template.timezone ?? defaultTimezone,
+  };
 }

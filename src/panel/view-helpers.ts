@@ -47,15 +47,20 @@ export function statusColor(status: PostStatus): string {
  * значение — то же, что у проверки конфига.
  */
 export function formatDate(value: Date): string {
-  return new Intl.DateTimeFormat('ru-RU', {
+  // Один форматтер на процесс, а не на вызов; создаётся при первом вызове —
+  // к этому времени конфиг уже загружен.
+  dateFormat ??= new Intl.DateTimeFormat('ru-RU', {
     day: '2-digit',
     month: '2-digit',
     year: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
     timeZone: process.env.DEFAULT_TIMEZONE || 'Europe/Moscow',
-  }).format(value);
+  });
+  return dateFormat.format(value);
 }
+
+let dateFormat: Intl.DateTimeFormat | undefined;
 
 /**
  * Состояние доставки для человека. Отдельно от статуса в базе, потому что
@@ -128,12 +133,14 @@ const CONTEST_LABELS: Record<ContestStatus, string> = {
   draft: 'черновик',
   open: 'идёт приём',
   drawn: 'разыгран',
+  cancelled: 'отменён',
 };
 
 const CONTEST_COLORS: Record<ContestStatus, string> = {
   draft: 'secondary',
   open: 'green',
   drawn: 'blue',
+  cancelled: 'secondary',
 };
 
 export function contestLabel(status: ContestStatus): string {

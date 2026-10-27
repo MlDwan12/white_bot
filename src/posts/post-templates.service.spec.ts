@@ -60,8 +60,15 @@ function setup() {
       create: jest.fn().mockResolvedValue({ id: 'occ-1' }),
       update: jest
         .fn()
+        // `undefined` — «не трогать», как у настоящей Prisma.
         .mockImplementation(({ data }: { data: object }) =>
-          Promise.resolve(template(data as Partial<Post>)),
+          Promise.resolve(
+            template(
+              Object.fromEntries(
+                Object.entries(data).filter(([, v]) => v !== undefined),
+              ) as Partial<Post>,
+            ),
+          ),
         ),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
@@ -127,10 +134,12 @@ function setup() {
     error: jest.fn(),
   };
 
+  const audit = { record: jest.fn(), purgeExpired: jest.fn() };
   const service = new PostTemplatesService(
     prisma as unknown as PrismaService,
     posts as unknown as PostsService,
     config,
+    audit as never,
     logger as unknown as PinoLogger,
   );
   /** Sets what the template read returns, for both shapes at once. */
@@ -148,7 +157,7 @@ function setup() {
     prisma.post.findMany.mockResolvedValue([templateRow.current]);
   };
 
-  return { service, prisma, posts, logger, given };
+  return { service, prisma, posts, logger, given, audit };
 }
 
 /** An active target row as the include shape returns it. */
@@ -645,6 +654,23 @@ describe('PostTemplatesService', () => {
   });
 
   describe('updateTemplate', () => {
+    it('правка только текста — в журнале (раньше выходила раньше записи), без правки — нет', async () => {
+      const { service, prisma, audit } = setup();
+      prisma.post.findUnique.mockResolvedValue(template());
+
+      await service.updateTemplate('tpl-1', { text: 'повторяющийся текст' });
+      expect(audit.record).not.toHaveBeenCalled();
+
+      await service.updateTemplate('tpl-1', { text: 'другой текст' });
+      const entry = callArg<{
+        action: string;
+        details: { before: { text: string }; after: { text: string } };
+      }>(audit.record, 0, 0);
+      expect(entry.action).toBe('template.edit');
+      expect(entry.details.before.text).toBe('повторяющийся текст');
+      expect(entry.details.after.text).toBe('другой текст');
+    });
+
     it('rejects blank text but lets an edit without text through', async () => {
       const { service, prisma } = setup();
 
@@ -915,6 +941,17 @@ describe('PostTemplatesService', () => {
         0,
       ).data;
       expect(data.timezone).toBe('Europe/Moscow');
+    });
+
+    it('повторная «пауза» уже стоящего на паузе — без записи в журнал', async () => {
+      const { service, prisma, audit } = setup();
+      prisma.post.findUnique.mockResolvedValue(
+        template({ templatePaused: true }),
+      );
+
+      await service.setPaused('tpl-1', true);
+
+      expect(audit.record).not.toHaveBeenCalled();
     });
 
     it('leaves the schedule alone when pausing', async () => {

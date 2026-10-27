@@ -89,13 +89,15 @@ function buildService() {
 
   const vkUploaderToken = { isUsable: jest.fn().mockResolvedValue(true) };
 
+  const audit = { record: jest.fn(), purgeExpired: jest.fn() };
   const service = new PostsService(
     prisma as unknown as PrismaService,
     queue as unknown as Queue,
     vkUploaderToken as unknown as VkUploaderTokenService,
+    audit as never,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma, queue, vkUploaderToken, logger };
+  return { service, prisma, queue, vkUploaderToken, logger, audit };
 }
 
 describe('PostsService', () => {
@@ -726,6 +728,33 @@ describe('PostsService', () => {
   });
 
   describe('editDraft', () => {
+    it('сохранение без правки — без записи в журнал; смена вложений — с записью', async () => {
+      const { service, prisma, audit } = buildService();
+      prisma.post.findUnique.mockResolvedValue(post({ status: 'draft' }));
+      prisma.group.findMany.mockResolvedValue([
+        { id: 'g1', status: 'active', title: 'A' },
+      ]);
+      prisma.postDelivery.findMany.mockResolvedValue([{ groupId: 'g1' }]);
+      prisma.postAttachment.findMany.mockResolvedValue([
+        { mediaAssetId: 'm1' },
+      ]);
+      prisma.mediaAsset.count.mockResolvedValue(1);
+
+      await service.editDraft('post-1', {
+        text: 'привет',
+        groupIds: ['g1'],
+        attachmentIds: ['m1'],
+      });
+      expect(audit.record).not.toHaveBeenCalled();
+
+      await service.editDraft('post-1', {
+        text: 'привет',
+        groupIds: ['g1'],
+        attachmentIds: [],
+      });
+      expect(audit.record).toHaveBeenCalledTimes(1);
+    });
+
     it('refuses to edit a post that is no longer a draft', async () => {
       const { service, prisma } = buildService();
       prisma.post.findUnique.mockResolvedValue(post({ status: 'scheduled' }));

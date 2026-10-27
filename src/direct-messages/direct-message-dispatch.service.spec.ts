@@ -18,16 +18,30 @@ function setup() {
     getJob: jest.fn().mockResolvedValue(undefined),
   };
   const logger = { setContext: jest.fn(), warn: jest.fn() };
+  const audit = { record: jest.fn(), purgeExpired: jest.fn() };
   const service = new DirectMessageDispatchService(
     prisma as unknown as PrismaService,
     recipients as unknown as DirectMessageRecipientsService,
     queue as unknown as import('bullmq').Queue,
+    audit as never,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma, recipients, queue, logger };
+  return { service, prisma, recipients, queue, logger, audit };
 }
 
 describe('DirectMessageDispatchService.sendNow', () => {
+  it('повтор, когда всем уже отправлено (нечего ставить в очередь), — без записи в журнал', async () => {
+    const { service, recipients, audit } = setup();
+    recipients.resolve.mockResolvedValue([
+      { id: 'pu-1', platform: 'max', externalUserId: '1' },
+    ]);
+
+    await expect(service.sendNow('post-1', { mode: 'all' })).resolves.toEqual({
+      queued: 0,
+    });
+    expect(audit.record).not.toHaveBeenCalled();
+  });
+
   it('падает NOT_FOUND, если поста нет', async () => {
     const { service, prisma } = setup();
     prisma.post.findUnique.mockResolvedValue(null);
@@ -58,6 +72,7 @@ describe('DirectMessageDispatchService.sendNow', () => {
       prisma as unknown as PrismaService,
       recipients as unknown as DirectMessageRecipientsService,
       queue as unknown as import('bullmq').Queue,
+      { record: jest.fn(), purgeExpired: jest.fn() } as never,
       logger as unknown as PinoLogger,
     );
     prisma.directMessageDelivery.findMany.mockResolvedValue([

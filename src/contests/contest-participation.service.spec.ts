@@ -1,3 +1,4 @@
+import { ErrorCode } from '../common/error-code.enum';
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client';
@@ -36,7 +37,14 @@ const uniqueViolation = () =>
 
 function setup(contest: ReturnType<typeof contestRow> | null = contestRow()) {
   const prisma = {
-    contest: { findUnique: jest.fn().mockResolvedValue(contest) },
+    contestFunnelEvent: {
+      createMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
+    contest: {
+      findUnique: jest.fn().mockResolvedValue(contest),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
+    $executeRaw: jest.fn().mockResolvedValue(1),
     group: { findUnique: jest.fn().mockResolvedValue({ id: 'group-1' }) },
     contestParticipant: {
       create: jest.fn().mockResolvedValue({ id: 'participant-1' }),
@@ -64,13 +72,15 @@ function setup(contest: ReturnType<typeof contestRow> | null = contestRow()) {
     requiredChannels: jest.fn().mockResolvedValue([]),
   };
   const logger = { setContext: jest.fn(), info: jest.fn(), warn: jest.fn() };
+  const audit = { record: jest.fn(), purgeExpired: jest.fn() };
   const service = new ContestParticipationService(
     prisma as unknown as PrismaService,
     platformUsers as unknown as PlatformUsersService,
     subscriptions as unknown as ContestSubscriptions,
+    audit as never,
     logger as unknown as PinoLogger,
   );
-  return { service, prisma, platformUsers, subscriptions };
+  return { service, prisma, platformUsers, subscriptions, logger, audit };
 }
 
 const request = () => ({
@@ -89,6 +99,42 @@ const request = () => ({
 });
 
 describe('ContestParticipationService.join', () => {
+  it('отменённый конкурс: отказ «отменён», анонс — без кнопки и с пометкой', async () => {
+    const { service } = setup(contestRow({ status: 'cancelled' }));
+
+    const outcome = await service.join(request());
+
+    expect(outcome.status).toBe('not_open');
+    expect(outcome.message).toMatch(/отменён/);
+    expect(outcome.refresh).toMatchObject({ buttonText: null, finished: true });
+    expect(outcome.refresh?.text).toMatch(/Текст анонса\n\nКонкурс отменён/);
+  });
+
+  it('старт бота по ссылке не собирает вид анонса — он не нужен', async () => {
+    const { service, prisma } = setup();
+
+    await service.startedFromLink(CONTEST_ID, request().user);
+
+    // Счётчик участников под кнопкой считает только `announcementView`.
+    expect(prisma.contestParticipant.count).not.toHaveBeenCalled();
+  });
+
+  it('повторное нажатие не шлёт вставки воронки повторно', async () => {
+    const { service, prisma } = setup();
+    prisma.contestParticipant.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('dup', {
+        code: 'P2002',
+        clientVersion: 'test',
+      }),
+    );
+
+    await service.join(request());
+    await service.join(request());
+
+    // consented + already_joined — по разу, а не на каждое нажатие.
+    expect(prisma.contestFunnelEvent.createMany).toHaveBeenCalledTimes(2);
+  });
+
   it('registers a participant and links them to a stored profile', async () => {
     const { service, prisma, platformUsers } = setup();
 
@@ -243,7 +289,7 @@ describe('ContestParticipationService.join', () => {
       text: 'Текст анонса',
       buttonText: 'Участвовать (3)',
       payload: `contest:join:${CONTEST_ID}`,
-      drawn: false,
+      finished: false,
     });
   });
 
@@ -766,6 +812,132 @@ describe('contestButton', () => {
   });
 });
 
+describe('воронка участия', () => {
+  const stages = (prisma: { contestFunnelEvent: { createMany: jest.Mock } }) =>
+    (prisma.contestFunnelEvent.createMany.mock.calls as unknown[][]).map(
+      (call) => (call[0] as { data: { stage: string }[] }).data[0].stage,
+    );
+
+  it('записанный проходит этапы «согласие» и «записан»', async () => {
+    const { service, prisma } = setup();
+
+    await service.join(request());
+
+    expect(stages(prisma)).toEqual(['consented', 'joined']);
+  });
+
+  it('неподписанный — «согласие» и «не подписан», без «записан»', async () => {
+    const { service, prisma, subscriptions } = setup();
+    subscriptions.missingFor.mockResolvedValue([
+      { title: 'Новости', link: null },
+    ]);
+
+    await service.join(request());
+
+    expect(stages(prisma)).toEqual(['consented', 'not_subscribed']);
+  });
+
+  it('повторное нажатие не плодит строк: пропуск дублей и платформа в ключе', async () => {
+    const { service, prisma } = setup();
+
+    await service.join(request());
+
+    const arg = (
+      prisma.contestFunnelEvent.createMany.mock.calls as unknown[][]
+    )[0][0] as {
+      data: { platform: string }[];
+      skipDuplicates: boolean;
+    };
+    expect(arg.skipDuplicates).toBe(true);
+    expect(arg.data[0].platform).toBe('max');
+  });
+
+  it('после розыгрыша нажатие «Узнать результаты» не считается началом участия', async () => {
+    const { service, prisma } = setup(contestRow({ status: 'drawn' }));
+
+    await service.join(request());
+
+    expect(stages(prisma)).toEqual([]);
+  });
+
+  it('кнопка без согласия — ни строки с id человека, ни счёта (счёт — у экрана согласия)', async () => {
+    const { service, prisma, platformUsers } = setup();
+    platformUsers.hasConsented.mockResolvedValue(false);
+
+    expect((await service.join(request())).status).toBe('consent_required');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(stages(prisma)).toEqual([]);
+    // Ответ ведёт по ссылке в бота, где старт посчитает `noteAnonymousStart`
+    // — счёт и здесь дал бы двойной учёт.
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('noteAnonymousStart — один запрос, только у принимающего конкурса, отдельной строкой', async () => {
+    const { service, prisma } = setup();
+
+    service.noteAnonymousStart(CONTEST_ID);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    const sql = (
+      (prisma.$executeRaw.mock.calls as unknown[][])[0][0] as string[]
+    ).join('?');
+    expect(sql).toContain('"ContestAnonymousStarts"');
+    // То же правило, что `isAcceptingEntries`: открыт и срок не прошёл.
+    expect(sql).toContain("status = 'open'");
+    expect(sql).toContain('"endsAt" IS NULL OR "endsAt" > now()');
+    expect(prisma.contest.updateMany).not.toHaveBeenCalled();
+    expect(stages(prisma)).toEqual([]);
+  });
+
+  it('конкурс удалили между проверкой и счётом — тихо (сырой SQL отдаёт P2010 с 23503)', async () => {
+    const { service, prisma, logger } = setup();
+    // Форма ошибки снята живьём с адаптера pg.
+    prisma.$executeRaw.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('fk', {
+        code: 'P2010',
+        clientVersion: 'test',
+        meta: {
+          driverAdapterError: {
+            name: 'DriverAdapterError',
+            cause: { originalCode: '23503' },
+          },
+        },
+      }),
+    );
+
+    service.noteAnonymousStart(CONTEST_ID);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(prisma.$executeRaw).toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('удалённый конкурс (кнопка под старым постом) — тихо, без предупреждения в лог', async () => {
+    const { service, prisma, logger } = setup();
+    prisma.contestFunnelEvent.createMany.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('fk', {
+        code: 'P2003',
+        clientVersion: 'test',
+      }),
+    );
+
+    await service.join(request());
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('сбой записи события не мешает участию', async () => {
+    const { service, prisma } = setup();
+    prisma.contestFunnelEvent.createMany.mockRejectedValue(new Error('db'));
+
+    expect((await service.join(request())).status).toBe('joined');
+  });
+});
+
 describe('markWinnersNotified', () => {
   it('помечает места отправленными', async () => {
     const { service, prisma } = setup();
@@ -795,5 +967,64 @@ describe('markWinnersNotified', () => {
     await service.markWinnersNotified([]);
 
     expect(updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('ContestParticipationService.extendContest', () => {
+  function extendSetup(row: { status: string; endsAt: Date | null }) {
+    const ctx = setup();
+    const prisma = ctx.prisma as unknown as Record<string, unknown>;
+    const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([row]),
+      contest: {
+        update: jest.fn(({ data }: { data: { endsAt: Date } }) =>
+          Promise.resolve({ title: 'Конкурс', endsAt: data.endsAt }),
+        ),
+      },
+    };
+    (prisma.$transaction as jest.Mock).mockImplementation(
+      (fn: (t: typeof tx) => unknown) => fn(tx),
+    );
+    return { ...ctx, tx };
+  }
+
+  it('продлевает от прежнего срока и сбрасывает отметку предупреждения', async () => {
+    const endsAt = new Date(Date.now() + 5 * 60 * 1000);
+    const { service, tx, audit } = extendSetup({ status: 'open', endsAt });
+
+    const result = await service.extendContest(CONTEST_ID, 1, 'admin-1');
+
+    expect(result.endsAt.getTime()).toBe(
+      endsAt.getTime() + 24 * 60 * 60 * 1000,
+    );
+    const { data } = (tx.contest.update.mock.calls as unknown[][])[0][0] as {
+      data: { endWarningSentAt: unknown };
+    };
+    expect(data.endWarningSentAt).toBeNull();
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'contest.extend' }),
+    );
+  });
+
+  it('срок уже прошёл — продлевает от сейчас', async () => {
+    const { service } = extendSetup({
+      status: 'open',
+      endsAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+
+    const result = await service.extendContest(CONTEST_ID, 3, 'admin-1');
+
+    expect(result.endsAt.getTime()).toBeGreaterThan(
+      Date.now() + 3 * 24 * 60 * 60 * 1000 - 5000,
+    );
+  });
+
+  it('отменённый конкурс не продлевается', async () => {
+    const { service, tx } = extendSetup({ status: 'cancelled', endsAt: null });
+
+    await expect(
+      service.extendContest(CONTEST_ID, 1, 'admin-1'),
+    ).rejects.toMatchObject({ code: ErrorCode.CONTEST_ALREADY_DRAWN });
+    expect(tx.contest.update).not.toHaveBeenCalled();
   });
 });

@@ -1,11 +1,10 @@
 import { config as loadEnv } from 'dotenv';
-import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
-import { hash } from '@node-rs/argon2';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
 import { PrismaClient } from '../generated/prisma/client';
 import { isValidAdminEmail, normalizeAdminEmail } from '../auth/admin-email';
+import { generatePassword, PasswordService } from '../auth/password.service';
 
 /**
  * Заводит первого администратора.
@@ -57,19 +56,13 @@ async function main(): Promise<void> {
       throw new Error(`Администратор ${email} уже существует`);
     }
 
-    // Пароль не спрашивается, а генерируется: набранный руками он почти
-    // наверняка окажется слабее и, скорее всего, уже где-то используется.
-    const password = randomBytes(18).toString('base64url');
+    const password = generatePassword();
 
     const admin = await prisma.adminUser.create({
       data: {
         email,
-        passwordHash: await hash(password, {
-          algorithm: 2,
-          memoryCost: 19 * 1024,
-          timeCost: 2,
-          parallelism: 1,
-        }),
+        // Те же параметры argon2, что у входа, — из одного места.
+        passwordHash: await new PasswordService().hash(password),
         role: 'developer',
         extraPermissions: [],
         maxUserId,

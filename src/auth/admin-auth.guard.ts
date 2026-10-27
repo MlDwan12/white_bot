@@ -1,5 +1,6 @@
 import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
+import { setCurrentAdmin } from '../audit/request-context';
 import type { Request } from 'express';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
@@ -40,6 +41,8 @@ export class AdminAuthGuard implements CanActivate {
     // должны действовать немедленно, а не когда истечёт access-токен.
     const admin = await this.auth.resolveAdmin(token);
     request.admin = admin;
+    // Автор для журнала действий этого запроса.
+    setCurrentAdmin(admin.id);
 
     const required = this.reflector.getAllAndOverride<Permission[]>(
       PERMISSIONS_KEY,

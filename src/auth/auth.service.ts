@@ -7,6 +7,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AdminUser } from '../generated/prisma/client';
 import { normalizeAdminEmail } from './admin-email';
 import { PasswordService } from './password.service';
+import { AuditService } from '../audit/audit.service';
 import { IssuedRefresh, SessionService } from './session.service';
 
 /** Короткий TTL access-токена: отозванная сессия перестаёт работать быстро. */
@@ -24,6 +25,7 @@ export class AuthService {
     private readonly passwords: PasswordService,
     private readonly sessions: SessionService,
     private readonly jwt: JwtService,
+    private readonly audit: AuditService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(AuthService.name);
@@ -55,19 +57,32 @@ export class AuthService {
     // пароля (argon2 — десятки миллисекунд), уже погасило сессии, а эта
     // вставлена после — она пережила бы отключение и ожила после «Включить».
     await this.revokeIfDisabled(admin.id, issued.refresh.token);
+    // Автор явно: вход идёт до проверки токена, вошедшего в запросе ещё нет.
+    await this.audit.record({
+      actor: { adminId: admin.id },
+      action: 'auth.login',
+      entityType: 'admin',
+      entityId: admin.id,
+      summary: `Вошёл в панель`,
+    });
     return issued;
   }
 
-  /** Гасит только что выданную сессию, если админа успели отключить. */
+  /**
+   * Гасит только что выданную сессию, если админа успели отключить, — и
+   * одним же запросом отмечает «был в панели» (для статистики; точность до
+   * продления сессии, раз в 15 минут). Условный update: ноль обновлённых
+   * строк значит «отключён или удалён».
+   */
   private async revokeIfDisabled(
     adminUserId: string,
     refreshToken: string,
   ): Promise<void> {
-    const admin = await this.prisma.adminUser.findUnique({
-      where: { id: adminUserId },
-      select: { disabledAt: true },
+    const { count } = await this.prisma.adminUser.updateMany({
+      where: { id: adminUserId, disabledAt: null },
+      data: { lastSeenAt: new Date() },
     });
-    if (!admin || admin.disabledAt) {
+    if (count === 0) {
       await this.sessions.revoke(refreshToken);
       throw new AppException(
         ErrorCode.UNAUTHORIZED,
@@ -118,9 +133,11 @@ export class AuthService {
    * действовать немедленно, а не через четверть часа, когда истечёт access.
    */
   async resolveAdmin(accessToken: string): Promise<AdminUser> {
-    let payload: { sub?: string };
+    let payload: { sub?: string; iat?: number };
     try {
-      payload = await this.jwt.verifyAsync<{ sub?: string }>(accessToken);
+      payload = await this.jwt.verifyAsync<{ sub?: string; iat?: number }>(
+        accessToken,
+      );
     } catch {
       throw new AppException(ErrorCode.UNAUTHORIZED, 'Сессия истекла');
     }
@@ -131,7 +148,7 @@ export class AuthService {
     // Отключённый — как несуществующий: access-токен живёт ещё до 15 минут,
     // и без этой проверки отключение действовало бы только после его
     // истечения (сессии для обновления гасятся отдельно, при отключении).
-    if (!admin || admin.disabledAt) {
+    if (!admin || admin.disabledAt || issuedBeforeReset(payload.iat, admin)) {
       throw new AppException(ErrorCode.UNAUTHORIZED, 'Сессия недействительна');
     }
     return admin;
@@ -152,6 +169,23 @@ export class AuthService {
       { expiresIn: ACCESS_TTL_SECONDS },
     );
   }
+}
+
+/**
+ * Токен выдан до сброса пароля — им пользуется тот, у кого был старый
+ * пароль. `iat` в JWT — в секундах (округлён вниз), поэтому сравнение
+ * строгое с моментом сброса: токен той же секунды, что и сброс, отвергается
+ * — иначе выданный за миг до сброса жил бы ещё 15 минут. Цена — вход новым
+ * паролем в ту же секунду придётся повторить.
+ */
+function issuedBeforeReset(
+  iat: number | undefined,
+  admin: { passwordChangedAt: Date | null },
+): boolean {
+  if (!admin.passwordChangedAt) {
+    return false;
+  }
+  return (iat ?? 0) * 1000 <= admin.passwordChangedAt.getTime();
 }
 
 /**

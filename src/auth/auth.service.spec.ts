@@ -15,7 +15,11 @@ const ADMIN = {
 
 function setup(admin: Record<string, unknown> | null = ADMIN) {
   const prisma = {
-    adminUser: { findUnique: jest.fn().mockResolvedValue(admin) },
+    adminUser: {
+      findUnique: jest.fn().mockResolvedValue(admin),
+      // «не отключён» + отметка «был в панели» одним условным update
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
   };
   const passwords = { verify: jest.fn().mockResolvedValue(true) };
   const sessions = {
@@ -33,12 +37,16 @@ function setup(admin: Record<string, unknown> | null = ADMIN) {
     sign: jest.fn().mockReturnValue('access-token'),
     verifyAsync: jest.fn().mockResolvedValue({ sub: 'admin-1' }),
   };
-  const logger = { setContext: jest.fn() } as unknown as PinoLogger;
+  const logger = {
+    setContext: jest.fn(),
+    warn: jest.fn(),
+  } as unknown as PinoLogger;
   const service = new AuthService(
     prisma as unknown as PrismaService,
     passwords as unknown as PasswordService,
     sessions as unknown as SessionService,
     jwt as unknown as JwtService,
+    { record: jest.fn(), purgeExpired: jest.fn() } as never,
     logger,
   );
   return { service, prisma, passwords, sessions, jwt };
@@ -72,10 +80,9 @@ describe('AuthService.login', () => {
 
   it('гасит выданную сессию, если админа отключили за время проверки пароля', async () => {
     const { service, prisma, sessions } = setup();
-    // Первое чтение — до argon2 (активен), второе — после выдачи (отключён).
-    prisma.adminUser.findUnique
-      .mockResolvedValueOnce(ADMIN)
-      .mockResolvedValueOnce({ disabledAt: new Date() });
+    // Первое чтение — до argon2 (активен); условный update после выдачи
+    // сессии не нашёл активного — успели отключить.
+    prisma.adminUser.updateMany.mockResolvedValue({ count: 0 });
 
     await expect(service.login('dev@local', 'пароль')).rejects.toMatchObject({
       code: ErrorCode.UNAUTHORIZED,
@@ -169,12 +176,28 @@ describe('AuthService.refresh', () => {
     // Обновление прочитало старую сессию до гашения при отключении и
     // вставило новую после него — без этой проверки она пережила бы
     // отключение и снова заработала бы после «Включить».
-    const { service, sessions } = setup({ ...ADMIN, disabledAt: new Date() });
+    const { service, prisma, sessions } = setup();
+    prisma.adminUser.updateMany.mockResolvedValue({ count: 0 });
 
     await expect(service.refresh('refresh-1')).rejects.toMatchObject({
       code: ErrorCode.UNAUTHORIZED,
     });
     expect(sessions.revoke).toHaveBeenCalledWith('refresh-2');
+  });
+
+  it('отмечает «был в панели» тем же запросом, что проверяет отключение', async () => {
+    const { service, prisma } = setup();
+
+    await service.refresh('refresh-1');
+
+    const arg = (
+      prisma.adminUser.updateMany.mock.calls as unknown[][]
+    )[0][0] as {
+      where: unknown;
+      data: { lastSeenAt: unknown };
+    };
+    expect(arg.where).toEqual({ id: 'admin-1', disabledAt: null });
+    expect(arg.data.lastSeenAt).toBeInstanceOf(Date);
   });
 
   it('refuses an unknown refresh token', async () => {
@@ -186,6 +209,34 @@ describe('AuthService.refresh', () => {
 });
 
 describe('AuthService.resolveAdmin', () => {
+  it('после сброса пароля отвергает access-токен, выданный раньше', async () => {
+    const { service, prisma, jwt } = setup();
+    const resetAt = new Date('2026-10-27T10:00:00Z');
+    prisma.adminUser.findUnique.mockResolvedValue({
+      ...ADMIN,
+      passwordChangedAt: resetAt,
+    });
+    const seconds = Math.floor(resetAt.getTime() / 1000);
+
+    jwt.verifyAsync.mockResolvedValue({ sub: 'admin-1', iat: seconds - 60 });
+    await expect(service.resolveAdmin('old')).rejects.toMatchObject({
+      code: ErrorCode.UNAUTHORIZED,
+    });
+
+    // Токен той же секунды, что и сброс, — тоже: он мог быть выдан за миг
+    // до сброса и прожил бы ещё 15 минут.
+    jwt.verifyAsync.mockResolvedValue({ sub: 'admin-1', iat: seconds });
+    await expect(service.resolveAdmin('same')).rejects.toMatchObject({
+      code: ErrorCode.UNAUTHORIZED,
+    });
+
+    // Вход новым паролем после сброса проходит.
+    jwt.verifyAsync.mockResolvedValue({ sub: 'admin-1', iat: seconds + 1 });
+    await expect(service.resolveAdmin('new')).resolves.toMatchObject({
+      id: 'admin-1',
+    });
+  });
+
   it('re-reads the admin from the database on every request', async () => {
     const { service, prisma } = setup();
 

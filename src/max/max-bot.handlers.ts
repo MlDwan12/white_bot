@@ -5,6 +5,7 @@ import { PinoLogger } from 'nestjs-pino';
 import { GroupsService, PublicGroup } from '../groups/groups.service';
 import { AdminNotifier } from './admin-notifier';
 import { MaxAdminResolver } from './max-admin.resolver';
+import { runAsAdmin } from '../audit/request-context';
 import { MaxApiClient } from './max-api.client';
 import {
   ContestParticipationService,
@@ -17,10 +18,11 @@ import {
 } from '../platform-users/platform-users.service';
 import {
   CONTEST_CHECK_PAYLOAD,
+  CONTEST_EXTEND_PAYLOAD,
   CONTEST_JOIN_PAYLOAD,
   CONTEST_START_PAYLOAD,
-  contestDmUrl,
-  contestKeyboard,
+  announcementKeyboard,
+  rewriteAnnouncement,
   subscriptionKeyboard,
   type ContestKeyboardButton,
 } from '../contests/contest-button';
@@ -34,6 +36,9 @@ import {
   unsupportedAttachmentTypes,
 } from './max-attachments';
 import { MAX_BOT } from './max-bot.provider';
+import { AppException } from '../common/app-exception';
+import { hasAllPermissions } from '../auth/permissions';
+import { formatDate } from '../panel/view-helpers';
 
 /** Callback payloads for the pending-group review buttons. */
 const GROUP_REVIEW_PAYLOAD = /^group:(confirm|reject):([0-9a-fA-F-]{36})$/;
@@ -186,6 +191,19 @@ export class MaxBotHandlers {
       );
     });
 
+    bot.action(CONTEST_EXTEND_PAYLOAD, async (ctx) => {
+      const match = ctx.match;
+      if (!match) {
+        return;
+      }
+      await this.handleContestExtend(
+        ctx.user.user_id,
+        ctx.callback.callback_id,
+        match[1],
+        match[2] === '3' ? 3 : 1,
+      );
+    });
+
     bot.action(GROUP_REVIEW_PAYLOAD, async (ctx) => {
       const match = ctx.match;
       if (!match) {
@@ -269,7 +287,7 @@ export class MaxBotHandlers {
       { chatId, marked },
       marked
         ? 'MAX-группа помечена как bot_removed'
-        : 'Событие bot_removed для неизвестной группы — пропущено',
+        : 'Событие bot_removed для неизвестной или уже помеченной группы — пропущено',
     );
   }
 
@@ -326,12 +344,10 @@ export class MaxBotHandlers {
             // Та же клавиатура, что и при отправке: ответ заменяет сообщение
             // целиком, и без второй кнопки ссылка на бота пропала бы после
             // первого же клика.
-            buttons: contestKeyboard(
-              {
-                text: outcome.refresh.buttonText,
-                payload: outcome.refresh.payload,
-              },
-              contestDmUrl(this.api.botUsername(), contestId),
+            buttons: announcementKeyboard(
+              outcome.refresh,
+              contestId,
+              this.api.botUsername(),
             ),
             // Без этого первое же нажатие стёрло бы картинку анонса у всех.
             attachments: toRequestAttachments(attachments),
@@ -343,7 +359,7 @@ export class MaxBotHandlers {
     // он мог затереть итоги в этом сообщении — тогда доводим все сообщения
     // анонса до вида итогов. На сдвиг счётчика не перерисовываем: при
     // потоке нажатий это гоняло бы правки всех каналов на каждый клик.
-    if (outcome.refresh && !outcome.refresh.drawn) {
+    if (outcome.refresh && !outcome.refresh.finished) {
       await this.redrawIfDrawnSince(contestId);
     }
 
@@ -393,6 +409,13 @@ export class MaxBotHandlers {
       return;
     }
     if (!consented) {
+      // Воронка: пришёл по ссылке конкурса, но до участия ему ещё экран
+      // согласия — иначе отказавшиеся не попали бы в статистику. До согласия
+      // — только счётчик, без id человека.
+      const startedContestId = CONTEST_START_PAYLOAD.exec(resumePayload)?.[1];
+      if (startedContestId) {
+        this.contests.noteAnonymousStart(startedContestId);
+      }
       await this.sendConsentGate(chatId, resumePayload);
       return;
     }
@@ -643,7 +666,7 @@ export class MaxBotHandlers {
   /** Возвращает записанный вид — или `null`, если перерисовывать нечего. */
   private async redrawOnce(
     contestId: string,
-  ): Promise<{ drawn: boolean } | null> {
+  ): Promise<{ finished: boolean } | null> {
     let redraw: Awaited<
       ReturnType<ContestParticipationService['announcementRefresh']>
     >;
@@ -660,37 +683,28 @@ export class MaxBotHandlers {
       return null;
     }
 
-    const buttons = contestKeyboard(
-      { text: redraw.buttonText, payload: redraw.payload },
-      contestDmUrl(this.api.botUsername(), contestId),
-    );
-    for (const messageId of redraw.messageIds) {
-      try {
-        const current = await this.api.getMessageBody(messageId);
-        if (current.unsupported.length > 0) {
-          this.logger.warn(
-            { contestId, dropped: current.unsupported },
-            'Вложения анонса, которые нечем пересобрать, потеряются при правке',
-          );
-        }
-        await this.api.editMessage(messageId, redraw.text, {
-          attachments: current.attachments,
-          buttons,
-        });
-      } catch (err: unknown) {
+    await rewriteAnnouncement(
+      this.api,
+      contestId,
+      redraw,
+      (err, messageId) =>
         this.logger.warn(
           { err, contestId, messageId },
           'Не удалось обновить счётчик участников под анонсом',
-        );
-      }
-    }
+        ),
+      (dropped) =>
+        this.logger.warn(
+          { contestId, dropped },
+          'Вложения анонса, которые нечем пересобрать, потеряются при правке',
+        ),
+    );
     return redraw;
   }
 
   private async redrawIfDrawnSince(contestId: string): Promise<void> {
     let drawn = false;
     try {
-      drawn = await this.contests.isDrawn(contestId);
+      drawn = await this.contests.isFinished(contestId);
     } catch (err: unknown) {
       this.logger.warn({ err, contestId }, 'Не удалось сверить вид анонса');
     }
@@ -702,7 +716,7 @@ export class MaxBotHandlers {
   /** Отличается ли текущий вид анонса от уже записанного. Сбой — «нет». */
   private async viewChangedSince(
     contestId: string,
-    written: { drawn: boolean },
+    written: { finished: boolean },
   ): Promise<boolean> {
     // Только смена «до розыгрыша / после», а не сдвиг счётчика: счётчик
     // поправит следующая перерисовка по следующему вступлению, а повтор на
@@ -712,7 +726,7 @@ export class MaxBotHandlers {
     // лишь если записан вид «до», а конкурс уже разыгран. После записи итогов
     // цикл заведомо останавливается.
     try {
-      return !written.drawn && (await this.contests.isDrawn(contestId));
+      return !written.finished && (await this.contests.isFinished(contestId));
     } catch (err: unknown) {
       this.logger.warn({ err, contestId }, 'Не удалось сверить вид анонса');
       return false;
@@ -781,10 +795,12 @@ export class MaxBotHandlers {
 
     try {
       if (action === 'confirm') {
-        const group = await this.groups.confirmMaxGroup(groupId);
+        const group = await runAsAdmin(admin.id, () =>
+          this.groups.confirmMaxGroup(groupId),
+        );
         await this.safeAnswer(callbackId, `Группа «${group.title}» подключена`);
       } else {
-        await this.groups.rejectMaxGroup(groupId);
+        await runAsAdmin(admin.id, () => this.groups.rejectMaxGroup(groupId));
         await this.safeAnswer(callbackId, 'Группа отклонена');
       }
     } catch (err: unknown) {
@@ -797,6 +813,60 @@ export class MaxBotHandlers {
       await this.safeAnswer(
         callbackId,
         'Не удалось применить решение — возможно, группа уже обработана',
+      );
+    }
+  }
+
+  /**
+   * «Продлить» из предупреждения «участников нет». Только админ с правом на
+   * конкурсы: кнопку можно переслать, а полезную нагрузку — подделать.
+   */
+  private async handleContestExtend(
+    userId: number,
+    callbackId: string,
+    contestId: string,
+    days: 1 | 3,
+  ): Promise<void> {
+    const admin = await this.admins.findByMaxUserId(userId);
+    if (
+      !admin ||
+      !hasAllPermissions(
+        {
+          id: admin.id,
+          role: admin.role,
+          extraPermissions: admin.extraPermissions,
+        },
+        ['contests_manage'],
+      )
+    ) {
+      // Как у подтверждения групп: постороннему — тишина.
+      this.logger.warn(
+        { userId, contestId },
+        'Продление конкурса от пользователя без права — проигнорировано',
+      );
+      await this.safeAnswer(callbackId);
+      return;
+    }
+    try {
+      const { title, endsAt } = await this.contests.extendContest(
+        contestId,
+        days,
+        admin.id,
+      );
+      await this.safeAnswer(
+        callbackId,
+        `Конкурс «${title}» продлён до ${formatDate(endsAt)}`,
+      );
+    } catch (err: unknown) {
+      this.logger.warn(
+        { err, contestId, adminId: admin.id },
+        'Не удалось продлить конкурс',
+      );
+      await this.safeAnswer(
+        callbackId,
+        err instanceof AppException
+          ? err.message
+          : 'Не удалось продлить — попробуйте в панели',
       );
     }
   }

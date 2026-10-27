@@ -21,7 +21,7 @@ export interface ContestView {
    * описанию негде разойтись с тем, что человек прочёл в канале.
    */
   terms: string;
-  status: 'draft' | 'open' | 'drawn';
+  status: 'draft' | 'open' | 'drawn' | 'cancelled';
   participantsCount: number;
   placesCount: number;
   joined: boolean;

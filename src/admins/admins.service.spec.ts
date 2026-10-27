@@ -34,6 +34,8 @@ function setup(target = row()) {
       update: jest.fn(({ data }: { data: object }) =>
         Promise.resolve({ ...target, ...data }),
       ),
+      // Отключение/включение — условием по `disabledAt`.
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
     // Активные developer'ы под блокировкой: по умолчанию целевой и ещё один.
     $queryRaw: jest.fn().mockResolvedValue([{ id: OTHER }, { id: SELF }]),
@@ -46,12 +48,14 @@ function setup(target = row()) {
     hash: jest.fn((p: string) => Promise.resolve(`h(${p})`)),
   };
   const sessions = { revokeAll: jest.fn().mockResolvedValue(undefined) };
+  const audit = { record: jest.fn(), purgeExpired: jest.fn() };
   const service = new AdminsService(
     prisma as unknown as PrismaService,
     passwords as unknown as PasswordService,
     sessions as unknown as SessionService,
+    audit as never,
   );
-  return { service, prisma, passwords, sessions };
+  return { service, prisma, passwords, sessions, audit };
 }
 
 describe('AdminsService', () => {
@@ -110,13 +114,37 @@ describe('AdminsService', () => {
   });
 
   describe('disable', () => {
+    it('сессии гаснут до записи журнала, а сбой гашения журнал не теряет', async () => {
+      const { service, sessions, audit } = setup(row({ role: 'admin' }));
+      sessions.revokeAll.mockRejectedValue(new Error('redis down'));
+
+      await expect(service.disable(OTHER, SELF)).rejects.toThrow('redis down');
+
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'admin.disable' }),
+      );
+      expect(sessions.revokeAll.mock.invocationCallOrder[0]).toBeLessThan(
+        audit.record.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('включение уже включённого и сохранение без правки — без записи в журнал', async () => {
+      const { service, prisma, audit } = setup(row({ role: 'admin' }));
+
+      await service.enable(OTHER);
+      expect(prisma.adminUser.update).not.toHaveBeenCalled();
+      await service.update(OTHER, { role: 'admin', maxUserId: null }, SELF);
+
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
     it('гасит сессии — отключение действует сразу', async () => {
       const { service, prisma, sessions } = setup(row({ role: 'admin' }));
 
       await service.disable(OTHER, SELF);
 
-      expect(prisma.adminUser.update).toHaveBeenCalledWith({
-        where: { id: OTHER },
+      expect(prisma.adminUser.updateMany).toHaveBeenCalledWith({
+        where: { id: OTHER, disabledAt: null },
         data: { disabledAt: expect.any(Date) as Date },
       });
       expect(sessions.revokeAll).toHaveBeenCalledWith(OTHER);
@@ -172,15 +200,39 @@ describe('AdminsService', () => {
     });
   });
 
+  it('себе пароль сбросить нельзя — вылетел бы, не увидев новый', async () => {
+    const { service, prisma } = setup(row({ id: SELF }));
+
+    await expect(service.resetPassword(SELF, SELF)).rejects.toMatchObject({
+      code: ErrorCode.VALIDATION_ERROR,
+    });
+    expect(prisma.adminUser.update).not.toHaveBeenCalled();
+  });
+
   it('сброс пароля выдаёт новый и завершает все входы', async () => {
     const { service, sessions, prisma } = setup();
 
-    const issued = await service.resetPassword(OTHER);
+    const issued = await service.resetPassword(OTHER, SELF);
 
     expect(prisma.adminUser.update).toHaveBeenCalledWith({
       where: { id: OTHER },
-      data: { passwordHash: `h(${issued.password})` },
+      data: {
+        passwordHash: `h(${issued.password})`,
+        // Старые access-токены перестают приниматься сразу.
+        passwordChangedAt: expect.any(Date) as Date,
+      },
     });
     expect(sessions.revokeAll).toHaveBeenCalledWith(OTHER);
+  });
+
+  it('двойной клик «Отключить» — одна запись в журнале, сессии гасит только первый', async () => {
+    const { service, prisma, sessions, audit } = setup(row({ role: 'admin' }));
+    // Второй запрос: первый уже отключил между чтением и записью.
+    prisma.adminUser.updateMany.mockResolvedValue({ count: 0 });
+
+    await service.disable(OTHER, SELF);
+
+    expect(sessions.revokeAll).not.toHaveBeenCalled();
+    expect(audit.record).not.toHaveBeenCalled();
   });
 });

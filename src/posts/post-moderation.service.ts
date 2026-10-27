@@ -3,10 +3,11 @@ import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { sleep } from '../common/sleep';
-import type { Group } from '../generated/prisma/client';
+import type { Group, Post } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { PostSender } from './post-sender';
 import { PostsService } from './posts.service';
+import { AuditService, changed, postSnippet } from '../audit/audit.service';
 import { ContestParticipationService } from '../contests/contest-participation.service';
 
 export interface ModerationOutcome {
@@ -47,6 +48,7 @@ export class PostModerationService {
     private readonly sender: PostSender,
     private readonly posts: PostsService,
     private readonly participation: ContestParticipationService,
+    private readonly audit: AuditService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(PostModerationService.name);
@@ -103,6 +105,18 @@ export class PostModerationService {
       }
     }
 
+    // Цикл не прерывается: ошибки платформы ловятся в нём, а `recordOutcome`
+    // сам гасит сбой записи — так что журнал после цикла не теряется.
+    await this.audit.record({
+      action: 'post.delete_published',
+      entityType: 'post',
+      entityId: postId,
+      summary:
+        outcome.succeeded > 0
+          ? `Удалил пост из каналов: удалено ${outcome.succeeded}, ошибок ${outcome.failed.length}`
+          : `Не удалось удалить пост ни из одного канала: ошибок ${outcome.failed.length}`,
+      details: { failed: outcome.failed },
+    });
     return outcome;
   }
 
@@ -137,8 +151,20 @@ export class PostModerationService {
       await this.posts.assertAttachmentsUsable(input.attachmentIds);
     }
 
+    // Прежние вложения — для журнала, только если их меняют.
+    const previousAttachmentIds =
+      input.attachmentIds === undefined
+        ? undefined
+        : (
+            await this.prisma.postAttachment.findMany({
+              where: { postId },
+              orderBy: { position: 'asc' },
+              select: { mediaAssetId: true },
+            })
+          ).map((a) => a.mediaAssetId);
+
     if (post.status === 'sending') {
-      await this.posts.stopPost(postId);
+      await this.posts.stopPost(postId, 'edit');
       // Стоп помечает только необработанные. Доставки, у которых вызов уже
       // в полёте, допишутся `sent` **после** снимка ниже — и остались бы со
       // старым текстом навсегда, ровно вопреки смыслу правки. Ждём, пока
@@ -181,6 +207,31 @@ export class PostModerationService {
         contest: true,
       },
     });
+
+    // В журнал — сразу после сохранения нового текста: он уже в базе, и сбой
+    // дальше (правка в каналах, запись итога) не должен терять запись о том,
+    // кто его поменял. Итог по каналам виден у доставок поста.
+    const before = {
+      ...editableFields(post),
+      ...(previousAttachmentIds
+        ? { attachmentIds: previousAttachmentIds }
+        : {}),
+    };
+    const after = {
+      ...editableFields(updated),
+      ...(input.attachmentIds ? { attachmentIds: input.attachmentIds } : {}),
+    };
+    // Сохранение без правки — не действие (в каналы правка всё равно уходит:
+    // так чинится сообщение, правка которого раньше не прошла).
+    if (changed(before, after)) {
+      await this.audit.record({
+        action: 'post.edit_published',
+        entityType: 'post',
+        entityId: postId,
+        summary: `Изменил опубликованный пост «${postSnippet(updated.text)}»`,
+        details: { before, after },
+      });
+    }
 
     const assets = updated.attachments.map((a) => a.mediaAsset);
 
@@ -404,4 +455,15 @@ export function autoDeleteDueAt(
 
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : 'Неизвестная ошибка';
+}
+
+/** Что меняет правка опубликованного поста — для «было → стало» в журнале. */
+function editableFields(post: Post) {
+  return {
+    text: post.text,
+    vkTextOverride: post.vkTextOverride,
+    maxTextOverride: post.maxTextOverride,
+    autoDeleteAt: post.autoDeleteAt?.toISOString() ?? null,
+    autoDeleteAfterMinutes: post.autoDeleteAfterMinutes,
+  };
 }

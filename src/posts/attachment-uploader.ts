@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { isUniqueViolation } from '../common/prisma-errors';
 import type { AttachmentRequest } from '@maxhub/max-bot-api/types';
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
@@ -7,7 +8,6 @@ import {
   MediaAsset,
   MediaKind,
   Platform,
-  Prisma,
 } from '../generated/prisma/client';
 import { MediaService } from '../media/media.service';
 import { VkApiClient, type VkAttachmentInput } from '../vk/vk-api.client';
@@ -35,13 +35,6 @@ const MAX_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Видео в кэше старше этого MAX уже обработал — готовность не опрашиваем. */
 const VIDEO_SETTLED_MS = 10 * 60 * 1000;
-
-/** True for Prisma's unique-constraint violation (P2002). */
-function isUniqueConstraintViolation(err: unknown): boolean {
-  return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002'
-  );
-}
 
 /**
  * Turns stored files into platform attachment references, reusing previous
@@ -210,7 +203,7 @@ export class AttachmentUploader {
       });
       return fresh;
     } catch (err: unknown) {
-      if (isUniqueConstraintViolation(err)) {
+      if (isUniqueViolation(err)) {
         const winner = await this.prisma.mediaPlatformUpload.findUnique({
           where,
         });

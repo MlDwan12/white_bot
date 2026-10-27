@@ -1,30 +1,21 @@
 import { Inject, Injectable } from '@nestjs/common';
+import {
+  isForeignKeyViolation,
+  isUniqueViolation,
+} from '../common/prisma-errors';
 import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
 import { TokenEncryptionService } from '../common/crypto/token-encryption.service';
+import { AuditService, changed } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { Group, GroupKind, Prisma } from '../generated/prisma/client';
+import { Group, GroupKind } from '../generated/prisma/client';
 import { VkApiClient } from '../vk/vk-api.client';
 import { AdminNotifier } from '../max/admin-notifier';
 import { CreateVkGroupDto } from './dto/create-vk-group.dto';
 import { maskToken } from './mask-token';
 import { VK_TOKEN_PROVIDER } from './token-provider/vk-token.provider';
 import type { VkTokenProvider } from './token-provider/vk-token.provider';
-
-/** True for Prisma's unique-constraint violation (P2002) — see https://pris.ly/d/client-error-reference. */
-function isUniqueConstraintViolation(err: unknown): boolean {
-  return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002'
-  );
-}
-
-/** Row still referenced elsewhere (FK `ON DELETE RESTRICT`). */
-function isForeignKeyViolation(err: unknown): boolean {
-  return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2003'
-  );
-}
 
 export interface PublicGroup {
   id: string;
@@ -45,6 +36,7 @@ export class GroupsService {
     private readonly vkApiClient: VkApiClient,
     private readonly tokenEncryption: TokenEncryptionService,
     private readonly notifier: AdminNotifier,
+    private readonly audit: AuditService,
     private readonly logger: PinoLogger,
     @Inject(VK_TOKEN_PROVIDER)
     private readonly vkTokenProvider: VkTokenProvider,
@@ -76,16 +68,29 @@ export class GroupsService {
       dto.tags,
     );
 
+    // Та же форма обновляет токен уже подключённого (в том числе слетевший —
+    // `token_invalid`) — это не подключение. Заново подключённое после
+    // отключения (`removed`) — подключение.
+    const tokenUpdate = previous != null && previous.status !== 'removed';
+
     // Подтверждение — только админам, в лс: тестовый пост на стене
     // сообщества увидели бы все подписчики. Не ждём: рассылка идёт по
     // админам по очереди, и тормозящий MAX задерживал бы ответ панели, а
     // `notifyAll` сам не бросает.
     void this.notifier.notifyAll(
-      previous?.status === 'active'
+      tokenUpdate
         ? `Токен VK-сообщества «${group.title}» обновлён.`
         : `VK-сообщество «${group.title}» подключено.`,
     );
 
+    await this.audit.record({
+      action: tokenUpdate ? 'group.token' : 'group.connect_vk',
+      entityType: 'group',
+      entityId: group.id,
+      summary: tokenUpdate
+        ? `Заменил токен VK-сообщества «${group.title}»`
+        : `Подключил VK-сообщество «${group.title}»`,
+    });
     return this.toPublicGroup(group);
   }
 
@@ -124,7 +129,7 @@ export class GroupsService {
             },
           });
     } catch (err: unknown) {
-      if (!isUniqueConstraintViolation(err)) {
+      if (!isUniqueViolation(err)) {
         throw err;
       }
       const nowExisting = await this.prisma.group.findUniqueOrThrow({
@@ -167,6 +172,12 @@ export class GroupsService {
         status: 'active',
       },
     });
+    await this.audit.record({
+      action: 'group.token',
+      entityType: 'group',
+      entityId: group.id,
+      summary: `Заменил токен VK-сообщества «${group.title}»`,
+    });
     return this.toPublicGroup(group);
   }
 
@@ -182,11 +193,25 @@ export class GroupsService {
   }
 
   async updateTags(id: string, tags: string[]): Promise<PublicGroup> {
-    await this.findByIdOrThrow(id);
-    const group = await this.prisma.group.update({
-      where: { id },
+    const existing = await this.findByIdOrThrow(id);
+    // Условием «теги всё ещё те, что прочитаны»: двойной клик иначе дал бы
+    // две записи. Не совпало — их успели сменить, и это сохранение уже
+    // ничего не меняет (последнее слово — за успевшим).
+    const { count } = await this.prisma.group.updateMany({
+      where: { id, tags: { equals: existing.tags } },
       data: { tags },
     });
+    const group = await this.findByIdOrThrow(id);
+    // Сохранение формы без правки — не действие.
+    if (count > 0 && changed(existing.tags, tags)) {
+      await this.audit.record({
+        action: 'group.tags',
+        entityType: 'group',
+        entityId: group.id,
+        summary: `Изменил теги канала «${group.title}»: ${tags.join(', ') || 'без тегов'}`,
+        details: { before: existing.tags, after: tags },
+      });
+    }
     return this.toPublicGroup(group);
   }
 
@@ -198,9 +223,23 @@ export class GroupsService {
         'Группа уже деактивирована',
       );
     }
-    const group = await this.prisma.group.update({
-      where: { id },
+    const { count } = await this.prisma.group.updateMany({
+      where: { id, status: { not: 'removed' } },
       data: { status: 'removed' },
+    });
+    if (count === 0) {
+      // Второй клик: первый уже отключил.
+      throw new AppException(
+        ErrorCode.REQUEST_ERROR,
+        'Группа уже деактивирована',
+      );
+    }
+    const group = await this.findByIdOrThrow(id);
+    await this.audit.record({
+      action: 'group.deactivate',
+      entityType: 'group',
+      entityId: group.id,
+      summary: `Отключил канал «${group.title}»`,
     });
     return this.toPublicGroup(group);
   }
@@ -223,47 +262,80 @@ export class GroupsService {
     };
     const existing = await this.prisma.group.findUnique({ where });
 
+    let group: Group;
+    // Сменился ли статус этим событием — по нему решаем, писать ли в журнал:
+    // повтор события статус не меняет, а в гонке двух одинаковых событий
+    // второе упирается в уже созданную или обновлённую первым строку.
+    let statusChanged: boolean;
     try {
-      const group = existing
-        ? await this.prisma.group.update({
-            where: { id: existing.id },
-            data: {
-              title: input.title,
-              kind: input.kind,
-              status: this.maxDraftStatus(existing),
-            },
-          })
-        : await this.prisma.group.create({
-            data: {
-              platform: 'max',
-              kind: input.kind,
-              externalId: input.externalId,
-              title: input.title,
-              status: 'pending_confirmation',
-              tags: [],
-            },
+      ({ group, statusChanged } = existing
+        ? await this.reactivateMaxGroup(existing, input)
+        : {
+            statusChanged: true,
+            group: await this.prisma.group.create({
+              data: {
+                platform: 'max',
+                kind: input.kind,
+                externalId: input.externalId,
+                title: input.title,
+                status: 'pending_confirmation',
+                tags: [],
+              },
+            }),
           });
-      return this.toPublicGroup(group);
     } catch (err: unknown) {
       // See upsertVkGroupByExternalId: the same double-webhook-delivery race
       // applies here (a chat re-add event retried while the first is
       // in-flight), converging by updating the row that now exists.
-      if (!isUniqueConstraintViolation(err)) {
+      if (!isUniqueViolation(err)) {
         throw err;
       }
       const nowExisting = await this.prisma.group.findUniqueOrThrow({
         where,
       });
-      const group = await this.prisma.group.update({
-        where: { id: nowExisting.id },
-        data: {
-          title: input.title,
-          kind: input.kind,
-          status: this.maxDraftStatus(nowExisting),
-        },
-      });
-      return this.toPublicGroup(group);
+      ({ group, statusChanged } = await this.reactivateMaxGroup(
+        nowExisting,
+        input,
+      ));
     }
+    if (statusChanged) {
+      await this.audit.record({
+        actor: 'bot',
+        action: 'group.bot_added',
+        entityType: 'group',
+        entityId: group.id,
+        summary: `Бота добавили в «${group.title}»${group.status === 'pending_confirmation' ? ' — ждёт подтверждения' : ''}`,
+      });
+    }
+    return this.toPublicGroup(group);
+  }
+
+  /**
+   * Обновление условием «статус всё ещё тот, что прочитан»: если параллельное
+   * такое же событие успело раньше, это ничего не меняет (`statusChanged: false`) —
+   * и второй записи в журнале не будет.
+   */
+  private async reactivateMaxGroup(
+    existing: Group,
+    input: { kind: GroupKind; title: string },
+  ): Promise<{ group: Group; statusChanged: boolean }> {
+    const status = this.maxDraftStatus(existing);
+    const { count } = await this.prisma.group.updateMany({
+      where: { id: existing.id, status: existing.status },
+      data: { title: input.title, kind: input.kind, status },
+    });
+    // Статус успели сменить (подтвердили, параллельное событие) — его не
+    // трогаем, но название и тип из события всё равно свежее.
+    const group =
+      count > 0
+        ? await this.prisma.group.findUniqueOrThrow({
+            where: { id: existing.id },
+          })
+        : await this.prisma.group.update({
+            where: { id: existing.id },
+            data: { title: input.title, kind: input.kind },
+          });
+    return { group, statusChanged: count > 0 && existing.status !== status };
   }
 
   // A group that was ever actually confirmed (active/token_invalid/
@@ -298,15 +370,27 @@ export class GroupsService {
    * broadcast target that no admin ever approved.
    */
   async markMaxGroupBotRemoved(externalId: string): Promise<boolean> {
-    const { count } = await this.prisma.group.updateMany({
-      where: {
-        platform: 'max',
-        externalId,
-        status: { notIn: ['removed', 'pending_confirmation'] },
-      },
-      data: { status: 'bot_removed' },
-    });
-    return count > 0;
+    // Одним запросом с RETURNING: id и название для журнала приходят
+    // только при реальной смене статуса. Уже помеченная не трогается —
+    // строка возвращается, лишь если статус сменился, и два одновременных
+    // одинаковых события не дадут двух записей «бота удалили».
+    const [removed] = await this.prisma.$queryRaw<
+      { id: string; title: string }[]
+    >`
+      UPDATE "Group" SET status = 'bot_removed'
+      WHERE platform = 'max' AND "externalId" = ${externalId}
+        AND status NOT IN ('removed', 'pending_confirmation', 'bot_removed')
+      RETURNING id, title`;
+    if (removed) {
+      await this.audit.record({
+        actor: 'bot',
+        action: 'group.bot_removed',
+        entityType: 'group',
+        entityId: removed.id,
+        summary: `Бота удалили из канала «${removed.title}»`,
+      });
+    }
+    return removed !== undefined;
   }
 
   /** MAX drafts awaiting an admin's confirm/reject decision. */
@@ -322,10 +406,29 @@ export class GroupsService {
     const existing = await this.findByIdOrThrow(id);
     this.assertPendingMax(existing);
 
-    const group = await this.prisma.group.update({
-      where: { id },
+    // Условием: уведомление о новой группе получают все админы, и два
+    // почти одновременных «Подтвердить» иначе дали бы две записи в журнале.
+    const { count } = await this.prisma.group.updateMany({
+      where: { id, status: 'pending_confirmation' },
       data: { status: 'active', tags: tags ?? existing.tags },
     });
+    const group = await this.prisma.group.findUniqueOrThrow({ where: { id } });
+    // Не мы перевели — второе «Подтвердить» (уже `active`, тихо) или группу
+    // успели отклонить: тогда «подключена» было бы неправдой.
+    if (count === 0 && group.status !== 'active') {
+      throw new AppException(
+        ErrorCode.REQUEST_ERROR,
+        'Группа уже не ждёт подтверждения',
+      );
+    }
+    if (count > 0) {
+      await this.audit.record({
+        action: 'group.confirm',
+        entityType: 'group',
+        entityId: group.id,
+        summary: `Подтвердил канал «${group.title}»`,
+      });
+    }
     return this.toPublicGroup(group);
   }
 
@@ -339,17 +442,31 @@ export class GroupsService {
     // deliveries, a contest's subscription condition — and those rows pin
     // it: the delete then fails on a foreign key, and the rejection falls
     // back to the same soft-delete a deactivation uses.
+    // Условием «всё ещё ждёт подтверждения»: второе «Отклонить» (или
+    // «Подтвердить» другого админа) иначе падало бы на P2025 — 500 — или
+    // писало вторую запись в журнал.
+    const pending = { id, status: 'pending_confirmation' as const };
+    let count: number;
     try {
-      await this.prisma.group.delete({ where: { id } });
+      ({ count } = await this.prisma.group.deleteMany({ where: pending }));
     } catch (err: unknown) {
       if (!isForeignKeyViolation(err)) {
         throw err;
       }
-      await this.prisma.group.update({
-        where: { id },
+      ({ count } = await this.prisma.group.updateMany({
+        where: pending,
         data: { status: 'removed' },
-      });
+      }));
     }
+    if (count === 0) {
+      throw new AppException(ErrorCode.REQUEST_ERROR, 'Группа уже обработана');
+    }
+    await this.audit.record({
+      action: 'group.reject',
+      entityType: 'group',
+      entityId: id,
+      summary: `Отклонил канал «${existing.title}»`,
+    });
   }
 
   private assertPendingMax(group: Group): void {

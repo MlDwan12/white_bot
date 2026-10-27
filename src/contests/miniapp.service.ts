@@ -79,10 +79,8 @@ export class MiniAppService {
       case 'unknown_contest':
         throw new AppException(ErrorCode.NOT_FOUND, 'Конкурс не найден');
       case 'not_open':
-        throw new AppException(
-          ErrorCode.VALIDATION_ERROR,
-          'Приём участников ещё не открыт',
-        );
+        // Текст отказа — из `join`: «ещё не открыт», «завершён», «отменён».
+        throw new AppException(ErrorCode.VALIDATION_ERROR, outcome.message);
       case 'drawn':
         throw new AppException(
           ErrorCode.CONTEST_ALREADY_DRAWN,

@@ -17,7 +17,8 @@ import {
  */
 export interface ContestButton {
   contestId: string;
-  label: string;
+  /** `null` — конкурс отменён: кнопки нет, клавиатура снимается. */
+  label: string | null;
   /**
    * Текст сообщения целиком: после розыгрыша в нём итоги, поэтому текст
    * поста здесь не годится (см. `ContestParticipationService.announcementView`).
@@ -193,7 +194,7 @@ export class PostSender {
    * вторую кнопку.
    */
   private contestButtons(button?: ContestButton | null) {
-    if (!button) {
+    if (!button?.label) {
       return undefined;
     }
     return contestKeyboard(

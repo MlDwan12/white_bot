@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { isUUID } from 'class-validator';
 import {
   Body,
@@ -1486,8 +1487,61 @@ export class PanelController {
     @Res() res: Response,
     @Query('flash') flash?: string,
     @Query('reason') reason?: string,
+    @Query('issued') issuedToken?: string,
   ): Promise<void> {
-    await this.renderAdmins(res, req, admin, { flash, reason });
+    await this.renderAdmins(res, req, admin, {
+      flash,
+      reason,
+      issued: this.takeIssuedPassword(issuedToken, admin.id),
+    });
+  }
+
+  /**
+   * Выданный пароль — между POST и страницей, на которую он редиректит.
+   * Без этого страницу с паролем отдавал сам POST, и F5 отправлял форму
+   * повторно — выдавался ещё один пароль. В адресе — одноразовый ключ, не
+   * пароль; показывается один раз, только тому, кто его выдал, и недолго.
+   * ponytail: в памяти процесса — при нескольких экземплярах панели нужен
+   * общий стор (Redis).
+   */
+  private readonly issuedPasswords = new Map<
+    string,
+    {
+      issued: IssuedPassword & { reason: 'created' | 'reset' };
+      ownerId: string;
+      expiresAt: number;
+    }
+  >();
+
+  private stashIssuedPassword(
+    res: Response,
+    ownerId: string,
+    issued: IssuedPassword & { reason: 'created' | 'reset' },
+  ): void {
+    const now = Date.now();
+    for (const [key, entry] of this.issuedPasswords) {
+      if (entry.expiresAt < now) this.issuedPasswords.delete(key);
+    }
+    const token = randomUUID();
+    this.issuedPasswords.set(token, {
+      issued,
+      ownerId,
+      expiresAt: now + 5 * 60 * 1000,
+    });
+    // 303: обновление страницы после него — уже GET, а не повтор формы.
+    res.redirect(303, `${PANEL_PREFIX}/admins?issued=${token}`);
+  }
+
+  private takeIssuedPassword(
+    token: string | undefined,
+    ownerId: string,
+  ): (IssuedPassword & { reason: 'created' | 'reset' }) | undefined {
+    const entry = token ? this.issuedPasswords.get(token) : undefined;
+    if (!entry || entry.ownerId !== ownerId) {
+      return undefined;
+    }
+    this.issuedPasswords.delete(token!);
+    return entry.expiresAt >= Date.now() ? entry.issued : undefined;
   }
 
   @Post('admins')
@@ -1505,9 +1559,7 @@ export class PanelController {
         role: body.role as AdminRole,
         maxUserId: body.maxUserId,
       });
-      await this.renderAdmins(res, req, admin, {
-        issued: { ...issued, reason: 'created' },
-      });
+      this.stashIssuedPassword(res, admin.id, { ...issued, reason: 'created' });
     } catch (err: unknown) {
       this.logger.warn({ err }, 'Не удалось добавить админа');
       await this.renderAdmins(res, req, admin, {
@@ -1565,11 +1617,7 @@ export class PanelController {
     );
   }
 
-  /**
-   * Сброс пароля отвечает страницей, а не редиректом: новый пароль
-   * показывается один раз, и в адресе (история браузера, логи прокси) ему не
-   * место.
-   */
+  /** Новый пароль показывается один раз — через `stashIssuedPassword`. */
   @Post('admins/:id/reset-password')
   @UseGuards(AdminAuthGuard, CsrfGuard)
   @RequirePermissions('admins_manage')
@@ -1580,10 +1628,8 @@ export class PanelController {
     @Res() res: Response,
   ): Promise<void> {
     try {
-      const issued = await this.admins.resetPassword(id);
-      await this.renderAdmins(res, req, admin, {
-        issued: { ...issued, reason: 'reset' },
-      });
+      const issued = await this.admins.resetPassword(id, admin.id);
+      this.stashIssuedPassword(res, admin.id, { ...issued, reason: 'reset' });
     } catch (err: unknown) {
       this.logger.warn({ err, adminId: id }, 'Не удалось сбросить пароль');
       this.redirectFlash(
@@ -2173,21 +2219,21 @@ export class PanelController {
           'Текст конкурса обязателен — его увидят подписчики',
         );
       }
-      const contest = await this.contests.getContest(id);
-      if (!contest.post) {
+      const post = await this.contests.contestPost(id);
+      if (!post) {
         throw new AppException(
           ErrorCode.VALIDATION_ERROR,
           'У этого конкурса нет публикации',
         );
       }
       const attachmentIds = asArray(body.attachmentIds);
-      if (contest.post.status === 'draft') {
+      if (post.status === 'draft') {
         const groupIds = asArray(body.groupIds);
         await this.contests.assertPublishChannels(
           groupIds,
-          contest.post.deliveries.map((d) => d.groupId),
+          post.deliveries.map((d) => d.groupId),
         );
-        await this.posts.editDraft(contest.post.id, {
+        await this.posts.editDraft(post.id, {
           text,
           groupIds,
           attachmentIds,
@@ -2198,7 +2244,7 @@ export class PanelController {
         );
         return;
       }
-      const outcome = await this.moderation.editPublished(contest.post.id, {
+      const outcome = await this.moderation.editPublished(post.id, {
         text,
         // У конкурса один текст. Переопределение для MAX (бывает у постов,
         // привязанных старым способом) имеет приоритет над `text`, и без
@@ -2289,14 +2335,14 @@ export class PanelController {
       id,
       `${PANEL_PREFIX}/contests/${id}?flash=resumed`,
       async () => {
-        const contest = await this.contests.getContest(id);
-        if (!contest.post) {
+        const post = await this.contests.contestPost(id);
+        if (!post) {
           throw new AppException(
             ErrorCode.VALIDATION_ERROR,
             'У этого конкурса нет публикации',
           );
         }
-        await this.posts.resumePost(contest.post.id);
+        await this.posts.resumePost(post.id);
       },
     );
   }

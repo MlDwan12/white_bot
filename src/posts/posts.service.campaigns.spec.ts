@@ -31,6 +31,7 @@ function setup(
     prisma as unknown as PrismaService,
     { add: jest.fn() } as never,
     {} as unknown as VkUploaderTokenService,
+    { record: jest.fn(), purgeExpired: jest.fn() } as never,
     { setContext: jest.fn() } as unknown as PinoLogger,
   );
   return { service, prisma };

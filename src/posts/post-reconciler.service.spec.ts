@@ -32,7 +32,8 @@ function setup(lockAcquired = true) {
   const contests = {
     openDueContests: jest.fn().mockResolvedValue({ opened: [] }),
     openContestsWithUnsentAnnouncement: jest.fn().mockResolvedValue([]),
-    drawDueContests: jest.fn().mockResolvedValue({ drawn: 0 }),
+    drawDueContests: jest.fn().mockResolvedValue({ drawn: 0, cancelled: 0 }),
+    warnEmptyEndingContests: jest.fn().mockResolvedValue(0),
   };
   const redis = {
     set: jest.fn().mockResolvedValue(lockAcquired ? 'OK' : null),
@@ -52,6 +53,7 @@ function setup(lockAcquired = true) {
     templates as unknown as PostTemplatesService,
     moderation as unknown as PostModerationService,
     contests as unknown as ContestsService,
+    { record: jest.fn(), purgeExpired: jest.fn() } as never,
     redis as unknown as Redis,
     logger as unknown as PinoLogger,
   );
@@ -77,12 +79,12 @@ describe('PostReconcilerService', () => {
   });
 
   it('не запускает вторую сверку, пока идёт первая — даже когда Redis-лок истёк', async () => {
-    // Розыгрыш с проверкой подписки держит проход до минуты, а лок живёт
-    // 30 с: следующий тик таймера иначе пошёл бы параллельно.
+    // Любой медленный шаг держит проход дольше лока (30 с): следующий тик
+    // таймера иначе пошёл бы параллельно.
     const { service, contests, redis } = setup();
     let release!: () => void;
-    contests.drawDueContests.mockImplementationOnce(
-      () => new Promise((resolve) => (release = () => resolve({ drawn: 0 }))),
+    contests.warnEmptyEndingContests.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve(0))),
     );
 
     const first = service.runSweep();
@@ -92,7 +94,18 @@ describe('PostReconcilerService', () => {
     await first;
 
     expect(redis.set).toHaveBeenCalledTimes(1);
-    expect(contests.drawDueContests).toHaveBeenCalledTimes(1);
+    expect(contests.warnEmptyEndingContests).toHaveBeenCalledTimes(1);
+  });
+
+  it('розыгрыши по датам не держат сверку: проход завершается, не дожидаясь их', async () => {
+    // Розыгрыш с проверкой подписки ходит в MAX до минуты.
+    const { service, contests, moderation } = setup();
+    contests.drawDueContests.mockReturnValue(new Promise(() => {}));
+
+    await service.runSweep();
+
+    expect(contests.drawDueContests).toHaveBeenCalled();
+    expect(moderation.sweepAutoDeletions).toHaveBeenCalled();
   });
 
   it('takes the lock with NX and an expiry, so a crash cannot wedge it', async () => {

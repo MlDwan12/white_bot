@@ -35,6 +35,16 @@ export class ContestsController {
     return this.contests.createContest(dto);
   }
 
+  /**
+   * Воронка участия — статистика разработчика. Оба права: метод заменяет
+   * право класса, а не дополняет его.
+   */
+  @Get(':id/funnel')
+  @RequirePermissions('contests_manage', 'audit_viewAll')
+  funnel(@Param('id', ParseUUIDPipe) id: string) {
+    return this.contests.funnelStats(id);
+  }
+
   @Get(':id')
   get(@Param('id', ParseUUIDPipe) id: string) {
     return this.contests.getContest(id);

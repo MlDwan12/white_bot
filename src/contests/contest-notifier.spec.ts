@@ -84,7 +84,7 @@ function setup(
     participation as unknown as ContestParticipationService,
     logger as unknown as PinoLogger,
   );
-  return { notifier, prisma, max, adminNotifier, logger };
+  return { notifier, prisma, max, adminNotifier, logger, participation };
 }
 
 /** The status written for a prize by the notification pass. */
@@ -93,6 +93,47 @@ const notifyStatusOf = (prisma: ReturnType<typeof setup>['prisma']) =>
     .notifyStatus;
 
 describe('ContestNotifier', () => {
+  it('отмена: пост с пометкой и без клавиатуры, админам — сообщение', async () => {
+    const { notifier, max, adminNotifier, participation } = setup();
+    participation.announcementRefresh.mockResolvedValue({
+      text: 'Анонс\n\nКонкурс отменён — к сроку не набралось ни одного участника.',
+      buttonText: null,
+      payload: `contest:join:${CONTEST_ID}`,
+      messageIds: ['mid.1'],
+    });
+
+    await notifier.announceCancelled(CONTEST_ID);
+
+    const [, text, options] = max.editMessage.mock.calls[0] as [
+      string,
+      string,
+      { buttons?: unknown; attachments: unknown[] },
+    ];
+    expect(text).toMatch(/Конкурс отменён/);
+    // Без кнопок правка снимает клавиатуру; картинка — на месте.
+    expect(options.buttons).toBeUndefined();
+    expect(options.attachments).toHaveLength(1);
+    expect(adminNotifier.notifyAll).toHaveBeenCalledWith(
+      expect.stringContaining('отменён'),
+    );
+  });
+
+  it('предупреждение: кнопки продления на сутки и на 3 дня', async () => {
+    const { notifier, adminNotifier } = setup();
+
+    await notifier.warnEmptyEnding(CONTEST_ID, 'Пустой');
+
+    const [text, buttons] = adminNotifier.notifyAll.mock.calls[0] as [
+      string,
+      { payload: string }[][],
+    ];
+    expect(text).toContain('«Пустой»');
+    expect(buttons[0].map((b) => b.payload)).toEqual([
+      `contest:extend:${CONTEST_ID}:1`,
+      `contest:extend:${CONTEST_ID}:3`,
+    ]);
+  });
+
   it('swaps the button to the results label', async () => {
     const { notifier, max } = setup();
 

@@ -3,6 +3,7 @@
  * отправщику постов, и сервису участия, а те уже ссылаются друг на друга —
  * без этого файла импорты замкнулись бы в кольцо.
  */
+import type { MaxApiClient } from '../max/max-api.client';
 
 /** Полезная нагрузка кнопки участия: `contest:join:<uuid>`. */
 export const CONTEST_JOIN_PAYLOAD = /^contest:join:([0-9a-fA-F-]{36})$/;
@@ -83,6 +84,67 @@ export function contestKeyboard(
 }
 
 /**
+ * Клавиатура анонса по его текущему виду — или `undefined`, если кнопки нет
+ * (конкурс отменён): правка без кнопок снимает клавиатуру.
+ */
+export function announcementKeyboard(
+  view: { buttonText: string | null; payload: string },
+  contestId: string,
+  botUsername: string | null,
+): ContestKeyboardButton[][] | undefined {
+  return view.buttonText
+    ? contestKeyboard(
+        { text: view.buttonText, payload: view.payload },
+        contestDmUrl(botUsername, contestId),
+      )
+    : undefined;
+}
+
+/** То, что нужно от клиента MAX для перерисовки анонса. */
+type AnnouncementEditor = Pick<
+  MaxApiClient,
+  'botUsername' | 'getMessageBody' | 'editMessage'
+>;
+
+/**
+ * Перерисовывает все сообщения анонса под текущий вид. Одна реализация на
+ * обоих — подмену после розыгрыша/отмены и счётчик после вступления: две
+ * копии этого цикла уже расходились.
+ *
+ * Правка заменяет сообщение целиком, поэтому вложения снимаются с текущей
+ * версии и передаются заново — иначе картинка анонса исчезла бы у всех.
+ * Сбой по одному сообщению не мешает остальным; о нём сообщает `onError`.
+ */
+export async function rewriteAnnouncement(
+  api: AnnouncementEditor,
+  contestId: string,
+  view: {
+    text: string;
+    buttonText: string | null;
+    payload: string;
+    messageIds: string[];
+  },
+  onError: (err: unknown, messageId: string) => void,
+  onDropped: (dropped: string[]) => void,
+): Promise<void> {
+  const buttons = announcementKeyboard(view, contestId, api.botUsername());
+  for (const messageId of view.messageIds) {
+    try {
+      const current = await api.getMessageBody(messageId);
+      if (current.unsupported.length > 0) {
+        onDropped(current.unsupported);
+      }
+      await api.editMessage(messageId, view.text, {
+        attachments: current.attachments,
+        buttons,
+      });
+    } catch (err: unknown) {
+      onError(err, messageId);
+    }
+  }
+}
+
+/**
  * Поздравление победителя. Одно место для текста: его шлёт и уведомитель при
  * розыгрыше, и обработчик старта бота, когда победитель открыл диалог позже.
  * Две копии разошлись бы при первой же правке формулировки, и человек получал
@@ -117,6 +179,18 @@ export function announcementText(
   winnersList: string | null,
 ): string {
   return winnersList ? `${postText}\n\nПобедители:\n${winnersList}` : postText;
+}
+
+/**
+ * Кнопка продления в предупреждении админам «участников нет»:
+ * `contest:extend:<uuid>:<дней>`. Дни — из короткого списка, а не любое
+ * число из нажатия: полезную нагрузку можно подделать.
+ */
+export const CONTEST_EXTEND_PAYLOAD =
+  /^contest:extend:([0-9a-fA-F-]{36}):(1|3)$/;
+
+export function contestExtendPayload(contestId: string, days: 1 | 3): string {
+  return `contest:extend:${contestId}:${days}`;
 }
 
 /**

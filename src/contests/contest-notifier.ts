@@ -5,8 +5,8 @@ import { MaxApiClient } from '../max/max-api.client';
 import { AdminNotifier } from '../max/admin-notifier';
 import { ContestParticipationService } from './contest-participation.service';
 import {
-  contestDmUrl,
-  contestKeyboard,
+  contestExtendPayload,
+  rewriteAnnouncement,
   winnerCongratulation,
 } from './contest-button';
 
@@ -39,6 +39,41 @@ export class ContestNotifier {
     await this.notifyAdmins(contestId, reason);
   }
 
+  /** Отмена: пост — «Конкурс отменён» без кнопки, админам — сообщение. */
+  async announceCancelled(contestId: string): Promise<void> {
+    await this.swapButtons(contestId);
+    const contest = await this.prisma.contest.findUnique({
+      where: { id: contestId },
+      select: { title: true },
+    });
+    if (contest) {
+      await this.adminNotifier.notifyAll(
+        `Конкурс «${contest.title}» отменён: к сроку не набралось ни одного участника.`,
+      );
+    }
+  }
+
+  /** «Через 10 минут конец, участников нет» — с кнопками продления. */
+  async warnEmptyEnding(contestId: string, title: string): Promise<void> {
+    await this.adminNotifier.notifyAll(
+      `В конкурсе «${title}» нет ни одного участника, а до конца меньше 10 минут. Если не продлить, конкурс отменится.`,
+      [
+        [
+          {
+            type: 'callback',
+            text: 'Продлить на сутки',
+            payload: contestExtendPayload(contestId, 1),
+          },
+          {
+            type: 'callback',
+            text: 'Продлить на 3 дня',
+            payload: contestExtendPayload(contestId, 3),
+          },
+        ],
+      ],
+    );
+  }
+
   /**
    * Меняет подпись кнопки под анонсом на «Узнать результаты». Проверено
    * живьём: MAX разрешает боту-администратору править своё сообщение вместе
@@ -55,36 +90,23 @@ export class ContestNotifier {
     if (!view) {
       return;
     }
-    const buttons = contestKeyboard(
-      { text: view.buttonText, payload: view.payload },
-      // Ссылка на бота остаётся и после розыгрыша: победитель, который
-      // открыл диалог позже, получает поздравление сразу при старте.
-      contestDmUrl(this.max.botUsername(), contestId),
-    );
-
-    for (const messageId of view.messageIds) {
-      try {
-        // Правка заменяет сообщение целиком, поэтому медиа снимается со
-        // старой версии и передаётся заново — иначе картинка анонса
-        // исчезнет у всех.
-        const current = await this.max.getMessageBody(messageId);
-        if (current.unsupported.length > 0) {
-          this.logger.warn(
-            { contestId, dropped: current.unsupported },
-            'Вложения анонса, которые нечем пересобрать, потеряются при правке',
-          );
-        }
-        await this.max.editMessage(messageId, view.text, {
-          attachments: current.attachments,
-          buttons,
-        });
-      } catch (err: unknown) {
+    // Ссылка на бота остаётся и после розыгрыша: победитель, который открыл
+    // диалог позже, получает поздравление сразу при старте.
+    await rewriteAnnouncement(
+      this.max,
+      contestId,
+      view,
+      (err, messageId) =>
         this.logger.warn(
           { err, contestId, messageId },
           'Не удалось обновить анонс конкурса — останется кнопка «Участвовать», результаты отдаст обработчик нажатия',
-        );
-      }
-    }
+        ),
+      (dropped) =>
+        this.logger.warn(
+          { contestId, dropped },
+          'Вложения анонса, которые нечем пересобрать, потеряются при правке',
+        ),
+    );
   }
 
   /**

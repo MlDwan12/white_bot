@@ -60,6 +60,7 @@ function setup(
       count: jest.fn().mockResolvedValue(0),
     },
     contestParticipant: { count: jest.fn().mockResolvedValue(0) },
+    postAttachment: { findMany: jest.fn().mockResolvedValue([]) },
   };
   const sender = {
     delete: jest.fn().mockResolvedValue(undefined),
@@ -77,15 +78,17 @@ function setup(
   } as unknown as PinoLogger;
 
   const participation = { contestButton: jest.fn().mockResolvedValue(null) };
+  const audit = { record: jest.fn(), purgeExpired: jest.fn() };
 
   const service = new PostModerationService(
     prisma as unknown as PrismaService,
     sender as unknown as PostSender,
     posts as unknown as PostsService,
     participation as unknown as ContestParticipationService,
+    audit as never,
     logger,
   );
-  return { service, prisma, sender, posts, participation };
+  return { service, prisma, sender, posts, participation, audit };
 }
 
 /** Читает `data` последнего обновления доставки. */
@@ -201,6 +204,29 @@ describe('PostModerationService.deletePublished', () => {
 });
 
 describe('PostModerationService.editPublished', () => {
+  it('сохранение без правки — без записи в журнал, но в каналы правка уходит', async () => {
+    const same = {
+      id: POST_ID,
+      status: 'sent',
+      text: 'новый текст',
+      vkTextOverride: null,
+      maxTextOverride: null,
+      autoDeleteAt: null,
+      autoDeleteAfterMinutes: null,
+    };
+    const { service, sender, audit } = setup({ post: same });
+
+    await service.editPublished(POST_ID, { text: 'новый текст' });
+    expect(audit.record).not.toHaveBeenCalled();
+    expect(sender.edit).toHaveBeenCalled();
+
+    await service.editPublished(POST_ID, {
+      text: 'новый текст',
+      attachmentIds: ['m1'],
+    });
+    expect(audit.record).toHaveBeenCalledTimes(1);
+  });
+
   it('stops an in-flight campaign before saving the new text', async () => {
     const { service, posts, prisma } = setup({
       post: {
@@ -217,7 +243,9 @@ describe('PostModerationService.editPublished', () => {
     // навсегда осталась бы с двумя версиями.
     expect(posts.stopPost.mock.invocationCallOrder[0]).toBeLessThan(
       prisma.post.update.mock.invocationCallOrder[0],
-    );
+    ); // Стоп помечен «ради правки»: в журнале он виден как часть правки, а не
+    // как ручная остановка, — и виден, даже если правка потом сорвётся.
+    expect(posts.stopPost).toHaveBeenCalledWith(POST_ID, 'edit');
   });
 
   it('does not stop a campaign that already finished', async () => {

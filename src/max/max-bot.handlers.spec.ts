@@ -7,6 +7,7 @@ import { ContestParticipationService } from '../contests/contest-participation.s
 import { PlatformUsersService } from '../platform-users/platform-users.service';
 import { MaxApiClient } from './max-api.client';
 import { MaxBotHandlers, groupReviewPayload } from './max-bot.handlers';
+import { contestExtendPayload } from '../contests/contest-button';
 
 const GROUP_ID = '11111111-2222-3333-4444-555555555555';
 
@@ -78,6 +79,7 @@ function setup() {
       id: 'admin-1',
       email: 'admin@example.com',
       role: 'developer',
+      extraPermissions: [],
       maxUserId: '777',
     }),
     listNotifiableAdmins: jest
@@ -119,7 +121,9 @@ function setup() {
       prizeIdsToMark: [],
       joined: false,
     }),
-    isDrawn: jest.fn().mockResolvedValue(false),
+    isFinished: jest.fn().mockResolvedValue(false),
+    recordFunnel: jest.fn(),
+    noteAnonymousStart: jest.fn(),
     announcementRefresh: jest.fn().mockResolvedValue({
       text: 'Анонс',
       buttonText: 'Участвовать (5)',
@@ -127,6 +131,10 @@ function setup() {
       messageIds: ['mid.1', 'mid.2'],
     }),
     markWinnersNotified: jest.fn().mockResolvedValue(undefined),
+    extendContest: jest.fn().mockResolvedValue({
+      title: 'Пустой',
+      endsAt: new Date('2026-10-28T10:00:00Z'),
+    }),
   };
 
   // По умолчанию — уже согласившийся человек: так тесты, написанные до
@@ -318,6 +326,52 @@ describe('MaxBotHandlers', () => {
     await harness.fire('bot_removed', { chatId: 500 });
 
     expect(groups.markMaxGroupBotRemoved).toHaveBeenCalledWith('500');
+  });
+
+  describe('продление конкурса из предупреждения', () => {
+    const CONTEST = '22222222-3333-4444-5555-666666666666';
+
+    it('админ с правом продлевает и получает новый срок в ответе', async () => {
+      const { harness, contests, api } = setup();
+
+      await harness.fireAction(contestExtendPayload(CONTEST, 3), {
+        user: { user_id: 777 },
+        callback: { callback_id: 'cb-1' },
+      });
+
+      expect(contests.extendContest).toHaveBeenCalledWith(
+        CONTEST,
+        3,
+        'admin-1',
+      );
+      expect(api.answerCallback).toHaveBeenCalledWith(
+        'cb-1',
+        expect.stringContaining('продлён до'),
+      );
+    });
+
+    it('не админ — тишина, конкурс не трогаем', async () => {
+      const { harness, contests, admins } = setup();
+      admins.findByMaxUserId.mockResolvedValue(null);
+
+      await harness.fireAction(contestExtendPayload(CONTEST, 1), {
+        user: { user_id: 778 },
+        callback: { callback_id: 'cb-1' },
+      });
+
+      expect(contests.extendContest).not.toHaveBeenCalled();
+    });
+
+    it('подделанное число дней не распознаётся как продление', () => {
+      const { harness, contests } = setup();
+      expect(() =>
+        harness.fireAction(`contest:extend:${CONTEST}:365`, {
+          user: { user_id: 777 },
+          callback: { callback_id: 'cb-1' },
+        }),
+      ).toThrow(/Нет обработчика/);
+      expect(contests.extendContest).not.toHaveBeenCalled();
+    });
   });
 
   describe('group review buttons', () => {
@@ -574,7 +628,7 @@ describe('MaxBotHandlers', () => {
         text: 'Анонс\n\nПобедители:\n1. Место 1 — Иван',
         buttonText: 'Узнать результаты',
         payload: 'p',
-        drawn: true,
+        finished: true,
         messageIds: ['mid.1'],
       };
       contests.announcementRefresh
@@ -582,12 +636,12 @@ describe('MaxBotHandlers', () => {
           text: 'Анонс',
           buttonText: 'Участвовать (4)',
           payload: 'p',
-          drawn: false,
+          finished: false,
           messageIds: ['mid.1'],
         })
         .mockResolvedValue(results);
       // Розыгрыш прошёл, пока шла первая правка.
-      contests.isDrawn.mockResolvedValue(true);
+      contests.isFinished.mockResolvedValue(true);
 
       await harness.fire('bot_started', started(`c_${CONTEST}`));
 
@@ -705,6 +759,25 @@ describe('MaxBotHandlers', () => {
         type: 'callback',
         payload: `consent:c_${CONTEST}`,
       });
+    });
+
+    it('воронка: приход по ссылке конкурса считается ещё до экрана согласия — анонимно', async () => {
+      // Иначе отказавшиеся от согласия не попали бы в статистику вовсе.
+      const { harness, contests, platformUsers } = setup();
+      platformUsers.hasConsented.mockResolvedValue(false);
+
+      await harness.fire('bot_started', started(`c_${CONTEST}`));
+
+      // Только id конкурса: id человека до согласия не уходит никуда.
+      expect(contests.noteAnonymousStart).toHaveBeenCalledWith(CONTEST);
+    });
+
+    it('воронка: обычный старт без метки конкурса не пишется', async () => {
+      const { harness, contests } = setup();
+
+      await harness.fire('bot_started', started(null));
+
+      expect(contests.noteAnonymousStart).not.toHaveBeenCalled();
     });
 
     it('без согласия и без метки — тот же экран, не молчание', async () => {

@@ -32,8 +32,11 @@ function buildService() {
       create: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
+      deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
       updateMany: jest.fn(),
     },
+    // «Бота удалили» — одним UPDATE … RETURNING.
+    $queryRaw: jest.fn().mockResolvedValue([]),
   };
   const vkApiClient = {
     resolveGroupInfo: jest.fn(),
@@ -50,16 +53,26 @@ function buildService() {
     ),
   };
 
+  const audit = { record: jest.fn(), purgeExpired: jest.fn() };
   const service = new GroupsService(
     prisma as unknown as PrismaService,
     vkApiClient as unknown as VkApiClient,
     tokenEncryption as unknown as TokenEncryptionService,
     notifier as unknown as AdminNotifier,
+    audit as never,
     logger as unknown as PinoLogger,
     vkTokenProvider,
   );
 
-  return { service, prisma, vkApiClient, tokenEncryption, notifier, logger };
+  return {
+    service,
+    prisma,
+    vkApiClient,
+    tokenEncryption,
+    notifier,
+    logger,
+    audit,
+  };
 }
 
 describe('GroupsService', () => {
@@ -138,14 +151,20 @@ describe('GroupsService', () => {
       });
     });
 
-    it('says "token updated", not "connected", when the community was already active', async () => {
-      const { service, prisma, vkApiClient, notifier } = buildService();
+    it.each([
+      ['active', true],
+      // Слетевший токен заменили той же формой — это замена, не подключение.
+      ['token_invalid', true],
+      // Отключённое админом и подключённое снова — подключение.
+      ['removed', false],
+    ])('статус %s: «токен обновлён» = %s', async (status, tokenUpdate) => {
+      const { service, prisma, vkApiClient, notifier, audit } = buildService();
       prisma.group.findUnique.mockResolvedValue({
         id: 'g1',
         platform: 'vk',
         externalId: '42',
         tags: [],
-        status: 'active',
+        status,
       });
       vkApiClient.resolveGroupInfo.mockResolvedValue({
         externalId: '42',
@@ -166,8 +185,31 @@ describe('GroupsService', () => {
       await service.createVkGroup({ token: 'token' });
 
       expect(notifier.notifyAll).toHaveBeenCalledWith(
-        'Токен VK-сообщества «Тестовое сообщество» обновлён.',
+        tokenUpdate
+          ? 'Токен VK-сообщества «Тестовое сообщество» обновлён.'
+          : 'VK-сообщество «Тестовое сообщество» подключено.',
       );
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: tokenUpdate ? 'group.token' : 'group.connect_vk',
+        }),
+      );
+    });
+
+    it('сохранение тех же тегов — без записи в журнал', async () => {
+      const { service, prisma, audit } = buildService();
+      prisma.group.findUnique.mockResolvedValue({
+        id: 'g1',
+        title: 'Канал',
+        tags: ['a', 'b'],
+      });
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.updateTags('g1', ['a', 'b']);
+      expect(audit.record).not.toHaveBeenCalled();
+
+      await service.updateTags('g1', ['a']);
+      expect(audit.record).toHaveBeenCalledTimes(1);
     });
 
     it('throws a validation error when VK rejects the token', async () => {
@@ -299,7 +341,8 @@ describe('GroupsService', () => {
         id: 'g1',
         status: 'bot_removed',
       });
-      prisma.group.update.mockResolvedValue({
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+      prisma.group.findUniqueOrThrow.mockResolvedValue({
         id: 'g1',
         platform: 'max',
         kind: 'chat',
@@ -317,7 +360,7 @@ describe('GroupsService', () => {
         title: 'Чат',
       });
 
-      expect(lastCallArg(prisma.group.update)).toMatchObject({
+      expect(lastCallArg(prisma.group.updateMany)).toMatchObject({
         where: { id: 'g1' },
         data: { status: 'active' },
       });
@@ -330,7 +373,8 @@ describe('GroupsService', () => {
         id: 'g1',
         status: 'pending_confirmation',
       });
-      prisma.group.update.mockResolvedValue({
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+      prisma.group.findUniqueOrThrow.mockResolvedValue({
         id: 'g1',
         status: 'pending_confirmation',
         tags: [],
@@ -342,7 +386,7 @@ describe('GroupsService', () => {
         title: 'Чат',
       });
 
-      expect(lastCallArg(prisma.group.update)).toMatchObject({
+      expect(lastCallArg(prisma.group.updateMany)).toMatchObject({
         where: { id: 'g1' },
         data: { status: 'pending_confirmation' },
       });
@@ -354,7 +398,8 @@ describe('GroupsService', () => {
         id: 'g1',
         status: 'removed',
       });
-      prisma.group.update.mockResolvedValue({
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+      prisma.group.findUniqueOrThrow.mockResolvedValue({
         id: 'g1',
         status: 'pending_confirmation',
         tags: [],
@@ -366,7 +411,7 @@ describe('GroupsService', () => {
         title: 'Чат',
       });
 
-      expect(lastCallArg(prisma.group.update)).toMatchObject({
+      expect(lastCallArg(prisma.group.updateMany)).toMatchObject({
         where: { id: 'g1' },
         data: { status: 'pending_confirmation' },
       });
@@ -376,11 +421,12 @@ describe('GroupsService', () => {
       const { service, prisma } = buildService();
       prisma.group.findUnique.mockResolvedValue(null);
       prisma.group.create.mockRejectedValue(uniqueConstraintError());
-      prisma.group.findUniqueOrThrow.mockResolvedValue({
+      prisma.group.findUniqueOrThrow.mockResolvedValueOnce({
         id: 'winner',
         status: 'pending_confirmation',
       });
-      prisma.group.update.mockResolvedValue({
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+      prisma.group.findUniqueOrThrow.mockResolvedValue({
         id: 'winner',
         platform: 'max',
         kind: 'chat',
@@ -398,10 +444,43 @@ describe('GroupsService', () => {
         title: 'Чат',
       });
 
-      expect(lastCallArg(prisma.group.update)).toMatchObject({
+      expect(lastCallArg(prisma.group.updateMany)).toMatchObject({
         where: { id: 'winner' },
       });
       expect(result.id).toBe('winner');
+    });
+  });
+
+  describe('createOrReactivateMaxDraft — журнал', () => {
+    it('параллельное такое же событие успело раньше — без второй записи «бота добавили»', async () => {
+      const { service, prisma, audit } = buildService();
+      prisma.group.findUnique.mockResolvedValue({
+        id: 'g1',
+        status: 'bot_removed',
+      });
+      // Строка уже не `bot_removed` — её перевело первое событие.
+      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+      prisma.group.update.mockResolvedValue({
+        id: 'g1',
+        status: 'active',
+        tags: [],
+      });
+
+      await service.createOrReactivateMaxDraft({
+        externalId: 'c1',
+        kind: 'chat',
+        title: 'Чат',
+      });
+
+      expect(lastCallArg(prisma.group.updateMany)).toMatchObject({
+        where: { id: 'g1', status: 'bot_removed' },
+      });
+      // Статус не трогаем, а свежее название из события — записываем.
+      expect(lastCallArg(prisma.group.update)).toEqual({
+        where: { id: 'g1' },
+        data: { title: 'Чат', kind: 'chat' },
+      });
+      expect(audit.record).not.toHaveBeenCalled();
     });
   });
 
@@ -427,7 +506,8 @@ describe('GroupsService', () => {
         status: 'pending_confirmation',
         tags: [],
       });
-      prisma.group.update.mockResolvedValue({
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+      prisma.group.findUniqueOrThrow.mockResolvedValue({
         id: 'g1',
         status: 'active',
         tags: ['vip'],
@@ -435,10 +515,52 @@ describe('GroupsService', () => {
 
       await service.confirmMaxGroup('g1', ['vip']);
 
-      expect(prisma.group.update).toHaveBeenCalledWith({
-        where: { id: 'g1' },
+      expect(prisma.group.updateMany).toHaveBeenCalledWith({
+        where: { id: 'g1', status: 'pending_confirmation' },
         data: { status: 'active', tags: ['vip'] },
       });
+    });
+
+    it('группу успели отклонить — отказ, а не «подключена»', async () => {
+      const { service, prisma, audit } = buildService();
+      prisma.group.findUnique.mockResolvedValue({
+        id: 'g1',
+        platform: 'max',
+        status: 'pending_confirmation',
+        tags: [],
+      });
+      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+      prisma.group.findUniqueOrThrow.mockResolvedValue({
+        id: 'g1',
+        status: 'removed',
+        tags: [],
+      });
+
+      await expect(service.confirmMaxGroup('g1')).rejects.toMatchObject({
+        code: ErrorCode.REQUEST_ERROR,
+      });
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('второе почти одновременное «Подтвердить» — без второй записи в журнале', async () => {
+      const { service, prisma, audit } = buildService();
+      prisma.group.findUnique.mockResolvedValue({
+        id: 'g1',
+        platform: 'max',
+        status: 'pending_confirmation',
+        tags: [],
+      });
+      // Первое уже перевело строку в `active`.
+      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+      prisma.group.findUniqueOrThrow.mockResolvedValue({
+        id: 'g1',
+        status: 'active',
+        tags: [],
+      });
+
+      await service.confirmMaxGroup('g1');
+
+      expect(audit.record).not.toHaveBeenCalled();
     });
 
     it('hard-deletes a rejected pending draft', async () => {
@@ -451,7 +573,24 @@ describe('GroupsService', () => {
 
       await service.rejectMaxGroup('g1');
 
-      expect(prisma.group.delete).toHaveBeenCalledWith({ where: { id: 'g1' } });
+      expect(prisma.group.deleteMany).toHaveBeenCalledWith({
+        where: { id: 'g1', status: 'pending_confirmation' },
+      });
+    });
+
+    it('второе «Отклонить» — понятный отказ, а не 500 и не вторая запись', async () => {
+      const { service, prisma, audit } = buildService();
+      prisma.group.findUnique.mockResolvedValue({
+        id: 'g1',
+        platform: 'max',
+        status: 'pending_confirmation',
+      });
+      prisma.group.deleteMany.mockResolvedValue({ count: 0 });
+
+      await expect(service.rejectMaxGroup('g1')).rejects.toMatchObject({
+        code: ErrorCode.REQUEST_ERROR,
+      });
+      expect(audit.record).not.toHaveBeenCalled();
     });
 
     it('falls back to a soft delete when a returning group still has history pinning it', async () => {
@@ -461,60 +600,77 @@ describe('GroupsService', () => {
         platform: 'max',
         status: 'pending_confirmation',
       });
-      prisma.group.delete.mockRejectedValue(
+      prisma.group.deleteMany.mockRejectedValue(
         new Prisma.PrismaClientKnownRequestError('fk', {
           code: 'P2003',
           clientVersion: 'test',
         }),
       );
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
 
       await service.rejectMaxGroup('g1');
 
-      expect(prisma.group.update).toHaveBeenCalledWith({
-        where: { id: 'g1' },
+      expect(prisma.group.updateMany).toHaveBeenCalledWith({
+        where: { id: 'g1', status: 'pending_confirmation' },
         data: { status: 'removed' },
       });
     });
   });
 
   describe('markMaxGroupBotRemoved', () => {
-    it('marks a known MAX group as bot_removed', async () => {
-      const { service, prisma } = buildService();
-      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+    const sqlOf = (prisma: { $queryRaw: jest.Mock }) =>
+      ((prisma.$queryRaw.mock.calls as unknown[][])[0][0] as string[]).join(
+        '?',
+      );
 
-      await expect(service.markMaxGroupBotRemoved('500')).resolves.toBe(true);
-      expect(prisma.group.updateMany).toHaveBeenCalledWith({
-        where: {
-          platform: 'max',
-          externalId: '500',
-          status: { notIn: ['removed', 'pending_confirmation'] },
-        },
-        data: { status: 'bot_removed' },
-      });
-    });
-
-    it('leaves an explicitly disconnected group and an unreviewed draft alone', async () => {
-      const { service, prisma } = buildService();
-      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+    it('повтор того же события — без второй записи «бота удалили» в журнале', async () => {
+      // Уже помеченная группа не попадает под условие: строк нет — и
+      // записи нет, даже когда два одинаковых события пришли одновременно.
+      const { service, prisma, audit } = buildService();
+      prisma.$queryRaw.mockResolvedValue([]);
 
       await expect(service.markMaxGroupBotRemoved('500')).resolves.toBe(false);
-      const where = lastCallArg<{ where: { status: unknown } }>(
-        prisma.group.updateMany,
-      ).where;
+
+      expect(audit.record).not.toHaveBeenCalled();
+    });
+
+    it('первое событие — запись с id и названием группы, не с id чата', async () => {
+      const { service, prisma, audit } = buildService();
+      prisma.$queryRaw.mockResolvedValue([{ id: 'g-1', title: 'Новости' }]);
+
+      await expect(service.markMaxGroupBotRemoved('500')).resolves.toBe(true);
+
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          entityId: 'g-1',
+          action: 'group.bot_removed',
+          summary: 'Бота удалили из канала «Новости»',
+        }),
+      );
+    });
+
+    it('не трогает отключённую админом, неподтверждённую и уже помеченную', async () => {
+      const { service, prisma } = buildService();
+
+      await service.markMaxGroupBotRemoved('500');
+
       // `removed` means an admin disconnected it on purpose. And overwriting
       // a `pending_confirmation` draft would be worse than cosmetic:
       // maxDraftStatus reads `bot_removed` as "was confirmed once", so a
       // draft removed before review and then re-added would come back
-      // `active` — a live broadcast target nobody ever approved.
-      expect(where.status).toEqual({
-        notIn: ['removed', 'pending_confirmation'],
-      });
+      // `active` — a live broadcast target nobody ever approved. Уже
+      // помеченная `bot_removed` тоже не трогается — повтор события не
+      // должен давать вторую запись в журнале.
+      expect(sqlOf(prisma)).toContain(
+        "status NOT IN ('removed', 'pending_confirmation', 'bot_removed')",
+      );
+      expect(sqlOf(prisma)).toContain("platform = 'max'");
     });
 
     it('does not let an unreviewed draft reach active by way of bot_removed', async () => {
       const { service, prisma } = buildService();
       // The draft was never reviewed, so the removal must not touch it...
-      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+      prisma.$queryRaw.mockResolvedValue([]);
       await service.markMaxGroupBotRemoved('500');
 
       // ...and re-adding the bot must therefore still ask for confirmation.
@@ -522,31 +678,26 @@ describe('GroupsService', () => {
         id: 'g1',
         status: 'pending_confirmation',
       });
-      prisma.group.update.mockImplementation(
-        (args: { data: { status: string } }) => ({
-          id: 'g1',
-          platform: 'max',
-          kind: 'chat',
-          externalId: '500',
-          title: 'Чат',
-          tokenMask: null,
-          tags: [],
-          status: args.data.status,
-          createdAt: new Date(),
-        }),
-      );
+      prisma.group.updateMany.mockResolvedValue({ count: 1 });
+      prisma.group.findUniqueOrThrow.mockResolvedValue({
+        id: 'g1',
+        status: 'pending_confirmation',
+        tags: [],
+      });
 
-      const group = await service.createOrReactivateMaxDraft({
+      await service.createOrReactivateMaxDraft({
         externalId: '500',
         kind: 'chat',
         title: 'Чат',
       });
-      expect(group.status).toBe('pending_confirmation');
+      expect(lastCallArg(prisma.group.updateMany)).toMatchObject({
+        data: { status: 'pending_confirmation' },
+      });
     });
 
     it('reports an unknown chat as nothing-to-do rather than failing', async () => {
       const { service, prisma } = buildService();
-      prisma.group.updateMany.mockResolvedValue({ count: 0 });
+      prisma.$queryRaw.mockResolvedValue([]);
 
       // A rejected draft is hard-deleted, so its removal event has no row.
       await expect(service.markMaxGroupBotRemoved('999')).resolves.toBe(false);

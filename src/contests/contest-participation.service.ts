@@ -1,7 +1,18 @@
 import { Injectable } from '@nestjs/common';
+import {
+  isForeignKeyViolation,
+  isLockNotAvailable,
+  isUniqueViolation,
+} from '../common/prisma-errors';
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service';
-import { Contest, Platform, Post, Prisma } from '../generated/prisma/client';
+import {
+  Contest,
+  ContestFunnelStage,
+  ContestStatus,
+  Platform,
+  Post,
+} from '../generated/prisma/client';
 import { PostSender, type ContestButton } from '../posts/post-sender';
 import {
   PlatformUsersService,
@@ -17,6 +28,10 @@ import {
   type ContestKeyboardButton,
 } from './contest-button';
 import { buildDedupKey } from './contest-participants';
+import { assertNotFinished, isFinished } from './contest-status';
+import { AppException } from '../common/app-exception';
+import { ErrorCode } from '../common/error-code.enum';
+import { AuditService } from '../audit/audit.service';
 import {
   ContestSubscriptions,
   type MissingChannel,
@@ -40,10 +55,11 @@ export type JoinStatus =
  */
 export interface AnnouncementRefresh {
   text: string;
-  buttonText: string;
+  /** `null` — кнопки нет вовсе (конкурс отменён): клавиатура снимается. */
+  buttonText: string | null;
   payload: string;
-  /** Вид после розыгрыша (итоги, «Узнать результаты»). */
-  drawn: boolean;
+  /** Итог подведён — разыгран (итоги, «Узнать результаты») или отменён. */
+  finished: boolean;
 }
 
 export interface JoinOutcome {
@@ -83,6 +99,12 @@ export interface JoinRequest {
    * справочное поле, а не часть ключа дедупликации.
    */
   groupExternalId?: string | null;
+  /**
+   * Вид анонса для перерисовки не нужен — старт бота по ссылке отвечает
+   * текстом в лс и перерисовывает пост сам. Без флага каждый старт собирал
+   * вид (с подсчётом участников) впустую.
+   */
+  withoutRefresh?: boolean;
 }
 
 /**
@@ -100,9 +122,64 @@ export class ContestParticipationService {
     private readonly prisma: PrismaService,
     private readonly platformUsers: PlatformUsersService,
     private readonly subscriptions: ContestSubscriptions,
+    private readonly audit: AuditService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(ContestParticipationService.name);
+  }
+
+  /**
+   * Продление по кнопке из предупреждения «участников нет». Здесь, а не в
+   * `ContestsService`: кнопку обрабатывает MAX-бот, а сервис конкурсов сам
+   * зависит от модуля MAX. Новый срок — от прежнего, а если тот уже прошёл
+   * (кнопку нажали поздно, но конкурс ещё не отменён), — от сейчас.
+   * Отметка предупреждения сбрасывается: продлённый и снова пустой
+   * конкурс предупредит ещё раз.
+   */
+  async extendContest(
+    contestId: string,
+    days: 1 | 3,
+    adminId: string,
+  ): Promise<{ title: string; endsAt: Date }> {
+    const updated = await this.prisma.$transaction(
+      async (tx) => {
+        const [row] = await tx.$queryRaw<
+          { status: ContestStatus; endsAt: Date | null }[]
+        >`SELECT status, "endsAt" FROM "Contest" WHERE id = ${contestId} FOR NO KEY UPDATE`;
+        if (!row) {
+          throw new AppException(ErrorCode.NOT_FOUND, 'Конкурс не найден');
+        }
+        assertNotFinished(row.status, 'Розыгрыш уже проведён');
+        if (row.status !== 'open') {
+          throw new AppException(
+            ErrorCode.VALIDATION_ERROR,
+            'Конкурс ещё не открыт — продлевать нечего',
+          );
+        }
+        const now = Date.now();
+        const from = Math.max(row.endsAt?.getTime() ?? now, now);
+        return tx.contest.update({
+          where: { id: contestId },
+          data: {
+            endsAt: new Date(from + days * 24 * 60 * 60 * 1000),
+            endWarningSentAt: null,
+          },
+          select: { title: true, endsAt: true },
+        });
+      },
+      // Блокировку может держать идущий розыгрыш — до минуты; ожидание идёт
+      // в счёт `timeout`, стандартных 5 с мало.
+      { timeout: EXTEND_TX_TIMEOUT_MS },
+    );
+    await this.audit.record({
+      actor: { adminId },
+      action: 'contest.extend',
+      entityType: 'contest',
+      entityId: contestId,
+      summary: `Продлил конкурс «${updated.title}» на ${days === 1 ? 'сутки' : '3 дня'}`,
+      details: { endsAt: updated.endsAt!.toISOString() },
+    });
+    return { title: updated.title, endsAt: updated.endsAt! };
   }
 
   async join(request: JoinRequest): Promise<JoinOutcome> {
@@ -118,27 +195,35 @@ export class ContestParticipationService {
         message: 'Конкурс не найден — возможно, он был удалён.',
       };
     }
+    const view = () =>
+      request.withoutRefresh
+        ? Promise.resolve(undefined)
+        : this.announcementView(contest);
 
     if (contest.status === 'drawn') {
       return {
         status: 'drawn',
         message: await this.resultsMessage(contest.id),
-        refresh: await this.announcementView(contest),
+        refresh: await view(),
+      };
+    }
+
+    if (contest.status === 'cancelled') {
+      return {
+        status: 'not_open',
+        message: CANCELLED_MESSAGE,
+        refresh: await view(),
       };
     }
 
     // Срок прошёл, а розыгрыш ещё не состоялся (сверка не успела или не
     // хватает подписанных на места и конкурс ждёт админа): опоздавший не
     // должен попасть в конкурс после объявленного окончания.
-    if (
-      contest.status === 'open' &&
-      contest.endsAt &&
-      contest.endsAt.getTime() <= Date.now()
-    ) {
+    if (contest.status === 'open' && !isAcceptingEntries(contest)) {
       return {
         status: 'not_open',
         message: 'Приём участников завершён — скоро будут итоги.',
-        refresh: await this.announcementView(contest),
+        refresh: await view(),
       };
     }
 
@@ -146,9 +231,21 @@ export class ContestParticipationService {
       return {
         status: 'not_open',
         message: 'Приём участников ещё не открыт.',
-        refresh: await this.announcementView(contest),
+        refresh: await view(),
       };
     }
+
+    // Воронка — только у открытого конкурса: нажавший «Узнать результаты»
+    // после розыгрыша участвовать не начинал. События с id человека — только
+    // после согласия (152-ФЗ); до него — анонимный счётчик у экрана согласия
+    // (`noteAnonymousStart`).
+    const funnel = (stage: ContestFunnelStage) =>
+      this.recordFunnel(
+        contest.id,
+        request.platform,
+        request.user.externalUserId,
+        stage,
+      );
 
     // Единая точка: `join` — единственное место, которое действительно
     // сохраняет профиль и записывает участие, и все три пути к нему (старт
@@ -169,6 +266,9 @@ export class ContestParticipationService {
           'Чтобы участвовать, сначала откройте диалог с ботом («Начать») и подтвердите согласие на обработку персональных данных.',
       };
     }
+    // Этап воронки «согласие есть» — и у давшего его только что, и у
+    // согласившегося раньше: оба прошли экран согласия.
+    funnel('consented');
 
     // Условие «подписаться на каналы» — после согласия (без него профиль
     // человека не трогаем) и до записи. Проверяется и у уже участвующего:
@@ -192,15 +292,16 @@ export class ContestParticipationService {
           message:
             'Не получилось проверить подписку на каналы. Попробуйте ещё раз через минуту.',
           missingChannels: [],
-          refresh: await this.announcementView(contest),
+          refresh: await view(),
         };
       }
       if (missing.length > 0) {
+        funnel('not_subscribed');
         return {
           status: 'not_subscribed',
           message: notSubscribedText(missing),
           missingChannels: missing,
-          refresh: await this.announcementView(contest),
+          refresh: await view(),
         };
       }
     }
@@ -292,11 +393,94 @@ export class ContestParticipationService {
       message = 'Вы уже участвуете в этом конкурсе.';
     }
 
+    funnel(status === 'joined' ? 'joined' : 'already_joined');
     return {
       status,
       message,
-      refresh: await this.announcementView(contest),
+      refresh: await view(),
     };
+  }
+
+  /**
+   * Событие воронки участия — для статистики разработчика (уникальные люди
+   * на каждом этапе). Best-effort и не ждётся: сбой не мешает участию.
+   * Только для давших согласие: до него id человека не храним.
+   */
+  private recordFunnel(
+    contestId: string,
+    platform: Platform,
+    externalUserId: string,
+    stage: ContestFunnelStage,
+  ): void {
+    // Уже записанное этим процессом в базу не шлём: при потоке повторных
+    // нажатий каждое давало бы две пустые вставки на горячем пути.
+    const key = `${contestId}:${platform}:${externalUserId}:${stage}`;
+    if (this.recordedFunnel.has(key)) {
+      return;
+    }
+    // ponytail: сброс целиком при переполнении — после него повторы снова
+    // дойдут до unique в базе, это лишь лишние вставки, а не дубли.
+    if (this.recordedFunnel.size >= FUNNEL_MEMO_LIMIT) {
+      this.recordedFunnel.clear();
+    }
+    this.recordedFunnel.add(key);
+    // Не ждём: это статистика, а ответ на нажатие и так ждёт MAX. Ошибки
+    // ловятся здесь же — необработанного промиса не остаётся.
+    // Один раз на человека и этап: повторное нажатие упирается в unique и
+    // молча пропускается — таблица не растёт от кликов.
+    void this.prisma.contestFunnelEvent
+      .createMany({
+        data: [{ contestId, platform, externalUserId, stage }],
+        skipDuplicates: true,
+      })
+      .catch((err: unknown) => {
+        // Не записалось — пусть следующее нажатие попробует снова.
+        this.recordedFunnel.delete(key);
+        // Конкурса уже нет (кнопка под постом переживает удаление) — штатно.
+        if (isForeignKeyViolation(err)) {
+          return;
+        }
+        this.logger.warn(
+          { err, contestId, stage },
+          'Не удалось записать событие воронки конкурса',
+        );
+      });
+  }
+
+  /** События воронки, уже записанные этим процессом, — см. `recordFunnel`. */
+  private readonly recordedFunnel = new Set<string>();
+
+  /**
+   * Старт бота по ссылке конкурса **до согласия** — только +1 к счётчику
+   * конкурса, без id человека (152-ФЗ: до согласия о нём ничего не храним).
+   * Иначе отказавшиеся от согласия выпали бы из статистики. Считается только
+   * здесь, у экрана согласия: нажатие кнопки без согласия ведёт сюда же по
+   * ссылке, и счёт и там дал бы двойной учёт. Только у открытого конкурса
+   * (см. комментарий в `join`). Не ждётся, как и воронка.
+   */
+  noteAnonymousStart(contestId: string): void {
+    // Одним запросом: вставка только у конкурса, который принимает
+    // участников, — то же правило, что `isAcceptingEntries` (держать в
+    // согласии). Удалённый или закрытый конкурс — просто 0 строк, без гонки
+    // между проверкой и записью.
+    void this.prisma.$executeRaw`
+      INSERT INTO "ContestAnonymousStarts" ("contestId", count)
+      SELECT id, 1 FROM "Contest"
+      WHERE id = ${contestId} AND status = 'open'
+        AND ("endsAt" IS NULL OR "endsAt" > now())
+      ON CONFLICT ("contestId")
+      DO UPDATE SET count = "ContestAnonymousStarts".count + 1`.catch(
+      (err: unknown) => {
+        // Конкурс удалили прямо между выборкой и вставкой — штатно.
+        if (isForeignKeyViolation(err)) {
+          return;
+        }
+        this.logger.warn(
+          { err, contestId },
+          'Не удалось записать начало участия',
+        );
+      },
+    );
   }
 
   /**
@@ -336,29 +520,38 @@ export class ContestParticipationService {
       return undefined;
     }
     const drawn = contest.status === 'drawn';
+    const cancelled = contest.status === 'cancelled';
     // После розыгрыша счётчик не показывается: кнопка ведёт к итогам.
-    const count = drawn
-      ? 0
-      : await this.prisma.contestParticipant.count({
-          where: { contestId: contest.id },
-        });
+    const count =
+      drawn || cancelled
+        ? 0
+        : await this.prisma.contestParticipant.count({
+            where: { contestId: contest.id },
+          });
     // Победители дописываются в сам пост, потому что это единственный канал,
     // который видят все подписчики: лс от бота доходит не всем.
     const winners =
       drawn && contest.publishResultsInPost
         ? await this.winnersList(contest.id)
         : null;
+    const postText = PostSender.resolveText(contest.post, 'max');
+    if (cancelled) {
+      // Кнопку снимаем: участвовать нельзя, итогов нет.
+      return {
+        text: `${postText}\n\n${CANCELLED_MESSAGE}`,
+        buttonText: null,
+        payload: contestJoinPayload(contest.id),
+        finished: true,
+      };
+    }
     return {
-      text: announcementText(
-        PostSender.resolveText(contest.post, 'max'),
-        winners,
-      ),
+      text: announcementText(postText, winners),
       buttonText: joinButtonText(
         drawn ? contest.resultsButtonLabel : contest.joinButtonLabel,
         count,
       ),
       payload: contestJoinPayload(contest.id),
-      drawn,
+      finished: drawn,
     };
   }
 
@@ -405,6 +598,10 @@ export class ContestParticipationService {
       };
     }
 
+    if (contest.status === 'cancelled') {
+      return { text: CANCELLED_MESSAGE, prizeIdsToMark: [], joined: false };
+    }
+
     if (contest.status === 'drawn') {
       // Поздравление задним числом — только там, где оно не дошло. Место
       // в состоянии `pending` принадлежит уведомителю: розыгрыш только что
@@ -448,6 +645,7 @@ export class ContestParticipationService {
       platform: 'max',
       user,
       groupExternalId: null,
+      withoutRefresh: true,
     });
 
     if (outcome.status === 'joined' || outcome.status === 'already_joined') {
@@ -511,13 +709,16 @@ export class ContestParticipationService {
     };
   }
 
-  /** Только статус — на каждое нажатие, поэтому без сборки всего вида. */
-  async isDrawn(contestId: string): Promise<boolean> {
+  /**
+   * Подведён ли итог (разыгран или отменён). Только статус — на каждое
+   * нажатие, поэтому без сборки всего вида.
+   */
+  async isFinished(contestId: string): Promise<boolean> {
     const contest = await this.prisma.contest.findUnique({
       where: { id: contestId },
       select: { status: true },
     });
-    return contest?.status === 'drawn';
+    return contest ? isFinished(contest.status) : false;
   }
 
   /** Сообщения анонса во всех MAX-группах, куда он вышел. */
@@ -597,6 +798,10 @@ export class ContestParticipationService {
   }
 }
 
+/** Одна формулировка отмены — для поста, ответа на кнопку и лс. */
+const CANCELLED_MESSAGE =
+  'Конкурс отменён — к сроку не набралось ни одного участника.';
+
 /**
  * Сколько ждать занятую строку конкурса: правки конкурса длятся
  * миллисекунды, розыгрыш с проверкой подписки — секунды. Литерал, а не
@@ -604,27 +809,23 @@ export class ContestParticipationService {
  */
 const JOIN_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '2s'";
 
-/**
- * `55P03` — строка занята дольше `lock_timeout` (идёт розыгрыш). С адаптером
- * драйвера Prisma отдаёт его не своим кодом, а как P2010 с исходным кодом
- * Postgres внутри (проверено живьём на dev-базе, 23.09.2026).
- */
-function isLockNotAvailable(err: unknown): boolean {
-  if (
-    !(err instanceof Prisma.PrismaClientKnownRequestError) ||
-    err.code !== 'P2010'
-  ) {
-    return false;
-  }
-  const cause = (
-    err.meta as
-      { driverAdapterError?: { cause?: { code?: unknown } } } | undefined
-  )?.driverAdapterError?.cause;
-  return cause?.code === '55P03';
-}
+/** Сколько событий воронки помнить — см. `recordFunnel`. */
+const FUNNEL_MEMO_LIMIT = 10_000;
 
-function isUniqueViolation(err: unknown): boolean {
+/** Ждать строку конкурса при продлении — розыгрыш держит её до минуты. */
+const EXTEND_TX_TIMEOUT_MS = 90_000;
+
+/**
+ * Принимает ли конкурс участников прямо сейчас: открыт и срок не прошёл
+ * (после `endsAt` приём закрыт, даже если розыгрыш ещё не состоялся). Одно
+ * место правила для `join`; его SQL-копия — в `noteAnonymousStart`.
+ */
+function isAcceptingEntries(contest: {
+  status: string;
+  endsAt: Date | null;
+}): boolean {
   return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002'
+    contest.status === 'open' &&
+    !(contest.endsAt && contest.endsAt.getTime() <= Date.now())
   );
 }

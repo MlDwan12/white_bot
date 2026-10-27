@@ -6,6 +6,7 @@ import { ErrorCode } from '../common/error-code.enum';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   Contest,
+  ContestFunnelStage,
   ContestStatus,
   Group,
   Platform,
@@ -20,6 +21,8 @@ import {
 } from './contest-draw';
 import { buildDedupKey, parseParticipantLines } from './contest-participants';
 import { ContestSubscriptions } from './contest-subscriptions';
+import { AuditService, changed } from '../audit/audit.service';
+import { assertNotFinished, FINISHED_STATUSES } from './contest-status';
 
 /**
  * Розыгрыш с условием подписки ходит в MAX изнутри транзакции: по запросу на
@@ -34,6 +37,9 @@ const DRAW_TX_TIMEOUT_MS = 60_000;
  * (до `DRAW_TX_TIMEOUT_MS`), а потом за миллисекунды стирает строки.
  */
 const DELETE_TX_TIMEOUT_MS = DRAW_TX_TIMEOUT_MS + 30_000;
+
+/** За сколько до `endsAt` предупреждать о конкурсе без участников. */
+const END_WARNING_BEFORE_MS = 10 * 60 * 1000;
 
 export interface CreateContestInput {
   title: string;
@@ -102,6 +108,7 @@ export class ContestsService {
     private readonly prisma: PrismaService,
     private readonly notifier: ContestNotifier,
     private readonly subscriptions: ContestSubscriptions,
+    private readonly audit: AuditService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(ContestsService.name);
@@ -208,6 +215,12 @@ export class ContestsService {
       );
     }
     const [contest] = (await this.prisma.$transaction(queries)) as [Contest];
+    await this.audit.record({
+      action: 'contest.create',
+      entityType: 'contest',
+      entityId: contest.id,
+      summary: `Создал конкурс «${contest.title}»`,
+    });
 
     return contest;
   }
@@ -315,12 +328,10 @@ export class ContestsService {
     now: Date = new Date(),
   ): Promise<Contest> {
     const contest = await this.requireContest(contestId);
-    if (contest.status === 'drawn') {
-      throw new AppException(
-        ErrorCode.CONTEST_ALREADY_DRAWN,
-        'Розыгрыш уже проведён — условия конкурса больше не редактируются',
-      );
-    }
+    assertNotFinished(
+      contest.status,
+      'Розыгрыш уже проведён — условия конкурса больше не редактируются',
+    );
     if (input.startsAt && input.endsAt && input.startsAt >= input.endsAt) {
       throw new AppException(
         ErrorCode.VALIDATION_ERROR,
@@ -362,42 +373,91 @@ export class ContestsService {
     // Условия меняются и у открытого конкурса. Уже записанных участников это
     // не выкидывает: новое условие проверится у выпавших победителей при
     // розыгрыше, как и у всех остальных.
-    return this.prisma.$transaction(async (tx) => {
-      // Условием, а не по голому id: проверка статуса выше — до транзакции,
-      // а розыгрыш держит строку до минуты (проверка подписки). Сохранение,
-      // дождавшееся его коммита, иначе переписало бы условия уже
-      // разыгранного конкурса.
-      const changed = await tx.contest.updateMany({
-        where: { id: contestId, status: { not: 'drawn' } },
-        data: {
-          title: input.title,
-          // Не передано — не трогаем: панель его больше не правит (текст
-          // конкурса живёт в посте публикации), а REST по-прежнему может.
-          ...(input.description !== undefined
-            ? { description: input.description }
-            : {}),
-          joinButtonLabel: input.joinButtonLabel,
-          resultsButtonLabel: input.resultsButtonLabel,
-          notifyWinners: input.notifyWinners,
-          publishResultsInPost: input.publishResultsInPost,
-          startsAt: input.startsAt ?? null,
-          endsAt: input.endsAt ?? null,
-        },
-      });
-      if (changed.count === 0) {
-        throw new AppException(
-          ErrorCode.CONTEST_ALREADY_DRAWN,
-          'Розыгрыш уже проведён — условия конкурса больше не редактируются',
-        );
-      }
-      if (requiredGroupIds !== undefined) {
-        await tx.contestRequiredGroup.deleteMany({ where: { contestId } });
-        await tx.contestRequiredGroup.createMany({
-          data: requiredGroupIds.map((groupId) => ({ contestId, groupId })),
+    const { updated, before } = await this.prisma.$transaction(
+      async (tx) => {
+        // «Было» для журнала — под блокировкой строки: прочитанное до
+        // транзакции у двух одновременных правок дало бы обеим одно «было».
+        const [locked] = await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM "Contest" WHERE id = ${contestId} FOR NO KEY UPDATE`;
+        if (!locked) {
+          // Удалили, пока форма сохранялась.
+          throw new AppException(ErrorCode.NOT_FOUND, 'Конкурс не найден');
+        }
+        // NO KEY: та же блокировка, что берёт сам update ниже. Её не ждут
+        // вставки по ссылке на конкурс (события воронки), но **ждёт** `join`
+        // (`FOR SHARE`, 2 с) — короткая правка его не задевает.
+        const current = await tx.contest.findUniqueOrThrow({
+          where: { id: contestId },
+          include: { requiredGroups: { select: { groupId: true } } },
         });
-      }
-      return tx.contest.findUniqueOrThrow({ where: { id: contestId } });
-    });
+        // Условием, а не по голому id: проверка статуса выше — до транзакции,
+        // а розыгрыш держит строку до минуты (проверка подписки). Сохранение,
+        // дождавшееся его коммита, иначе переписало бы условия уже
+        // разыгранного конкурса.
+        const written = await tx.contest.updateMany({
+          where: { id: contestId, status: { notIn: FINISHED_STATUSES } },
+          data: {
+            title: input.title,
+            // Не передано — не трогаем: панель его больше не правит (текст
+            // конкурса живёт в посте публикации), а REST по-прежнему может.
+            ...(input.description !== undefined
+              ? { description: input.description }
+              : {}),
+            joinButtonLabel: input.joinButtonLabel,
+            resultsButtonLabel: input.resultsButtonLabel,
+            notifyWinners: input.notifyWinners,
+            publishResultsInPost: input.publishResultsInPost,
+            startsAt: input.startsAt ?? null,
+            endsAt: input.endsAt ?? null,
+            // Новый срок — новое предупреждение «участников нет».
+            ...(endsAtChanged ? { endWarningSentAt: null } : {}),
+          },
+        });
+        if (written.count === 0) {
+          throw new AppException(
+            ErrorCode.CONTEST_ALREADY_DRAWN,
+            'Розыгрыш уже проведён — условия конкурса больше не редактируются',
+          );
+        }
+        if (requiredGroupIds !== undefined) {
+          await tx.contestRequiredGroup.deleteMany({ where: { contestId } });
+          await tx.contestRequiredGroup.createMany({
+            data: requiredGroupIds.map((groupId) => ({ contestId, groupId })),
+          });
+        }
+        return {
+          updated: await tx.contest.findUniqueOrThrow({
+            where: { id: contestId },
+          }),
+          before: {
+            ...contestTerms(current),
+            requiredGroupIds: current.requiredGroups
+              .map((r) => r.groupId)
+              .sort(),
+          },
+        };
+      },
+      // Блокировку может держать идущий розыгрыш — до DRAW_TX_TIMEOUT_MS;
+      // ожидание идёт в счёт `timeout`, стандартных 5 с мало.
+      { timeout: DELETE_TX_TIMEOUT_MS },
+    );
+    const after = {
+      ...contestTerms(updated),
+      requiredGroupIds: [
+        ...(requiredGroupIds ?? before.requiredGroupIds),
+      ].sort(),
+    };
+    // Сохранение формы без правки — не действие.
+    if (changed(before, after)) {
+      await this.audit.record({
+        action: 'contest.edit',
+        entityType: 'contest',
+        entityId: contestId,
+        summary: `Изменил условия конкурса «${updated.title}»`,
+        details: { before, after },
+      });
+    }
+    return updated;
   }
 
   /**
@@ -414,14 +474,16 @@ export class ContestsService {
    * отвечает «конкурс не найден», а панель называет канал.
    */
   async deleteContest(contestId: string): Promise<DeletedContestMessages> {
-    return this.prisma.$transaction(
+    const { messages, uncertain, title } = await this.prisma.$transaction(
       async (tx) => {
         const [row] = await tx.$queryRaw<
-          { status: string; postId: string | null }[]
-        >`SELECT status, "postId" FROM "Contest" WHERE id = ${contestId} FOR UPDATE`;
+          { status: string; postId: string | null; title: string }[]
+        >`SELECT status, "postId", title FROM "Contest" WHERE id = ${contestId} FOR UPDATE`;
         if (!row) {
           throw new AppException(ErrorCode.NOT_FOUND, 'Конкурс не найден');
         }
+        // Отменённый удалять можно: розыгрыша не было, журнал итогов
+        // защищать нечего, а иначе пустые отменённые копились бы навсегда.
         if (row.status === 'drawn') {
           throw new AppException(
             ErrorCode.CONTEST_ALREADY_DRAWN,
@@ -477,12 +539,19 @@ export class ContestsService {
           });
           await tx.post.delete({ where: { id: postId } });
         }
-        return result;
+        return { ...result, title: row.title };
       },
       // Блокировку может держать идущий розыгрыш — до DRAW_TX_TIMEOUT_MS;
       // ожидание блокировки идёт в счёт `timeout`, стандартных 5 с мало.
       { timeout: DELETE_TX_TIMEOUT_MS },
     );
+    await this.audit.record({
+      action: 'contest.delete',
+      entityType: 'contest',
+      entityId: contestId,
+      summary: `Удалил конкурс «${title}»`,
+    });
+    return { messages, uncertain };
   }
 
   /**
@@ -492,21 +561,32 @@ export class ContestsService {
    */
   async openContest(contestId: string): Promise<Contest> {
     const contest = await this.requireContest(contestId);
-    if (contest.status === 'drawn') {
-      throw new AppException(
-        ErrorCode.CONTEST_ALREADY_DRAWN,
-        'Розыгрыш уже проведён',
-      );
-    }
+    assertNotFinished(contest.status, 'Розыгрыш уже проведён');
     // Повторная защита той же дыры, что и в `createContest`/`editContest`:
     // места можно снести до нуля через `setPrizes` уже после того, как
     // `endsAt` назначен. Открытие — последний момент, где это ещё можно
     // поймать до того, как приём вообще начнётся.
     await this.assertPrizesForAutoDraw(contestId, contest.endsAt);
-    return this.prisma.contest.update({
-      where: { id: contestId },
+    // Только из черновика, условием: проверка статуса выше — вне транзакции,
+    // и безусловный update откатил бы розыгрыш, завершившийся между ними, —
+    // разыгранный конкурс снова принимал бы участников мимо пула.
+    const { count } = await this.prisma.contest.updateMany({
+      where: { id: contestId, status: 'draft' },
       data: { status: 'open' },
     });
+    const opened = await this.requireContest(contestId);
+    if (count === 0) {
+      assertNotFinished(opened.status, 'Розыгрыш уже проведён');
+      // Уже открыт — повторное «Открыть» ничего не меняет и в журнал не идёт.
+      return opened;
+    }
+    await this.audit.record({
+      action: 'contest.open',
+      entityType: 'contest',
+      entityId: contestId,
+      summary: `Опубликовал конкурс «${opened.title}» — приём открыт`,
+    });
+    return opened;
   }
 
   /**
@@ -588,41 +668,155 @@ export class ContestsService {
   }
 
   /**
-   * Тот же приём, что у `openDueContests`. Конкурс без участников на
-   * момент `endsAt` не считается сбоем сверки — `draw` откажет ожидаемой
-   * `CONTEST_INSUFFICIENT_PARTICIPANTS`, конкурс остаётся `open`, и
-   * следующий проход пробует снова: добавят участника вручную — разыграется
-   * сам, а нет — так и останется ждать, не застряв ни в каком неверном
-   * статусе.
+   * Тот же приём, что у `openDueContests`. Участников меньше, чем мест, —
+   * разыгрывается между теми, кто есть. Ни одного (или ни одного
+   * подписанного на каналы-условия) — конкурс **отменяется**: админов
+   * предупредили за 10 минут (`warnEmptyEndingContests`), и раз не продлили,
+   * ждать нечего. Раньше такой конкурс повторял розыгрыш каждую минуту
+   * бесконечно.
+   *
+   * Розыгрыш с условием подписки ходит в MAX и держит проход до минуты,
+   * поэтому сверка зовёт это без ожидания, а повторный вызов, пока идёт
+   * прошлый, ничего не делает.
    */
-  async drawDueContests(now: Date): Promise<{ drawn: number }> {
-    const due = await this.prisma.contest.findMany({
-      where: { status: 'open', endsAt: { lte: now } },
-      select: { id: true },
+  async drawDueContests(
+    now: Date,
+  ): Promise<{ drawn: number; cancelled: number }> {
+    if (this.drawingDue) {
+      return { drawn: 0, cancelled: 0 };
+    }
+    this.drawingDue = true;
+    try {
+      const due = await this.prisma.contest.findMany({
+        where: { status: 'open', endsAt: { lte: now } },
+        select: { id: true },
+      });
+      let drawn = 0;
+      let cancelled = 0;
+      for (const contest of due) {
+        try {
+          await this.draw(contest.id);
+          drawn++;
+        } catch (err: unknown) {
+          if (
+            err instanceof AppException &&
+            err.code === ErrorCode.CONTEST_INSUFFICIENT_PARTICIPANTS
+          ) {
+            if (await this.cancelEmptyContest(contest.id, now)) {
+              cancelled++;
+              continue;
+            }
+          }
+          this.logger.warn(
+            { err, contestId: contest.id },
+            'Не удалось автоматически провести розыгрыш',
+          );
+        }
+      }
+      return { drawn, cancelled };
+    } finally {
+      this.drawingDue = false;
+    }
+  }
+
+  /** Идёт ли проход авто-розыгрыша — см. `drawDueContests`. */
+  private drawingDue = false;
+
+  /**
+   * Отмена: к сроку разыгрывать некого. Условием «всё ещё открыт» — розыгрыш
+   * вручную мог успеть. Итог объявляется так же best-effort, как итоги
+   * розыгрыша: пост — «Конкурс отменён» без кнопки, админам — сообщение.
+   */
+  private async cancelEmptyContest(
+    contestId: string,
+    now: Date,
+  ): Promise<boolean> {
+    // Условия — ровно «пустой и просроченный»:
+    // - участников нет вовсе. Есть, но все отписались от каналов-условий, —
+    //   не отмена: предупреждения не было, и «не набралось ни одного» было
+    //   бы неправдой. Такой конкурс ждёт админа, как раньше;
+    // - срок всё ещё прошёл: продление, успевшее между розыгрышем и этим
+    //   запросом, иначе молча перечеркнулось бы отменой;
+    // - всё ещё открыт: ручной розыгрыш мог успеть.
+    const { count } = await this.prisma.contest.updateMany({
+      where: {
+        id: contestId,
+        status: 'open',
+        endsAt: { lte: now },
+        participants: { none: {} },
+      },
+      data: { status: 'cancelled' },
     });
-    let drawn = 0;
-    for (const contest of due) {
+    if (count === 0) {
+      return false;
+    }
+    const contest = await this.requireContest(contestId);
+    await this.audit.record({
+      actor: 'system',
+      action: 'contest.cancel',
+      entityType: 'contest',
+      entityId: contestId,
+      summary: `Конкурс «${contest.title}» отменён: к сроку не набралось участников`,
+    });
+    try {
+      await this.notifier.announceCancelled(contestId);
+    } catch (err: unknown) {
+      this.logger.error(
+        { err, contestId },
+        'Конкурс отменён, но объявить об этом не удалось',
+      );
+    }
+    return true;
+  }
+
+  /**
+   * За 10 минут до конца — предупредить админов о конкурсе **без единого
+   * участника**: иначе он отменится сам. Один раз на срок: отметка
+   * `endWarningSentAt` ставится условием (две сверки не пришлют двух
+   * предупреждений) и сбрасывается при смене `endsAt`. Участников меньше,
+   * чем мест, — не повод: разыграется между теми, кто есть.
+   */
+  async warnEmptyEndingContests(now: Date): Promise<number> {
+    const soon = await this.prisma.contest.findMany({
+      where: {
+        status: 'open',
+        endWarningSentAt: null,
+        endsAt: {
+          gt: now,
+          lte: new Date(now.getTime() + END_WARNING_BEFORE_MS),
+        },
+        participants: { none: {} },
+      },
+      select: { id: true, title: true, endsAt: true },
+    });
+    let warned = 0;
+    for (const contest of soon) {
+      const { count } = await this.prisma.contest.updateMany({
+        where: { id: contest.id, endWarningSentAt: null },
+        data: { endWarningSentAt: now },
+      });
+      if (count === 0) {
+        continue;
+      }
       try {
-        await this.draw(contest.id);
-        drawn++;
+        await this.notifier.warnEmptyEnding(contest.id, contest.title);
+        warned++;
       } catch (err: unknown) {
         this.logger.warn(
           { err, contestId: contest.id },
-          'Не удалось автоматически провести розыгрыш',
+          'Не удалось предупредить админов о конкурсе без участников',
         );
       }
     }
-    return { drawn };
+    return warned;
   }
 
   async setPrizes(contestId: string, prizes: PrizeInput[]): Promise<void> {
     const contest = await this.requireContest(contestId);
-    if (contest.status === 'drawn') {
-      throw new AppException(
-        ErrorCode.CONTEST_ALREADY_DRAWN,
-        'Призовые места нельзя менять после розыгрыша',
-      );
-    }
+    assertNotFinished(
+      contest.status,
+      'Призовые места нельзя менять после розыгрыша',
+    );
 
     const places = prizes.map((p) => p.place);
     if (new Set(places).size !== places.length) {
@@ -643,16 +837,49 @@ export class ContestsService {
       );
     }
 
-    await this.prisma.$transaction([
-      this.prisma.contestPrize.deleteMany({ where: { contestId } }),
-      this.prisma.contestPrize.createMany({
-        data: prizes.map((prize) => ({
+    // Под блокировкой строки конкурса, как в `editContest`: «было» у двух
+    // сохранений подряд не совпадёт, а статус перепроверяется — розыгрыш,
+    // завершившийся, пока мы ждали блокировку, иначе потерял бы победителей
+    // (места пересоздаются пустыми).
+    const previous = await this.prisma.$transaction(
+      async (tx) => {
+        await this.lockUnfinished(
+          tx,
           contestId,
-          place: prize.place,
-          label: prize.label,
-        })),
-      }),
-    ]);
+          'Призовые места нельзя менять после розыгрыша',
+        );
+        const rows = await tx.contestPrize.findMany({
+          where: { contestId },
+          orderBy: { place: 'asc' },
+          select: { place: true, label: true },
+        });
+        await tx.contestPrize.deleteMany({ where: { contestId } });
+        await tx.contestPrize.createMany({
+          data: prizes.map((prize) => ({
+            contestId,
+            place: prize.place,
+            label: prize.label,
+          })),
+        });
+        return rows;
+      },
+      // Блокировку может держать идущий розыгрыш — до DRAW_TX_TIMEOUT_MS;
+      // ожидание идёт в счёт `timeout`, стандартных 5 с мало.
+      { timeout: DELETE_TX_TIMEOUT_MS },
+    );
+    const next = prizes
+      .map((p) => ({ place: p.place, label: p.label }))
+      .sort((a, b) => a.place - b.place);
+    // Сохранение формы без правки — не действие.
+    if (changed(previous, next)) {
+      await this.audit.record({
+        action: 'contest.prizes',
+        entityType: 'contest',
+        entityId: contestId,
+        summary: `Изменил призовые места конкурса «${contest.title}»: ${prizes.length}`,
+        details: { before: previous, after: next },
+      });
+    }
   }
 
   /**
@@ -666,39 +893,58 @@ export class ContestsService {
     fallbackPlatform: Platform = 'max',
   ): Promise<AddParticipantsResult> {
     const contest = await this.requireContest(contestId);
-    if (contest.status === 'drawn') {
-      throw new AppException(
-        ErrorCode.CONTEST_ALREADY_DRAWN,
-        'Новых участников после розыгрыша добавлять поздно',
-      );
-    }
+    const whenDrawn = 'Новых участников после розыгрыша добавлять поздно';
+    assertNotFinished(contest.status, whenDrawn);
 
-    const parsed = parseParticipantLines(text, fallbackPlatform);
-    const duplicateLines: number[] = [];
-    let added = 0;
+    const parsed = parseParticipantLines(text, fallbackPlatform).map(
+      (entry) => ({ ...entry, dedupKey: buildDedupKey(entry) }),
+    );
 
-    for (const entry of parsed) {
-      try {
-        await this.prisma.contestParticipant.create({
-          data: {
+    // Один проход под блокировкой с перепроверкой статуса: розыгрыш,
+    // завершившийся, пока мы ждали, иначе получил бы участников мимо
+    // разыгранного пула. Дубли не обрывают вставку (`skipDuplicates`), а
+    // вычисляются по тому, чего нет среди вставленных.
+    const inserted = await this.prisma.$transaction(
+      async (tx) => {
+        await this.lockUnfinished(tx, contestId, whenDrawn);
+        const rows = await tx.contestParticipant.createManyAndReturn({
+          data: parsed.map((entry) => ({
             contestId,
             displayName: entry.displayName,
             platform: entry.platform,
             externalUserId: entry.externalUserId,
-            source: 'manual',
-            dedupKey: buildDedupKey(entry),
-          },
+            source: 'manual' as const,
+            dedupKey: entry.dedupKey,
+          })),
+          skipDuplicates: true,
+          select: { dedupKey: true },
         });
-        added += 1;
-      } catch (err: unknown) {
-        if (isUniqueViolation(err)) {
-          duplicateLines.push(entry.lineNumber);
-          continue;
-        }
-        throw err;
+        return new Set(rows.map((row) => row.dedupKey));
+      },
+      { timeout: DELETE_TX_TIMEOUT_MS },
+    );
+
+    // Строка добавлена, если её ключ вставлен и он первый такой в списке:
+    // повтор внутри вставленного списка — тоже дубль.
+    const duplicateLines: number[] = [];
+    const counted = new Set<string>();
+    for (const entry of parsed) {
+      if (inserted.has(entry.dedupKey) && !counted.has(entry.dedupKey)) {
+        counted.add(entry.dedupKey);
+      } else {
+        duplicateLines.push(entry.lineNumber);
       }
     }
+    const added = counted.size;
 
+    if (added > 0) {
+      await this.audit.record({
+        action: 'contest.participants_add',
+        entityType: 'contest',
+        entityId: contestId,
+        summary: `Добавил вручную участников в «${contest.title}»: ${added}`,
+      });
+    }
     return { added, duplicateLines };
   }
 
@@ -709,30 +955,41 @@ export class ContestsService {
       participantId,
     );
     const contest = await this.requireContest(prize.contestId);
-    if (contest.status === 'drawn') {
-      // После розыгрыша менять победителя можно только через
-      // `overrideWinner` — он пишет в журнал старое и новое значение.
-      // Иначе «подкрутка» стала бы способом тихо переписать итог.
-      throw new AppException(
-        ErrorCode.CONTEST_ALREADY_DRAWN,
-        'Розыгрыш уже проведён — замена победителя только через правку места',
-      );
-    }
+    // После розыгрыша менять победителя можно только через
+    // `overrideWinner` — он пишет в журнал старое и новое значение.
+    // Иначе «подкрутка» стала бы способом тихо переписать итог.
+    const whenDrawn =
+      'Розыгрыш уже проведён — замена победителя только через правку места';
+    assertNotFinished(contest.status, whenDrawn);
 
-    await this.prisma.$transaction(async (tx) => {
-      // На победителе висит unique: если участник уже закреплён за другим
-      // местом, прямое обновление упёрлось бы в constraint и вернуло 500.
-      await tx.contestPrize.updateMany({
-        where: {
-          contestId: prize.contestId,
-          winnerParticipantId: participantId,
-        },
-        data: { winnerParticipantId: null, isForced: false },
-      });
-      await tx.contestPrize.update({
-        where: { id: prizeId },
-        data: { winnerParticipantId: participantId, isForced: true },
-      });
+    await this.prisma.$transaction(
+      async (tx) => {
+        // Перепроверка под блокировкой: розыгрыш, завершившийся после проверки
+        // выше, иначе получил бы молча переписанное место без записи в журнал
+        // розыгрыша.
+        await this.lockUnfinished(tx, prize.contestId, whenDrawn);
+        // На победителе висит unique: если участник уже закреплён за другим
+        // местом, прямое обновление упёрлось бы в constraint и вернуло 500.
+        await tx.contestPrize.updateMany({
+          where: {
+            contestId: prize.contestId,
+            winnerParticipantId: participantId,
+          },
+          data: { winnerParticipantId: null, isForced: false },
+        });
+        await tx.contestPrize.update({
+          where: { id: prizeId },
+          data: { winnerParticipantId: participantId, isForced: true },
+        });
+      },
+      { timeout: DELETE_TX_TIMEOUT_MS },
+    );
+    await this.audit.record({
+      action: 'contest.force_winner',
+      entityType: 'contest',
+      entityId: prize.contestId,
+      summary: `Закрепил ${prize.place} место конкурса «${contest.title}» за участником до розыгрыша`,
+      details: { prizeId, place: prize.place, participantId },
     });
   }
 
@@ -752,12 +1009,10 @@ export class ContestsService {
    */
   async draw(contestId: string, actorId?: string): Promise<DrawAssignment[]> {
     const contest = await this.requireContest(contestId);
-    if (contest.status === 'drawn') {
-      throw new AppException(
-        ErrorCode.CONTEST_ALREADY_DRAWN,
-        'Розыгрыш уже проведён — доступны только точечные правки мест',
-      );
-    }
+    assertNotFinished(
+      contest.status,
+      'Розыгрыш уже проведён — доступны только точечные правки мест',
+    );
 
     const seed = generateSeed();
     const channels = await this.subscriptions.requiredChannels(contestId);
@@ -769,7 +1024,7 @@ export class ContestsService {
         // в таблицу участников, но не в разыгранный пул — и журнал розыгрыша
         // перестал бы сходиться с тем, что видно в базе.
         const closed = await tx.contest.updateMany({
-          where: { id: contestId, status: { not: 'drawn' } },
+          where: { id: contestId, status: { notIn: FINISHED_STATUSES } },
           data: { status: 'drawn' },
         });
         if (closed.count === 0) {
@@ -923,6 +1178,20 @@ export class ContestsService {
       { timeout: DRAW_TX_TIMEOUT_MS },
     );
 
+    await this.audit.record({
+      actor: actorId ? { adminId: actorId } : undefined,
+      action: 'contest.draw',
+      entityType: 'contest',
+      entityId: contestId,
+      summary: `Провёл розыгрыш «${contest.title}»`,
+      details: {
+        winners: assignments.map((a) => ({
+          place: a.place,
+          participantId: a.participantId,
+          isForced: a.isForced,
+        })),
+      },
+    });
     // Розыгрыш уже зафиксирован. Провал уведомлений (в том числе сбой базы
     // внутри них) не должен превращаться в 500: админ повторил бы запрос и
     // получил «уже проведён», а кнопки так и остались бы неподменёнными.
@@ -949,6 +1218,12 @@ export class ContestsService {
     // запускает объявление итогов: поздравление в лс и «Узнать результаты»
     // под анонсом ушли бы раньше самого розыгрыша.
     const contest = await this.requireContest(prize.contestId);
+    if (contest.status === 'cancelled') {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Конкурс отменён — победителей у него нет',
+      );
+    }
     if (contest.status !== 'drawn') {
       throw new AppException(
         ErrorCode.VALIDATION_ERROR,
@@ -1005,6 +1280,20 @@ export class ContestsService {
       });
     });
 
+    await this.audit.record({
+      actor: actorId ? { adminId: actorId } : undefined,
+      action: 'contest.override_winner',
+      entityType: 'contest',
+      entityId: prize.contestId,
+      summary: `Заменил победителя ${prize.place} места в «${contest.title}»${note ? ` — «${note}»` : ''}`,
+      details: {
+        prizeId,
+        place: prize.place,
+        previousParticipantId: prize.winnerParticipantId,
+        participantId,
+        note: note ?? null,
+      },
+    });
     // Итог изменился: пост всё ещё показывает прежнего победителя, а новый
     // ещё не уведомлён. Без переобъявления правка места была бы видна только
     // в базе.
@@ -1028,6 +1317,73 @@ export class ContestsService {
         'Итоги конкурса зафиксированы, но объявить их не удалось',
       );
     }
+  }
+
+  /**
+   * Воронка участия: **уникальные люди** на каждом этапе (не нажатия) —
+   * для статистики разработчика. Этапы без событий отдаются нулями.
+   * `anonymousStarts` — старты бота до согласия: id там нет, поэтому не люди.
+   */
+  async funnelStats(
+    contestId: string,
+  ): Promise<Record<ContestFunnelStage | 'anonymousStarts', number>> {
+    await this.requireContest(contestId);
+    // Строка — уже уникальный человек на этапе (unique в схеме), поэтому
+    // хватает простого подсчёта по этапу. «Не подписан» — только кто так и
+    // не вступил: подписавшийся потом и вступивший, как и отписавшийся
+    // участник, нажавший снова, — не отсев.
+    const [rows, [{ count: droppedUnsubscribed }], anonymous] =
+      await Promise.all([
+        this.prisma.contestFunnelEvent.groupBy({
+          by: ['stage'],
+          where: { contestId },
+          _count: { _all: true },
+        }),
+        this.prisma.$queryRaw<{ count: number }[]>`
+          SELECT count(*)::int AS count FROM "ContestFunnelEvent" e
+          WHERE e."contestId" = ${contestId} AND e.stage = 'not_subscribed'
+            AND NOT EXISTS (
+              SELECT 1 FROM "ContestFunnelEvent" j
+              WHERE j."contestId" = e."contestId" AND j.platform = e.platform
+                AND j."externalUserId" = e."externalUserId"
+                AND j.stage IN ('joined', 'already_joined'))`,
+        this.prisma.contestAnonymousStarts.findUnique({ where: { contestId } }),
+      ]);
+    const stats: Record<ContestFunnelStage | 'anonymousStarts', number> = {
+      anonymousStarts: anonymous?.count ?? 0,
+      consented: 0,
+      not_subscribed: 0,
+      joined: 0,
+      already_joined: 0,
+    };
+    for (const row of rows) {
+      stats[row.stage] = row._count._all;
+    }
+    stats.not_subscribed = droppedUnsubscribed;
+    return stats;
+  }
+
+  /**
+   * Только публикация конкурса (id, статус, каналы) — для действий панели,
+   * которым весь `getContest` с участниками и журналом не нужен.
+   */
+  async contestPost(contestId: string) {
+    const contest = await this.prisma.contest.findUnique({
+      where: { id: contestId },
+      select: {
+        post: {
+          select: {
+            id: true,
+            status: true,
+            deliveries: { select: { groupId: true } },
+          },
+        },
+      },
+    });
+    if (!contest) {
+      throw new AppException(ErrorCode.NOT_FOUND, 'Конкурс не найден');
+    }
+    return contest.post;
   }
 
   async getContest(contestId: string) {
@@ -1147,6 +1503,24 @@ export class ContestsService {
     return prize;
   }
 
+  /**
+   * Блокирует строку конкурса до конца транзакции и отказывает, если он уже
+   * завершён. Та же блокировка, что берёт розыгрыш (NO KEY UPDATE), — он
+   * дождётся нас или мы его, и проверка статуса после неё честная.
+   */
+  private async lockUnfinished(
+    tx: Prisma.TransactionClient,
+    contestId: string,
+    whenDrawn: string,
+  ): Promise<void> {
+    const [row] = await tx.$queryRaw<{ status: ContestStatus }[]>`
+      SELECT status FROM "Contest" WHERE id = ${contestId} FOR NO KEY UPDATE`;
+    if (!row) {
+      throw new AppException(ErrorCode.NOT_FOUND, 'Конкурс не найден');
+    }
+    assertNotFinished(row.status, whenDrawn);
+  }
+
   private async requireContest(contestId: string): Promise<Contest> {
     const contest = await this.prisma.contest.findUnique({
       where: { id: contestId },
@@ -1156,6 +1530,20 @@ export class ContestsService {
     }
     return contest;
   }
+}
+
+/** Условия конкурса для «было → стало» в журнале. */
+function contestTerms(contest: Contest) {
+  return {
+    title: contest.title,
+    description: contest.description,
+    joinButtonLabel: contest.joinButtonLabel,
+    resultsButtonLabel: contest.resultsButtonLabel,
+    notifyWinners: contest.notifyWinners,
+    publishResultsInPost: contest.publishResultsInPost,
+    startsAt: contest.startsAt?.toISOString() ?? null,
+    endsAt: contest.endsAt?.toISOString() ?? null,
+  };
 }
 
 function toAppException(err: unknown, disqualifiedCount = 0): unknown {
@@ -1173,10 +1561,4 @@ function toAppException(err: unknown, disqualifiedCount = 0): unknown {
     );
   }
   return new AppException(ErrorCode.VALIDATION_ERROR, err.message);
-}
-
-function isUniqueViolation(err: unknown): boolean {
-  return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002'
-  );
 }

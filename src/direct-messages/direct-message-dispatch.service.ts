@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { PinoLogger } from 'nestjs-pino';
 import { AppException } from '../common/app-exception';
 import { ErrorCode } from '../common/error-code.enum';
+import { AuditService, postSnippet } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   DIRECT_MESSAGE_QUEUE,
@@ -45,6 +46,7 @@ export class DirectMessageDispatchService {
     private readonly prisma: PrismaService,
     private readonly recipients: DirectMessageRecipientsService,
     @InjectQueue(DIRECT_MESSAGE_QUEUE) private readonly queue: Queue,
+    private readonly audit: AuditService,
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(DirectMessageDispatchService.name);
@@ -63,7 +65,7 @@ export class DirectMessageDispatchService {
   ): Promise<{ queued: number }> {
     const post = await this.prisma.post.findUnique({
       where: { id: postId },
-      select: { id: true },
+      select: { id: true, text: true },
     });
     if (!post) {
       throw new AppException(ErrorCode.NOT_FOUND, 'Пост не найден');
@@ -90,6 +92,17 @@ export class DirectMessageDispatchService {
       select: { id: true },
     });
 
+    // В журнал — до постановки в очередь: если она сорвётся на середине,
+    // часть сообщений всё равно уйдёт, и кто запустил рассылку, должно быть
+    // видно. Повторный запуск, когда всем уже отправлено, — не рассылка.
+    if (pending.length > 0) {
+      await this.audit.record({
+        action: 'post.direct_messages',
+        entityType: 'post',
+        entityId: postId,
+        summary: `Запустил рассылку в личку поста «${postSnippet(post.text)}»: выбрано ${recipients.length}, в очереди ${pending.length}`,
+      });
+    }
     await this.enqueueAll(pending.map((delivery) => delivery.id));
     return { queued: pending.length };
   }
