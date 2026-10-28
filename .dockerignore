@@ -1,12 +1,12 @@
-node_modules
-dist
-src/generated
+**/node_modules
+**/dist
+apps/api/src/generated
 .git
-.env
-.env.*
-!.env.example
-coverage
-*.tsbuildinfo
+**/.env
+**/.env.*
+!**/.env.example
+**/coverage
+**/*.tsbuildinfo
 # Локальные медиа и заметки с доступами не должны попадать в контекст сборки.
-storage
+**/storage
 PROGRESS.md

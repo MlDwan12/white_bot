@@ -42,7 +42,7 @@ services:
 
     restart: unless-stopped
 
-    env_file: .env
+    env_file: apps/api/.env
 
     environment:
       DATABASE_URL: postgresql://white_bot:white_bot@postgres:5432/white_bot
@@ -62,9 +62,13 @@ services:
 
     volumes:
       - .:/app
+      # node_modules — и корневой, и у каждого workspace: внутри контейнера
+      # свои (linux/musl) бинарники, хостовые их перетёрли бы.
       - /app/node_modules
-      - /app/src/generated
-      - /app/dist
+      - /app/apps/api/node_modules
+      - /app/apps/web/node_modules
+      - /app/apps/api/src/generated
+      - /app/apps/api/dist
 
     depends_on:
       postgres:

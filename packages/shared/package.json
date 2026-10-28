@@ -1,0 +1,12 @@
+{
+  "name": "@white-bot/shared",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts"
+    }
+  }
+}

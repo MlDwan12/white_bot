@@ -2,6 +2,6 @@
 # смотреть на сервер до первого запуска.
 panel.couchreboot.site {
 	# В корне у приложения ничего нет — сразу в панель.
-	redir / /panel/login
+	redir / /app
 	reverse_proxy app:3000
 }

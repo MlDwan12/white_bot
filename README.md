@@ -13,8 +13,8 @@
   старте; розыгрыш воспроизводимый (сид и список участников в журнале), призовые
   места, замена победителя; итоги дописываются в пост и приходят победителю в
   личные сообщения.
-- **Веб-панель** `/panel`: посты, повторяющиеся посты, конкурсы, группы; роли
-  `developer` и `admin`.
+- **Веб-панель** `/app` (React): посты, повторяющиеся посты, конкурсы, каналы,
+  админы, журнал действий, статистика; роли `developer` и `admin`.
 
 Пока не умеет: видео как видео (уходит файлом), конкурсы в VK, мини-приложение
 MAX. Личный токен VK для вложений живёт сутки и продлевается вручную — карточка
@@ -23,31 +23,42 @@ MAX. Личный токен VK для вложений живёт сутки и
 ## Стек
 
 Node 22 · NestJS + TypeScript · PostgreSQL 16 + Prisma 7 · Redis 7 + BullMQ ·
-EJS + Tabler (панель без сборки фронтенда) · `@maxhub/max-bot-api` · sharp.
+React 19 + Vite + Mantine (панель) · `@maxhub/max-bot-api` · sharp.
 Обновления MAX приходят через long polling, входящих соединений для этого не
 нужно. Архитектура и принятые решения — в [`PLAN.md`](PLAN.md).
+
+## Устройство репозитория
+
+Монорепо на yarn workspaces, один `yarn.lock` в корне:
+
+- `apps/api` — NestJS: API, бот MAX, очереди, Prisma (`prisma/`), `.env`;
+- `apps/web` — панель на React, собирается в `apps/web/dist`, Nest отдаёт её по `/app`;
+- `packages/shared` — типы ответов API, общие для бэкенда и панели (только типы).
 
 ## Локальный запуск
 
 ```bash
-cp .env.example .env                    # заполнить TOKEN_ENCRYPTION_KEY и JWT_SECRET
+cp apps/api/.env.example apps/api/.env  # заполнить TOKEN_ENCRYPTION_KEY и JWT_SECRET
 docker compose up -d postgres redis     # именно эти два сервиса, без `api`
-yarn install
-yarn prisma generate                    # клиент в git не хранится
-yarn prisma migrate deploy
-yarn start:dev                          # http://localhost:3000/panel/login
+yarn install                            # в корне — ставит все workspaces
+yarn api prisma generate                # клиент в git не хранится
+yarn api prisma migrate deploy
+yarn web build                          # панель; для разработки — `yarn web dev`
+yarn api start:dev                      # http://localhost:3000/app
 
-yarn build && yarn seed:admin you@example.com   # первый админ, пароль печатается один раз
-yarn test                               # юнит-тесты; yarn lint; yarn test:e2e
+yarn build && yarn api seed:admin you@example.com   # первый админ, пароль печатается один раз
+yarn test                               # юнит-тесты; yarn lint; yarn api test:e2e
 ```
 
-Ключи генерируются так (команды — в комментариях `.env.example`):
+`yarn api …` / `yarn web …` — короткие алиасы для `yarn workspace @white-bot/api …`.
+
+Ключи генерируются так (команды — в комментариях `apps/api/.env.example`):
 `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`
 для `TOKEN_ENCRYPTION_KEY` и `openssl rand -base64 48` для `JWT_SECRET`.
 
 ## Настройки
 
-Полный список с пояснениями — в `.env.example`. Для продакшена важны:
+Полный список с пояснениями — в `apps/api/.env.example`. Для продакшена важны:
 
 | Переменная | Значение |
 |---|---|
@@ -180,7 +191,7 @@ docker save white-bot:$TAG | gzip | ssh deploy@SERVER 'gunzip | docker load'
 
 # на сервере, в /opt/white_bot (в .env поставить APP_TAG=<тот же тег>)
 docker compose up -d postgres redis
-docker compose run --rm app node_modules/.bin/prisma migrate deploy
+docker compose run --rm app ../../node_modules/.bin/prisma migrate deploy
 docker compose run --rm app node dist/scripts/seed-admin.js you@example.com
 docker compose up -d app caddy
 curl -fsS https://panel.example.com/health        # {"success":true,"data":{"status":"ok"}}
@@ -202,7 +213,7 @@ docker save white-bot:$TAG | gzip | ssh deploy@SERVER 'gunzip | docker load'
 # на сервере
 docker compose exec -T postgres pg_dump -U white_bot white_bot | gzip > backups/pre-$TAG.sql.gz
 sed -i "s/^APP_TAG=.*/APP_TAG=$TAG/" .env
-docker compose run --rm app node_modules/.bin/prisma migrate deploy
+docker compose run --rm app ../../node_modules/.bin/prisma migrate deploy
 docker compose up -d app
 curl -fsS https://panel.example.com/health
 ```

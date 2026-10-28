@@ -1,8 +1,8 @@
 # compiled output
-/dist
-/node_modules
+dist
+node_modules
 /build
-/src/generated
+/apps/api/src/generated
 *.tsbuildinfo
 
 # Logs
@@ -61,8 +61,5 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 /PLAN.md
 /PROGRESS.md
 
-# Stray compiler output next to the hand-written scripts (scripts/*.cjs are source)
-/scripts/*.js
-/scripts/*.js.map
-/scripts/*.d.ts
+# Загруженные медиа (MEDIA_STORAGE_PATH)
 storage/
